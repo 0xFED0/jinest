@@ -1,0 +1,72 @@
+# Run from the repository root:
+#   python jinest.py examples/02_scripts_and_arrays/example.yml --output-format yaml
+#
+# Lists directly under $, @, or ^ resolve each string item in that mode.
+
+base: 4
+
+# Each string item is an independent native expression. Non-strings stay literal.
+native_values$:
+  - base + 1
+  - root.base * 2
+  - "true"
+  - "{'nested': base}"
+  - path
+  - 99
+
+# Each string item is a complete text template.
+text_values@:
+  - "base={{ base }}"
+  - "root={{ root.base }}"
+  - "item path={{ path }}"
+  - 99
+
+# Each string item is a multiline script; literal items are untouched.
+script_values^:
+  - |
+      % return base + 10
+  - |
+      % set doubled = base * 2
+      % return {"doubled": doubled}
+  - 99
+
+# A list returned by one expression is already computed and is not executed again.
+# (`$` expressions reject template delimiters, even inside string literals.)
+computed_list$: "['base + 1', 'root.base']"
+
+# `return` exits immediately, including from nested loops/conditionals.
+first_large^: |
+  % for item in [1, 3, 7, 9]
+    % if item > base
+      % return item
+    % endif
+  % endfor
+  % return none
+
+# Scripts can accumulate values and return a structured object.
+summary^: |
+  % set ns = namespace(total=0)
+  % for item in [1, 2, 3, 4]
+    % set ns.total = ns.total + item
+  % endfor
+  % return {"count": 4, "total": ns.total}
+
+# Standard Jinja block delimiters are accepted in scripts too.
+standard_block_syntax^: |
+  {% set tripled = base * 3 %}
+  {% return tripled %}
+
+# `%` has no special meaning in @ text templates.
+literal_percent_text@: |
+  % this line remains ordinary text
+  base={{ base }}
+
+# An empty return and reaching the end both resolve to null.
+empty_return^: |
+  % return
+implicit_null^: |
+  % set local_only = 123
+
+# Lazy sequence proxies support negative indexes and slices in expressions.
+last_native$: native_values[-1]
+middle_native$: native_values[1:3]

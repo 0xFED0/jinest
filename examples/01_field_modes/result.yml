@@ -1,0 +1,23 @@
+# Literal values remain native YAML values.
+project: Jinest
+port: 8080
+enabled: true
+
+# @ produced text.
+label: Jinest listens on 8080
+
+# $ preserved the integer and mapping/list types.
+next_port: 8081
+settings:
+  enabled: true
+  ports: [8080, 8081]
+
+# ^ returned a native mapping.
+status:
+  state: ready
+  endpoint: http://localhost:8080
+
+# Only the winning alternatives appear; suffixes are removed.
+priority: literal-wins
+script_priority: 42
+optional: null

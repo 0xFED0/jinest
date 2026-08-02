@@ -1,0 +1,30 @@
+# Run from the repository root:
+#   python jinest.py examples/07_cycles/example.yml --output-format yaml
+#
+# Jinest handles field, script, layer, and import cycles without recursion loops.
+
+# A recursive field lookup observes the currently resolving value as null.
+field_cycle:
+  a$: b
+  b$: a
+
+# The same rule applies to multiline scripts.
+script_cycle:
+  a^: |
+    % return b
+  b^: |
+    % return a
+
+# A recursive merge layer is temporarily an empty mapping.
+recursive_layer:
+  <<$: global_root.recursive_layer
+  local_survives: true
+
+# A script layer returning null is also simply empty.
+null_layer:
+  <<^: |
+    % return none
+  local_survives: true
+
+# cycle_a.yml -> cycle_b.yml -> cycle_a.yml stops at the repeated import path.
+import_cycle$: import("cycle_a.yml")

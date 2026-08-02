@@ -1,0 +1,4 @@
+# Native YAML date, datetime, and binary values remain native in YAML output.
+calendar_date: 2026-08-02
+timestamp: 2026-08-02T03:04:05+00:00
+payload: !!binary AP9B

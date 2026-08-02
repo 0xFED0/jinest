@@ -1,0 +1,20 @@
+# Field and script cycles resolve their current path to null.
+field_cycle:
+  a: null
+  b: null
+script_cycle:
+  a: null
+  b: null
+
+# Recursive and null layers contribute no fields.
+recursive_layer:
+  local_survives: true
+null_layer:
+  local_survives: true
+
+# The repeated cycle_a.yml import is the null leaf.
+import_cycle:
+  name: a
+  next:
+    name: b
+    back: null

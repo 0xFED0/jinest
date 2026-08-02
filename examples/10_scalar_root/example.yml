@@ -1,0 +1,3 @@
+# A valid document does not have to be a mapping or list.
+# Jinest returns JSON-compatible scalar roots unchanged.
+42

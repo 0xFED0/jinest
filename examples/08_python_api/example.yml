@@ -1,0 +1,21 @@
+# Run from the repository root:
+#   python examples/08_python_api/run.py
+#
+# This document needs the custom globals/filters installed by run.py. The runner
+# also demonstrates lazy access, in_place=True, and non-strict undefined values.
+
+value: 5
+
+# `double` is a custom Jinja global supplied by Python.
+doubled$: double(value)
+
+# `surround` is a custom Jinja filter supplied by Python.
+decorated@: '{{ value | surround("<", ">") }}'
+
+# strict=False turns missing native/script values into null.
+missing_native$: missing.deep.value
+missing_script^: |
+  % return missing.deep.value
+
+# Missing text values render as empty text in non-strict mode.
+missing_text@: "before{{ missing.deep.value }}after"

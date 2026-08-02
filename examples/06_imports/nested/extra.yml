@@ -1,0 +1,6 @@
+# A nested imported file receives yet another independent source root.
+value: 12
+double$: root.value * 2
+destination@: "{{ path }}"
+declaration@: "{{ origin.path }}"
+source_file_known$: source_file(origin) is not none

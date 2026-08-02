@@ -1,0 +1,44 @@
+parent_value: 100
+shared_constant: 10
+
+# At its declaration site, the prototype uses the top-level parent_value.
+prototype:
+  local: 3
+  local_value: 3
+  inherited_parent: 100
+  source_constant: 10
+  destination: global_root.prototype
+  path_value: global_root.prototype
+  parent_path: global_root
+  declaration: root.prototype
+  destination_source_path: root.prototype
+  source_root: root
+  global_root_path: global_root
+
+instance_group:
+  parent_value: 7
+  first:
+    # The local field overrides the prototype's `local: 3`.
+    local: 11
+    local_value: 11
+    inherited_parent: 7
+    source_constant: 10
+    destination: global_root.instance_group.first
+    path_value: global_root.instance_group.first
+    parent_path: global_root.instance_group
+    declaration: root.prototype
+    destination_source_path: root.instance_group.first
+    source_root: root
+    global_root_path: global_root
+  second:
+    local: 3
+    local_value: 3
+    inherited_parent: 7
+    source_constant: 10
+    destination: global_root.instance_group.second
+    path_value: global_root.instance_group.second
+    parent_path: global_root.instance_group
+    declaration: root.prototype
+    destination_source_path: root.prototype
+    source_root: root
+    global_root_path: global_root

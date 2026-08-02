@@ -1,0 +1,33 @@
+parent_value: 5
+
+instance:
+  local: 3
+  absolute: 10
+  relative: 5
+  destination: global_root.instance
+  declaration: root.prototype
+  source_root: root
+  global_root_path: global_root
+  destination_source_path: root.instance
+  source_file_known: true
+
+  # nested/extra.yml used its own root, then rebound to instance.extra.
+  extra:
+    value: 12
+    double: 24
+    destination: global_root.instance.extra
+    declaration: root
+    source_file_known: true
+
+# Both YAML global aliases resolve the same imported constant.
+yaml_alias_value: 10
+
+# The imported JSON object remains structured and resolves its own template key.
+json_tree:
+  value: 21
+  double: 42
+json_value: 42
+
+# Filter aliases behave like their global-function equivalents.
+via_yaml_filter: 10
+via_json_filter: 42

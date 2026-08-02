@@ -1,0 +1,39 @@
+# Source layer mappings are ordinary data and therefore remain in the output.
+defaults_one:
+  rank: default-1
+  from_default_one: true
+  shared: from-default-1
+defaults_two:
+  rank: default-2
+  from_default_two: true
+  shared: from-default-2
+overrides_one:
+  rank: override-1
+  from_override_one: true
+  shared: from-override-1
+overrides_two:
+  rank: override-2
+  from_override_two: true
+  shared: from-override-2
+
+# Both default layers contributed keys, locals contributed keys, and the last
+# override won every conflict.
+target:
+  rank: override-2
+  from_default_one: true
+  shared: from-override-2
+  from_default_two: true
+  local_only: true
+  from_override_one: true
+  from_override_two: true
+
+apply_optional: false
+optional_target:
+  rank: default-1
+  from_default_one: true
+  shared: from-default-1
+  local_value: present
+
+# The recursive layer vanished, leaving the local field.
+recursive_target:
+  survived: true

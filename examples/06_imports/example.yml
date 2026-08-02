@@ -1,0 +1,22 @@
+# Run from the repository root:
+#   python jinest.py examples/06_imports/example.yml --output-format yaml
+#
+# Imports are resolved relative to the file that declares them. Imported trees
+# keep independent source roots while their returned nodes rebind to destinations.
+
+parent_value: 5
+
+instance:
+  # import_yaml() loads library.yml lazily; the prototype adapts to this location.
+  <<$: import_yaml("library.yml").prototype
+
+# `import` is an alias for import_yaml.
+yaml_alias_value$: import("library.yml").constant
+
+# JSON imports are equally lazy and may contain Jinest suffix keys.
+json_tree$: import_json("data.json")
+json_value$: import_json("data.json").double
+
+# All import helpers are also available as filters.
+via_yaml_filter$: '"library.yml" | import | attr("constant")'
+via_json_filter$: '"data.json" | import_json | attr("double")'

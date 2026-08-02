@@ -1,0 +1,69 @@
+# Run from the repository root:
+#   python jinest.py examples/05_paths_and_metadata/example.yml --output-format yaml
+#
+# PathRef values are immutable, navigable paths. Nodes also expose path,
+# source_path, root, and file metadata attributes.
+
+target:
+  value: 42
+  absolute: 19
+
+# Non-identifier keys use bracket notation in canonical PathRef strings.
+some-key:
+  value: 7
+
+calc:
+  # These real fields intentionally collide with node metadata names.
+  path: real-path-field
+  source_path: real-source-path-field
+  root: real-root-field
+  file: real-file-field
+
+  # Dot access selects metadata even when a real field has the same name.
+  metadata_path@: "{{ context.path }}"
+  metadata_source_path@: "{{ context.source_path }}"
+  metadata_root_path@: "{{ context.root.path }}"
+  metadata_file_known$: context.file is not none
+
+  # Brackets select the real colliding fields.
+  real_path$: 'context["path"]'
+  real_source_path$: 'context["source_path"]'
+  real_root$: 'context["root"]'
+  real_file$: 'context["file"]'
+
+  # PathRef navigation and `.absolute` build a canonical destination path.
+  target_path@: "{{ path._.target.value.absolute }}"
+  target_value$: at(path._.target.value)
+  target_value_from_string$: at("global_root.target.value")
+  bracket_absolute_value$: 'at(path._.target["absolute"])'
+  non_identifier_path@: '{{ path._["some-key"].value.absolute }}'
+  non_identifier_value$: 'at(path._["some-key"].value)'
+
+  # get() safely handles a missing or invalid path.
+  missing_with_default$: get(path._.target.missing, 99)
+
+  # String paths can be parsed and normalized.
+  normalized@: '{{ normalize_path("global_root.target[\"value\"]") }}'
+
+  # path_of() returns a node path; `path=` aliases relative_path()'s base.
+  relative@: >-
+    {{ relative_path(path_of(global_root.target).value, path=context) }}
+
+  # absolute_path() accepts `root=` as an alias for its anchor argument.
+  absolute_from_relative@: >-
+    {{ absolute_path(
+      relative_path(path_of(global_root.target).value, path=context),
+      root=context
+    ) }}
+
+  # Indexing a node with a relative PathRef reanchors it to that node.
+  relative_value$: >-
+    context[relative_path(path_of(global_root.target).value, context)]
+
+  # at() may return an entire node, which is rebound under this field.
+  copied_target$: at(path_of(global_root.target))
+
+  # Explicit source helpers mirror the metadata attributes.
+  origin_source_path@: "{{ source_path_of(origin) }}"
+  source_root_path@: "{{ root_of(origin).path }}"
+  source_file_known$: source_file(origin) is not none

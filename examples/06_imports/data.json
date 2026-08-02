@@ -1,0 +1,4 @@
+{
+  "value": 21,
+  "double$": "root.value * 2"
+}
