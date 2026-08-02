@@ -1,0 +1,4 @@
+# Unterminated Jinja control flow must fail rather than silently resolve.
+value^: |
+  % if true
+  % return 42

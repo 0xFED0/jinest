@@ -1,0 +1,13 @@
+parent_value: 5
+instance:
+  absolute: 10
+  relative: 5
+  destination: global_root.instance
+  declaration: root.prototype
+json_object:
+  value: 21
+  double: 42
+json_value: 42
+via_filter: 10
+nested_value: 99
+

@@ -1,0 +1,16 @@
+# A prototype keeps its source root but is rebound to each destination context.
+parent_value: 100
+constant: 10
+prototype:
+  local: 3
+  local_value$: local
+  inherited_parent$: _.parent_value
+  source_constant$: root.constant
+  destination@: "{{ context.path }}"
+  declaration@: "{{ origin.path }}"
+instance_group:
+  parent_value: 7
+  first:
+    <<$: root.prototype
+    local: 11
+  second$: root.prototype

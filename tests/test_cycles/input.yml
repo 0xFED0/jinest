@@ -1,0 +1,10 @@
+# Recursive fields and layers deterministically resolve to null.
+fields:
+  a$: b
+  b$: a
+scripts:
+  a^: "% return b"
+  b^: "% return a"
+layers:
+  <<$: context
+  retained: true

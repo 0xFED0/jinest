@@ -1,0 +1,2 @@
+# The second-level import is relative to nested/entry.yml.
+value$: "import_yaml('extra.yml').answer"

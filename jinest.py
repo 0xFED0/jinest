@@ -1745,8 +1745,10 @@ class Resolver:
                 raise ValueError(format)
         except JinestError:
             raise
+        except FileNotFoundError as exc:
+            raise JinestImportError(f"Import file not found: {requested}") from exc
         except Exception as exc:
-            raise JinestImportError(f"Failed to import {path}: {exc}") from exc
+            raise JinestImportError(f"Failed to import {requested}: {exc}") from exc
 
         child = Resolver(
             data,
@@ -2213,12 +2215,15 @@ def _main() -> None:
     if not args.input:
         parser.error("input is required unless --self-test is used")
 
-    rendered = resolve_file(
-        args.input,
-        output=args.output,
-        output_format=args.output_format,
-        sandboxed=not args.unsafe,
-    )
+    try:
+        rendered = resolve_file(
+            args.input,
+            output=args.output,
+            output_format=args.output_format,
+            sandboxed=not args.unsafe,
+        )
+    except (JinestError, OSError, ValueError) as exc:
+        parser.exit(1, f"jinest: {exc}\n")
     if args.output is None:
         print(rendered)
 

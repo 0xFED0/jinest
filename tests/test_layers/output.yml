@@ -1,0 +1,22 @@
+defaults_one:
+  rank: default-one
+  one: true
+defaults_two:
+  rank: default-two
+  two: true
+overrides_one:
+  rank: override-one
+  override_one: true
+overrides_two:
+  rank: override-two
+  override_two: true
+service:
+  rank: override-two
+  one: true
+  two: true
+  port: 8080
+  override_one: true
+  override_two: true
+empty_layer:
+  value: retained
+

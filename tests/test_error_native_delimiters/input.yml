@@ -1,0 +1,2 @@
+# A native expression must not use full-template delimiters.
+value$: "{{ 42 }}"

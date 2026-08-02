@@ -488,6 +488,20 @@ python jinest.py config.yaml --unsafe
 python jinest.test.py
 ```
 
+Portable CLI fixtures live in `tests/<test-name>/`. Each directory contains an
+`input.yml` and the byte-for-byte expected `output.yml`, so another Jinest
+implementation can run the same scenarios without importing Python tests:
+
+```bash
+./run_tests.sh
+./run_tests.sh 'python3 jinest.py'
+JINEST_CMD='python3 jinest.py' ./run_tests.sh
+```
+
+`input.yml` is required. `output.yml`, `stderr.txt`, and `exit_code` are
+optional: omitted stream files mean an empty stream, and an omitted exit code
+means success (`0`). This makes the same runner suitable for negative tests.
+
 To test another file:
 
 ```bash

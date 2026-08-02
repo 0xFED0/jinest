@@ -1,0 +1,1 @@
+jinest: Merge global_root.target['<<$'] produced int, expected a mapping

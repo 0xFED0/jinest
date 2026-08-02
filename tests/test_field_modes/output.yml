@@ -1,0 +1,11 @@
+project: Jinest
+port: 8080
+label: Jinest listens on 8080
+next_port: 8081
+settings:
+  enabled: true
+  ports:
+  - 8080
+  - 8081
+priority: literal-wins
+

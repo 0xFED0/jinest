@@ -1,0 +1,16 @@
+config:
+  port: 8080
+  not-a-name: value
+service:
+  endpoint: http://localhost:8080
+  own_path: global_root.service
+  config_path: global_root.config
+  normalized: global_root.config.port
+  absolute: global_root.config.port
+  relative: _.config.port
+  looked_up: 8080
+  fallback: 30
+  special: value
+  source_path: root.service
+  source_file_known: true
+

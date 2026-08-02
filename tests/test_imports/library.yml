@@ -1,0 +1,6 @@
+constant: 10
+prototype:
+  absolute$: root.constant
+  relative$: _.parent_value
+  destination@: "{{ context.path }}"
+  declaration@: "{{ origin.path }}"

@@ -1,0 +1,25 @@
+# Defaults, local fields, then overrides; numbered layers are lazy.
+defaults_one:
+  rank: default-one
+  one: true
+defaults_two:
+  rank: default-two
+  two: true
+overrides_one:
+  rank: override-one
+  override_one: true
+overrides_two:
+  rank: override-two
+  override_two: true
+service:
+  <<1$: root.defaults_one
+  <<2^: |
+    % return root.defaults_two
+  rank: local
+  port: 8080
+  <<1!$: root.overrides_one
+  <<2!^: |
+    % return root.overrides_two
+empty_layer:
+  <<$: "none"
+  value: retained
