@@ -63,6 +63,9 @@ app:
 
 Jinest currently ships as one Python file. Copy `jinest.py` into your project, then install Jinja:
 
+**Python compatibility:** Python 3.10 is the minimum supported version.
+Development and compatibility testing primarily target Python 3.11 and newer.
+
 ```bash
 python -m pip install "jinja2>=3.1"
 ```
