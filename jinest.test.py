@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for Jinest 0.7.0.
+"""Regression tests for Jinest 0.8.0.
 
 Run:
     python jinest.test.py
@@ -60,7 +60,7 @@ except ImportError:
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.7.0")
+        self.assertEqual(jinest.__version__, "0.8.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -523,6 +523,57 @@ container:
                 jinest.resolve_file(folder / "main.yaml", output_format="json")
             )
             self.assertEqual(result["base"]["common"]["double"], 24)
+
+    def test_import_roots_restrict_imports_and_propagate_to_children(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            project = folder / "project"
+            (project / "templates").mkdir(parents=True)
+            (project / "shared").mkdir()
+            outside = folder / "outside"
+            outside.mkdir()
+            (project / "shared" / "common.yaml").write_text(
+                "value: 12\n",
+                encoding="utf-8",
+            )
+            (project / "templates" / "base.yaml").write_text(
+                "common$: import('../shared/common.yaml')\n",
+                encoding="utf-8",
+            )
+            (project / "main.yaml").write_text(
+                "base$: import('templates/base.yaml')\n",
+                encoding="utf-8",
+            )
+            (outside / "secret.yaml").write_text("value: secret\n", encoding="utf-8")
+            (project / "escape.yaml").write_text(
+                "secret$: import('../outside/secret.yaml')\n",
+                encoding="utf-8",
+            )
+
+            allowed = json.loads(
+                jinest.resolve_file(
+                    project / "main.yaml",
+                    output_format="json",
+                    import_roots=[project],
+                )
+            )
+            self.assertEqual(allowed, {"base": {"common": {"value": 12}}})
+
+            with self.assertRaisesRegex(
+                jinest.JinestImportError,
+                "outside permitted roots",
+            ):
+                jinest.resolve_file(
+                    project / "escape.yaml",
+                    output_format="json",
+                    import_roots=[project],
+                )
+            with self.assertRaises(jinest.JinestImportError):
+                jinest.resolve_file(
+                    project / "main.yaml",
+                    output_format="json",
+                    import_roots=[],
+                )
 
     def test_import_cycle_resolves_current_path_to_none(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
