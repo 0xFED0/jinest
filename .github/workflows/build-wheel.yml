@@ -1,0 +1,96 @@
+name: Build wheel
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch or tag to build
+        required: false
+        type: string
+    outputs:
+      version:
+        description: Version read from jinest.py
+        value: ${{ jobs.build.outputs.version }}
+      filename:
+        description: Built wheel filename
+        value: ${{ jobs.build.outputs.filename }}
+      artifact_name:
+        description: Uploaded wheel artifact name
+        value: ${{ jobs.build.outputs.artifact_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.wheel.outputs.version }}
+      filename: ${{ steps.wheel.outputs.filename }}
+      artifact_name: ${{ steps.wheel.outputs.artifact_name }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install build backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+
+      - name: Build wheel
+        run: python -m build --wheel
+
+      - name: Verify wheel and read metadata
+        id: wheel
+        run: |
+          shopt -s nullglob
+          wheels=(dist/jinest-*.whl)
+          if (( ${#wheels[@]} != 1 )); then
+            printf 'Expected one Jinest wheel, found: %s\n' "${wheels[*]:-none}" >&2
+            exit 1
+          fi
+          wheel="${wheels[0]}"
+          python -m zipfile -t "$wheel"
+          version="$(python - <<'PY2'
+          import ast
+          from pathlib import Path
+
+          tree = ast.parse(Path("jinest.py").read_text(encoding="utf-8"))
+          for node in tree.body:
+              if not isinstance(node, ast.Assign):
+                  continue
+              if not any(
+                  isinstance(target, ast.Name) and target.id == "__version__"
+                  for target in node.targets
+              ):
+                  continue
+              if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                  print(node.value.value)
+                  break
+          else:
+              raise SystemExit("Could not find string __version__ in jinest.py")
+          PY2
+          )"
+          filename="$(basename "$wheel")"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'filename=%s\n' "$filename" >> "$GITHUB_OUTPUT"
+          printf 'artifact_name=jinest-%s.whl\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.wheel.outputs.artifact_name }}
+          path: dist/${{ steps.wheel.outputs.filename }}
+          if-no-files-found: error

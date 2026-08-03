@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jinest"
+dynamic = ["version"]
+description = "Lazy structured Jinja resolution for Python, JSON, and YAML"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "Jinja2>=3.1",
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+jinest = "jinest:_main"
+
+[tool.setuptools]
+py-modules = ["jinest"]
+
+[tool.setuptools.dynamic]
+version = { attr = "jinest.__version__" }

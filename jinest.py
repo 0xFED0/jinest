@@ -67,7 +67,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _RESERVED_NAMES = {

@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.7.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.8.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Highlights
 
@@ -66,14 +66,24 @@ Jinest currently ships as one Python file. Copy `jinest.py` into your project, t
 **Python compatibility:** Python 3.10 is the minimum supported version.
 Development and compatibility testing primarily target Python 3.11 and newer.
 
+Install the package with its standard Jinja2 and PyYAML dependencies:
+
 ```bash
-python -m pip install "jinja2>=3.1"
+python -m pip install jinest
 ```
 
-YAML support additionally requires PyYAML:
+For a local checkout, build a wheel and install it:
 
 ```bash
-python -m pip install pyyaml
+python -m pip install build
+python -m build --wheel
+python -m pip install dist/jinest-*-py3-none-any.whl
+```
+
+The installed wheel exposes the `jinest` CLI:
+
+```bash
+jinest config.yaml
 ```
 
 ## Syntax
