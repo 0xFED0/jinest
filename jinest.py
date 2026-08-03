@@ -132,11 +132,17 @@ class _JinestJSONEncoder(json.JSONEncoder):
                 return "NaN"
             return "Infinity" if number > 0 else "-Infinity"
 
+        # Python 3.13 expects a prepared indent string here; older versions
+        # also accept it, so normalize before using this private helper.
+        indent = self.indent
+        if indent is not None and not isinstance(indent, str):
+            indent = " " * indent
+
         encoder = json.encoder._make_iterencode(
             markers,
             self.default,
             _encode_json_string,
-            self.indent,
+            indent,
             floatstr,
             self.key_separator,
             self.item_separator,
