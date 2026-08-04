@@ -420,6 +420,19 @@ import_json("file.json")
 
 Relative paths are resolved from the file containing the import. Imported trees remain lazy and retain their own `root`, `source_path`, and `file` metadata.
 
+To restrict imports to one or more project directories, pass `import_roots` to
+`Resolver`, `resolve`, `resolve_text`, or `resolve_file`. Paths are resolved
+before the check, so `..` and symlinks cannot escape an allowed root. `None`
+(the default) permits imports anywhere accessible to the process; `[]` denies
+all imports.
+
+```python
+result = resolve_file(
+    "project/config.yaml",
+    import_roots=["project"],
+)
+```
+
 An import already active in the current import ancestry resolves to `null`, matching ordinary field-cycle semantics.
 
 ## Python API
@@ -523,11 +536,14 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The test suite contains 59 regression tests covering expressions, templates, scripts, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
+The test suite contains 60 regression tests covering expressions, templates, scripts, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
 
 ## Security
 
 Jinest uses a sandboxed Jinja environment by default. The sandbox reduces exposure but is not a complete security boundary for hostile templates. Imported files also grant filesystem reads available to the running process. Use an OS-level sandbox and restrict accessible directories for adversarial inputs.
+
+When using the Python API, `import_roots` can additionally restrict imports to
+specific project directories.
 
 ## License
 

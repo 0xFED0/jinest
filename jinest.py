@@ -67,7 +67,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _RESERVED_NAMES = {
@@ -656,6 +656,7 @@ class Resolver:
         filters: Mapping[str, Any] | None = None,
         source_path: str | os.PathLike[str] | None = None,
         base_dir: str | os.PathLike[str] | None = None,
+        import_roots: Sequence[str | os.PathLike[str]] | None = None,
         _import_chain: tuple[Path, ...] | None = None,
         _global_owner: "Resolver | None" = None,
     ) -> None:
@@ -680,6 +681,17 @@ class Resolver:
             self.base_dir = self.source_path.parent
         else:
             self.base_dir = Path.cwd().resolve()
+
+        if import_roots is None:
+            self.import_roots: tuple[Path, ...] | None = None
+        else:
+            if isinstance(import_roots, (str, os.PathLike)):
+                raise TypeError("import_roots must be a sequence of directories")
+            roots = tuple(Path(root).expanduser().resolve() for root in import_roots)
+            for root in roots:
+                if not root.is_dir():
+                    raise ValueError(f"Import root is not a directory: {root}")
+            self.import_roots = roots
 
         if _import_chain is not None:
             self._import_chain = _import_chain
@@ -1731,6 +1743,13 @@ class Resolver:
         path = requested if requested.is_absolute() else self.base_dir / requested
         path = path.resolve()
 
+        if self.import_roots is not None and not any(
+            path.is_relative_to(root) for root in self.import_roots
+        ):
+            raise JinestImportError(
+                f"Import path is outside permitted roots: {requested}"
+            )
+
         # Import cycles follow ordinary field-cycle semantics: the currently
         # importing path resolves to None.
         if path in self._import_chain:
@@ -1763,6 +1782,7 @@ class Resolver:
             globals=self._user_globals,
             filters=self._user_filters,
             source_path=path,
+            import_roots=self.import_roots,
             _import_chain=self._import_chain + (path,),
             _global_owner=self._global_owner,
         )
