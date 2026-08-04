@@ -1,0 +1,3 @@
+# First half of an intentional import cycle.
+name: a
+next$: import("cycle_b.yml")

@@ -1,0 +1,41 @@
+# Run from the repository root:
+#   python jinest.py examples/01_field_modes/example.yml --output-format yaml
+#
+# This example covers literal fields plus the @, $, and ^ field modes.
+
+project: Jinest
+port: 8080
+enabled: true
+
+# @ renders a complete Jinja template and always produces text.
+label@: "{{ project }} listens on {{ port }}"
+
+# $ evaluates exactly one Jinja expression and preserves its native type.
+next_port$: port + 1
+settings$: "{'enabled': enabled, 'ports': [port, port + 1]}"
+
+# ^ executes a multiline script. `return` may produce any native value.
+status^: |
+  % if enabled and port > 0
+    % return {
+      "state": "ready",
+      "endpoint": "http://localhost:" ~ port
+    }
+  % endif
+  % return {"state": "disabled", "endpoint": none}
+
+# Local alternatives use: literal > ^ > $ > @.
+# The deliberately broken lower-priority alternatives are never evaluated.
+priority: literal-wins
+priority^: "% return missing.script.value"
+priority$: missing.native.value
+priority@: "{{ missing.text.value }}"
+
+# Without a literal field, ^ wins over $ and @.
+script_priority@: "{{ missing.text.value }}"
+script_priority$: missing.native.value
+script_priority^: |
+  % return 42
+
+# An ordinary YAML null remains a native None/null.
+optional: null

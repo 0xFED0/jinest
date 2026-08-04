@@ -494,6 +494,18 @@ To test another file:
 JINEST_MODULE=/path/to/jinest.py python jinest.test.py
 ```
 
+## Examples
+
+The [`examples/`](examples/) directory contains runnable, commented examples
+covering field modes, scripts, arrays, layers, prototypes, paths, imports,
+cycles, Python API extensions, extended scalar values, and scalar roots.
+
+Validate every documented result with:
+
+```bash
+python examples/validate.py
+```
+
 The test suite contains 59 regression tests covering expressions, templates, scripts, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
 
 ## Security

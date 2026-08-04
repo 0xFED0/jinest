@@ -1,0 +1,55 @@
+# Run from the repository root:
+#   python jinest.py examples/03_lazy_layers/example.yml --output-format yaml
+#
+# Layer precedence is: defaults -> local fields -> overrides.
+# Lookup therefore checks the last override first and the first default last.
+
+defaults_one:
+  rank: default-1
+  from_default_one: true
+  shared: from-default-1
+
+defaults_two:
+  rank: default-2
+  from_default_two: true
+  shared: from-default-2
+
+overrides_one:
+  rank: override-1
+  from_override_one: true
+  shared: from-override-1
+
+overrides_two:
+  rank: override-2
+  from_override_two: true
+  shared: from-override-2
+
+target:
+  # Source order is deliberately scrambled; N controls order within each family.
+  <<2!^: |
+    % return global_root.overrides_two
+  <<2$: global_root.defaults_two
+
+  rank: local
+  local_only: true
+  shared: from-local
+
+  <<1!$: global_root.overrides_one
+  <<1^: |
+    % return global_root.defaults_one
+
+# A null layer is equivalent to an empty mapping.
+apply_optional: false
+optional_target:
+  <<$: global_root.defaults_one
+  <<2^: |
+    % if global_root.apply_optional
+      % return {"optional_value": 123}
+    % endif
+    % return none
+  local_value: present
+
+# A layer that refers to its own destination is treated as empty, not infinite.
+recursive_target:
+  <<$: global_root.recursive_target
+  survived: true

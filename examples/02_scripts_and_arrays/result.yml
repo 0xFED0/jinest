@@ -1,0 +1,40 @@
+base: 4
+
+# Native expressions retained booleans, mappings, integers, and PathRef strings.
+native_values:
+  - 5
+  - 8
+  - true
+  - nested: 4
+  - global_root.native_values[4]
+  - 99
+
+# Text templates always became strings; the literal integer stayed literal.
+text_values:
+  - base=4
+  - root=4
+  - item path=global_root.text_values[2]
+  - 99
+
+script_values:
+  - 14
+  - doubled: 8
+  - 99
+
+# These strings were returned by a single expression, so they were not re-rendered.
+computed_list:
+  - base + 1
+  - root.base
+
+first_large: 7
+summary:
+  count: 4
+  total: 10
+standard_block_syntax: 12
+literal_percent_text: |-
+  % this line remains ordinary text
+  base=4
+empty_return: null
+implicit_null: null
+last_native: 99
+middle_native: [8, true]

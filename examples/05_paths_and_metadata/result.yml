@@ -1,0 +1,46 @@
+target:
+  value: 42
+  absolute: 19
+
+some-key:
+  value: 7
+
+calc:
+  # The colliding real fields remain available in the materialized mapping.
+  path: real-path-field
+  source_path: real-source-path-field
+  root: real-root-field
+  file: real-file-field
+
+  # Dot access read metadata, not the four real fields above.
+  metadata_path: global_root.calc
+  metadata_source_path: root.calc
+  metadata_root_path: root
+  metadata_file_known: true
+
+  # Bracket access read the actual fields.
+  real_path: real-path-field
+  real_source_path: real-source-path-field
+  real_root: real-root-field
+  real_file: real-file-field
+
+  target_path: global_root.target.value
+  target_value: 42
+  target_value_from_string: 42
+  bracket_absolute_value: 19
+  non_identifier_path: global_root['some-key'].value
+  non_identifier_value: 7
+  missing_with_default: 99
+  normalized: global_root.target.value
+  relative: _.target.value
+  absolute_from_relative: global_root.target.value
+  relative_value: 42
+
+  # The returned target node was copied and rebound here.
+  copied_target:
+    value: 42
+    absolute: 19
+
+  origin_source_path: root.calc
+  source_root_path: root
+  source_file_known: true

@@ -1,0 +1,44 @@
+# Run from the repository root:
+#   python jinest.py examples/04_prototypes_and_context/example.yml --output-format yaml
+#
+# A mapping returned by $ can act as a reusable, destination-aware prototype.
+
+# The prototype itself is also materialized, so its parent has a valid value.
+parent_value: 100
+shared_constant: 10
+
+prototype:
+  local: 3
+
+  # Unqualified names resolve against the destination mapping.
+  local_value$: local
+
+  # `_` is the parent of the destination, not necessarily the declaration parent.
+  inherited_parent$: _.parent_value
+
+  # `root` belongs to the source declaration tree.
+  source_constant$: root.shared_constant
+
+  # `context` and `path` follow the destination.
+  destination@: "{{ context.path }}"
+  path_value@: "{{ path }}"
+  parent_path@: "{{ _.path }}"
+
+  # `origin` remains at the declaration site.
+  declaration@: "{{ origin.path }}"
+  destination_source_path@: "{{ source_path_of(context) }}"
+
+  # Main-file prototypes share the same source and global roots.
+  source_root@: "{{ root.path }}"
+  global_root_path@: "{{ global_root.path }}"
+
+instance_group:
+  parent_value: 7
+
+  # Merge inheritance lets local fields override prototype defaults.
+  first:
+    <<$: global_root.prototype
+    local: 11
+
+  # Returning the prototype as a field also creates a destination-bound copy.
+  second$: global_root.prototype

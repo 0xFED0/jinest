@@ -1,0 +1,10 @@
+value: 5
+
+# Values produced by the custom global and filter.
+doubled: 10
+decorated: <5>
+
+# Non-strict missing native/script values become null; text becomes empty.
+missing_native: null
+missing_script: null
+missing_text: beforeafter

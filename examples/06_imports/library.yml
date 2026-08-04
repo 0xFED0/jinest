@@ -1,0 +1,22 @@
+# This file has its own source `root`, distinct from the main global_root.
+constant: 10
+
+prototype:
+  local: 3
+
+  # Absolute source references stay attached to library.yml.
+  absolute$: root.constant
+
+  # Relative references adapt to the destination parent in example.yml.
+  relative$: _.parent_value
+
+  # Destination and declaration metadata intentionally point to different trees.
+  destination@: "{{ path }}"
+  declaration@: "{{ origin.path }}"
+  source_root@: "{{ root.path }}"
+  global_root_path@: "{{ global_root.path }}"
+  destination_source_path@: "{{ source_path_of(context) }}"
+  source_file_known$: source_file(origin) is not none
+
+  # This nested import is relative to library.yml, not to the process cwd.
+  extra$: import("nested/extra.yml")
