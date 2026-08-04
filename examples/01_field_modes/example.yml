@@ -37,5 +37,16 @@ script_priority$: missing.native.value
 script_priority^: |
   % return 42
 
+# Dot-prefixed fields are hidden intermediate values. Templates access them
+# without the dot; they are never written to the final document.
+.internal_port$: "port + 1"
+.release_id@: "{{ project | lower }}-{{ internal_port }}"
+
+# If both forms exist, templates use .internal_port (8081), while the ordinary
+# internal_port is retained only for the final dump.
+internal_port: published-but-not-used-for-computation
+effective_port$: "internal_port + 1"
+release_endpoint@: "https://example.test/{{ release_id }}"
+
 # An ordinary YAML null remains a native None/null.
 optional: null

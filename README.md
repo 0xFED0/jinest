@@ -93,6 +93,7 @@ jinest config.yaml
 | `name@` | Full Jinja text template; result is a string |
 | `name$` | One Jinja expression; result preserves its native type |
 | `name^` | Multiline Jinja script; `return` produces a native value |
+| `.name`, `.name$`, `.name@`, `.name^` | Hidden field; use it in Jinja as `name`, but omit it from final output |
 | `<<$`, `<<N$` | Native-expression default layer |
 | `<<^`, `<<N^` | Script default layer |
 | `<<!$`, `<<N!$` | Native-expression override layer |
@@ -105,6 +106,23 @@ name > name^ > name$ > name@
 ```
 
 Ignored lower-priority alternatives are not parsed or evaluated.
+
+## Hidden fields
+
+Prefix a field name with `.` to create an intermediate value. It is available
+inside templates without the prefix and is never emitted in the resolved JSON
+or YAML. When both `.name` and `name` are declared, templates resolve `name`
+from `.name`; the public `name` remains independent and is used only in the
+final dump. The same rule applies to `$`, `@`, and `^` field modes.
+
+```yaml
+price: 100
+.tax$: "price * 0.2"       # available as `tax` in templates
+shown_tax: standard rate     # a normal output field
+total$: "price + tax"
+```
+
+The result contains `price`, `shown_tax`, and `total: 120.0`, but no `.tax`.
 
 ## Native expressions: `$`
 

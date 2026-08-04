@@ -20,4 +20,10 @@ status:
 # Only the winning alternatives appear; suffixes are removed.
 priority: literal-wins
 script_priority: 42
+
+# .internal_port and .release_id remain available during rendering but are hidden.
+# The public field of the same name is emitted unchanged.
+internal_port: published-but-not-used-for-computation
+effective_port: 8082
+release_endpoint: https://example.test/jinest-8081
 optional: null

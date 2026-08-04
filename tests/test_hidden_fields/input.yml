@@ -1,0 +1,13 @@
+# Dot-prefixed declarations are intermediate values and do not appear in output.
+price: 100
+.tax$: "price * 0.2" # In templates, this is available as `tax`.
+tax: public tax value # This ordinary field is retained only for the final dump.
+total$: "price + tax" # Uses the hidden tax (20.0), not the public string.
+
+nested:
+  name: Jinest
+  .label@: "private {{ name }}"
+  label: public label
+  message@: "{{ label }}" # Resolves from .label, while label stays public in output.
+
+.only@: "not emitted"

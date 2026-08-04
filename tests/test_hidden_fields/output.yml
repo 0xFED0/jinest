@@ -1,0 +1,8 @@
+price: 100
+tax: public tax value
+total: 120.0
+nested:
+  name: Jinest
+  label: public label
+  message: private Jinest
+

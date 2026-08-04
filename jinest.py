@@ -10,6 +10,8 @@ Syntax
 * ``name$`` — evaluate one native Jinja expression.
 * ``name^`` — execute a multiline Jinja script with ``%`` line statements and
   ``return`` a native value.
+* ``.name`` — a hidden field, available to Jinja as ``name`` but omitted from
+  the final resolved mapping.
 * Local priority is ``name`` > ``name^`` > ``name$`` > ``name@``.
 * ``<<$`` / ``<<N$`` and ``<<^`` / ``<<N^`` add lazy default layers.
 * ``<<!$`` / ``<<N!$`` and ``<<!^`` / ``<<N!^`` add lazy override layers.
@@ -501,7 +503,11 @@ class _ContainerProxy:
 class _MappingProxy(_ContainerProxy, Mapping):
     """Lazy mapping with default, local, and override layers."""
 
-    __slots__ = ("_jinest_resolved", "_jinest_layer_cache")
+    __slots__ = (
+        "_jinest_resolved",
+        "_jinest_public_resolved",
+        "_jinest_layer_cache",
+    )
 
     def __init__(
         self,
@@ -513,6 +519,7 @@ class _MappingProxy(_ContainerProxy, Mapping):
     ) -> None:
         super().__init__(owner, source, parent, path, path_kind)
         object.__setattr__(self, "_jinest_resolved", {})
+        object.__setattr__(self, "_jinest_public_resolved", {})
         object.__setattr__(self, "_jinest_layer_cache", {})
 
     def __getattribute__(self, name: str) -> Any:
@@ -1025,14 +1032,22 @@ class Resolver:
         self._schema_cache[raw_id] = schema
         return schema
 
-    def _local_candidate(self, raw: Mapping[Any, Any], key: Any) -> _Candidate | None:
-        if key in raw and self._merge_key(key) is None:
-            return _Candidate(key, raw[key], "concrete")
+    def _local_candidate(
+        self,
+        raw: Mapping[Any, Any],
+        key: Any,
+        *,
+        hidden: bool,
+    ) -> _Candidate | None:
+        """Return one local declaration from the hidden or public namespace."""
+        source_key = f".{key}" if hidden and isinstance(key, str) else key
+        if source_key in raw and self._merge_key(source_key) is None:
+            return _Candidate(source_key, raw[source_key], "concrete")
 
-        if isinstance(key, str):
-            script_key = f"{key}^"
-            native_key = f"{key}$"
-            text_key = f"{key}@"
+        if isinstance(source_key, str):
+            script_key = f"{source_key}^"
+            native_key = f"{source_key}$"
+            text_key = f"{source_key}@"
             if script_key in raw:
                 return _Candidate(script_key, raw[script_key], "script")
             if native_key in raw:
@@ -1041,12 +1056,16 @@ class Resolver:
                 return _Candidate(text_key, raw[text_key], "text")
         return None
 
+    @staticmethod
+    def _hidden_name(key: Any) -> bool:
+        return isinstance(key, str) and not key.startswith(".")
+
     def _scope_has_logical(self, scope: _MappingProxy, key: Any) -> bool:
         resolved = object.__getattribute__(scope, "_jinest_resolved")
         if key in resolved:
             return True
         source = object.__getattribute__(scope, "_jinest_source")
-        return self._contains(source, key, bind=scope, active=set())
+        return self._contains(source, key, bind=scope, active=set(), hidden=None)
 
     def _contains(
         self,
@@ -1054,9 +1073,22 @@ class Resolver:
         key: Any,
         *,
         bind: _MappingProxy,
-        active: set[tuple[int, int, Any]],
+        active: set[tuple[Any, ...]],
+        hidden: bool | None,
     ) -> bool:
-        token = (id(source.resolver), id(source.raw), self._hashable_key(key))
+        if hidden is None:
+            if self._hidden_name(key) and self._contains(
+                source, key, bind=bind, active=active, hidden=True
+            ):
+                return True
+            return self._contains(source, key, bind=bind, active=active, hidden=False)
+
+        token = (
+            id(source.resolver),
+            id(source.raw),
+            self._hashable_key(key),
+            hidden,
+        )
         if token in active:
             return False
         active.add(token)
@@ -1065,22 +1097,36 @@ class Resolver:
 
             for layer in reversed(schema.overrides):
                 layer_source = self._evaluate_layer(bind, source, layer)
-                if self._contains(layer_source, key, bind=bind, active=active):
+                if self._contains(
+                    layer_source, key, bind=bind, active=active, hidden=hidden
+                ):
                     return True
 
-            if self._local_candidate(source.raw, key) is not None:
+            if self._local_candidate(source.raw, key, hidden=hidden) is not None:
                 return True
 
             for layer in reversed(schema.defaults):
                 layer_source = self._evaluate_layer(bind, source, layer)
-                if self._contains(layer_source, key, bind=bind, active=active):
+                if self._contains(
+                    layer_source, key, bind=bind, active=active, hidden=hidden
+                ):
                     return True
             return False
         finally:
             active.remove(token)
 
     def _get_field(self, scope: _MappingProxy, key: Any) -> Any:
-        resolved = object.__getattribute__(scope, "_jinest_resolved")
+        return self._get_cached_field(scope, key, public=False)
+
+    def _get_public_field(self, scope: _MappingProxy, key: Any) -> Any:
+        """Resolve a key for serialization, ignoring its hidden declaration."""
+        return self._get_cached_field(scope, key, public=True)
+
+    def _get_cached_field(
+        self, scope: _MappingProxy, key: Any, *, public: bool
+    ) -> Any:
+        cache_name = "_jinest_public_resolved" if public else "_jinest_resolved"
+        resolved = object.__getattribute__(scope, cache_name)
         if key in resolved:
             return resolved[key]
 
@@ -1088,7 +1134,13 @@ class Resolver:
         object.__getattribute__(scope, "_jinest_children").pop(key, None)
         try:
             source = object.__getattribute__(scope, "_jinest_source")
-            value = self._lookup(source, key, bind=scope, active=set())
+            value = self._lookup(
+                source,
+                key,
+                bind=scope,
+                active=set(),
+                hidden=False if public else None,
+            )
             if value is _MISSING:
                 raise KeyError(key)
         except Exception:
@@ -1105,9 +1157,25 @@ class Resolver:
         key: Any,
         *,
         bind: _MappingProxy,
-        active: set[tuple[int, int, Any]],
+        active: set[tuple[Any, ...]],
+        hidden: bool | None,
     ) -> Any:
-        token = (id(source.resolver), id(source.raw), self._hashable_key(key))
+        """Look up a key, preferring the hidden namespace when requested."""
+        if hidden is None:
+            if self._hidden_name(key):
+                value = self._lookup(
+                    source, key, bind=bind, active=active, hidden=True
+                )
+                if value is not _MISSING:
+                    return value
+            return self._lookup(source, key, bind=bind, active=active, hidden=False)
+
+        token = (
+            id(source.resolver),
+            id(source.raw),
+            self._hashable_key(key),
+            hidden,
+        )
         if token in active:
             return _MISSING
         active.add(token)
@@ -1117,17 +1185,21 @@ class Resolver:
             # Reverse lookup of: defaults -> local -> overrides.
             for layer in reversed(schema.overrides):
                 layer_source = self._evaluate_layer(bind, source, layer)
-                value = self._lookup(layer_source, key, bind=bind, active=active)
+                value = self._lookup(
+                    layer_source, key, bind=bind, active=active, hidden=hidden
+                )
                 if value is not _MISSING:
                     return value
 
-            candidate = self._local_candidate(source.raw, key)
+            candidate = self._local_candidate(source.raw, key, hidden=hidden)
             if candidate is not None:
                 return self._resolve_candidate(candidate, source, bind, key)
 
             for layer in reversed(schema.defaults):
                 layer_source = self._evaluate_layer(bind, source, layer)
-                value = self._lookup(layer_source, key, bind=bind, active=active)
+                value = self._lookup(
+                    layer_source, key, bind=bind, active=active, hidden=hidden
+                )
                 if value is not _MISSING:
                     return value
 
@@ -1830,6 +1902,8 @@ class Resolver:
                     continue
                 template_info = self._template_key(source_key)
                 logical = template_info[0] if template_info else source_key
+                if isinstance(logical, str) and logical.startswith("."):
+                    continue
                 if logical not in seen:
                     seen.add(logical)
                     result.append(logical)
@@ -1860,7 +1934,9 @@ class Resolver:
             active.add(token)
             try:
                 return {
-                    key: self._to_plain(value[key], active=active)
+                    key: self._to_plain(
+                        self._get_public_field(value, key), active=active
+                    )
                     for key in self._public_keys(value)
                 }
             finally:

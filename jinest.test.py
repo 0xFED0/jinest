@@ -101,6 +101,57 @@ class JinestCoreTests(unittest.TestCase):
         self.assertEqual(result["example"]["sum"], 5)
         self.assertEqual(result["example"]["object"], {"value": 2, "enabled": True})
 
+    def test_hidden_fields_are_template_private_and_take_priority(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "price": 100,
+                ".tax$": "price * 0.2",
+                "tax": "public tax value",
+                "total$": "price + tax",
+                ".private_label@": "private {{ price }}",
+                "nested": {
+                    ".label@": "private {{ name }}",
+                    "name": "Jinest",
+                    "label": "public label",
+                    "message@": "{{ label }}",
+                },
+            }
+        )
+        self.assertEqual(resolver.root.tax, 20.0)
+        self.assertEqual(
+            resolver.resolve(),
+            {
+                "price": 100,
+                "tax": "public tax value",
+                "total": 120.0,
+                "nested": {
+                    "name": "Jinest",
+                    "label": "public label",
+                    "message": "private Jinest",
+                },
+            },
+        )
+
+        self.assertEqual(
+            jinest.resolve(
+                {
+                    "base": {".port": 8000},
+                    "service": {
+                        "<<$": "root.base",
+                        "port": 9000,
+                        "effective$": "port * 2",
+                    },
+                    ".answer^": "% return 41 + 1",
+                    "next_answer$": "answer + 1",
+                }
+            ),
+            {
+                "base": {},
+                "service": {"port": 9000, "effective": 16000},
+                "next_answer": 43,
+            },
+        )
+
     def test_local_priority_concrete_then_native_then_text(self) -> None:
         result = jinest.resolve(
             {
