@@ -1,0 +1,21 @@
+# Native, text, and script arrays resolve each string item lazily.
+x: 4
+native_values$:
+  - "x * 2"
+  - "{'answer': x + 1}"
+  - 7
+text_values@:
+  - "x={{ x }}"
+  - "path={{ path }}"
+script_values^:
+  - |
+      % return x + 10
+  - |
+      % for item in [1, 2, 3]
+        % if item == 2
+          % return {"found": item}
+        % endif
+      % endfor
+  - literal
+# An expression-returned list is already computed, not executed twice.
+ready$: "['x * 100', 'literal']"

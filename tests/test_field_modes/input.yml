@@ -1,0 +1,12 @@
+# Four field modes and their local precedence.
+project: Jinest
+port: 8080
+label@: "{{ project }} listens on {{ port }}"
+next_port$: "port + 1"
+settings^: |
+  % return {"enabled": true, "ports": [port, port + 1]}
+# Literal wins over the three suffixed alternatives.
+priority: literal-wins
+priority@: "ignored"
+priority$: "missing.value"
+priority^: "% return missing.value"

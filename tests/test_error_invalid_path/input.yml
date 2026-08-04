@@ -1,0 +1,2 @@
+# at() is strict: a missing destination path is an error.
+value$: "at('global_root.missing')"

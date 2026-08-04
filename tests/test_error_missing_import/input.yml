@@ -1,0 +1,2 @@
+# A missing imported source is a user-facing import error.
+value$: "import_yaml('missing.yml')"

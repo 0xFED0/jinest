@@ -1,0 +1,8 @@
+# Imports are resolved relative to this input.yml and preserve source metadata.
+parent_value: 5
+instance:
+  <<$: "import_yaml('library.yml').prototype"
+json_object$: "import_json('data.json')"
+json_value$: "import('data.json').double"
+via_filter$: "'library.yml' | import | attr('constant')"
+nested_value$: "import_yaml('nested/entry.yml').value"

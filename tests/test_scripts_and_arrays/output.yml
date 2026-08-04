@@ -1,0 +1,16 @@
+x: 4
+native_values:
+- 8
+- answer: 5
+- 7
+text_values:
+- x=4
+- path=global_root.text_values[1]
+script_values:
+- 14
+- found: 2
+- null
+ready:
+- x * 100
+- literal
+

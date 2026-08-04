@@ -1,0 +1,26 @@
+parent_value: 100
+constant: 10
+prototype:
+  local: 3
+  local_value: 3
+  inherited_parent: 100
+  source_constant: 10
+  destination: global_root.prototype
+  declaration: root.prototype
+instance_group:
+  parent_value: 7
+  first:
+    local: 11
+    local_value: 11
+    inherited_parent: 7
+    source_constant: 10
+    destination: global_root.instance_group.first
+    declaration: root.prototype
+  second:
+    local: 3
+    local_value: 3
+    inherited_parent: 7
+    source_constant: 10
+    destination: global_root.instance_group.second
+    declaration: root.prototype
+

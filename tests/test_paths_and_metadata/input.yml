@@ -1,0 +1,16 @@
+# Path values stay navigable until final YAML materialization.
+config:
+  port: 8080
+  "not-a-name": value
+service:
+  endpoint$: "'http://localhost:' ~ _.config.port"
+  own_path$: path
+  config_path$: "path._.config"
+  normalized$: "normalize_path('global_root.config.port')"
+  absolute$: "absolute_path('_.config.port', anchor=context)"
+  relative$: "relative_path('global_root.config.port', context)"
+  looked_up$: "at('global_root.config.port')"
+  fallback$: "get('global_root.config.missing', 30)"
+  special$: "at('global_root.config[\"not-a-name\"]')"
+  source_path$: "context.source_path"
+  source_file_known$: "source_file(context) is not none"

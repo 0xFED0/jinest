@@ -1,0 +1,3 @@
+# A merge layer must resolve to a mapping or null.
+target:
+  <<$: "42"

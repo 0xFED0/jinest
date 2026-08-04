@@ -1,0 +1,2 @@
+# An active import ancestry becomes null rather than recurring forever.
+other$: "import('other.yml')"
