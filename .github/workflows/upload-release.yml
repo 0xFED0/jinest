@@ -17,7 +17,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  build_wheel:
+    uses: ./.github/workflows/build-wheel.yml
+    with:
+      ref: ${{ inputs.ref }}
+
   test:
+    needs: build_wheel
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
@@ -31,7 +37,7 @@ jobs:
           ref: ${{ inputs.ref }}
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -53,7 +59,7 @@ jobs:
 
   release:
     name: Create GitHub release
-    needs: test
+    needs: [build_wheel, test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -95,6 +101,16 @@ jobs:
           )"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'tag=v%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify built wheel version
+        env:
+          WHEEL_VERSION: ${{ needs.build_wheel.outputs.version }}
+          SOURCE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [[ "$WHEEL_VERSION" != "$SOURCE_VERSION" ]]; then
+            echo "Wheel version $WHEEL_VERSION differs from source version $SOURCE_VERSION." >&2
+            exit 1
+          fi
 
       - name: Fail if release already exists
         env:
@@ -145,13 +161,21 @@ jobs:
             git push origin "refs/tags/$TAG"
           fi
 
-      - name: Create release and upload jinest.py
+      - name: Download built wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build_wheel.outputs.artifact_name }}
+          path: dist
+
+      - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
+          WHEEL: dist/${{ needs.build_wheel.outputs.filename }}
         run: |
-          gh release create "$TAG" jinest.py \
+          test -f "$WHEEL"
+          gh release create "$TAG" jinest.py "$WHEEL" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Jinest $VERSION" \
             --generate-notes
