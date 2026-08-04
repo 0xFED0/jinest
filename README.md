@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.8.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.9.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Highlights
 
@@ -232,6 +232,9 @@ Every template or expression receives:
 | `origin` | Source mapping/list where the winning field or layer was declared |
 | `root` | Root of the source tree that owns `origin` |
 | `global_root` | Top-level root of the original `Resolver` |
+| `keyname` | Logical output key of the field currently being evaluated |
+| `effective_key` | Exact source key that declared the field, including `.`, `$`, `@`, or `^` |
+| `keymode` | Field-mode marker: `$`, `@`, or `^`; `none` when there is no marker |
 
 This split allows imported prototypes to use their own absolute source references while adapting relative references to the destination:
 
@@ -262,6 +265,11 @@ origin       = root.prototype
 root         = root of library.yaml
 global_root  = root of main.yaml
 ```
+
+For a declaration `value$`, its expression sees `keyname == "value"`,
+`effective_key == "value$"`, and `keymode == "$"`. A hidden declaration such
+as `.value@` reports `keyname == "value"` while preserving
+`effective_key == ".value@"`.
 
 ## Node metadata
 

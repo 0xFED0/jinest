@@ -67,3 +67,10 @@ calc:
   origin_source_path@: "{{ source_path_of(origin) }}"
   source_root_path@: "{{ root_of(origin).path }}"
   source_file_known$: source_file(origin) is not none
+
+  # Field declaration metadata is also available while evaluating expressions.
+  # keyname is logical, effective_key preserves the exact YAML key, and keymode
+  # is the current field marker.
+  field_key_context$: >-
+    {'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}
+  field_key_context_text@: "{{ keyname }}|{{ effective_key }}|{{ keymode }}"

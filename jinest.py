@@ -69,7 +69,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _RESERVED_NAMES = {
@@ -557,7 +557,11 @@ class _MappingProxy(_ContainerProxy, Mapping):
 class _SequenceProxy(_ContainerProxy, Sequence):
     """Lazy sequence, optionally resolving each string item as Jinja."""
 
-    __slots__ = ("_jinest_item_mode", "_jinest_resolved")
+    __slots__ = (
+        "_jinest_item_mode",
+        "_jinest_key_context",
+        "_jinest_resolved",
+    )
 
     def __init__(
         self,
@@ -567,12 +571,14 @@ class _SequenceProxy(_ContainerProxy, Sequence):
         path: tuple[Any, ...],
         *,
         item_mode: str | None = None,
+        key_context: tuple[Any, Any, str | None] | None = None,
         path_kind: str = "global",
     ) -> None:
         super().__init__(owner, source, parent, path, path_kind)
         if item_mode not in {None, "native", "text", "script"}:
             raise ValueError(f"Unsupported sequence item mode: {item_mode!r}")
         object.__setattr__(self, "_jinest_item_mode", item_mode)
+        object.__setattr__(self, "_jinest_key_context", key_context)
         object.__setattr__(self, "_jinest_resolved", {})
 
     def _jinest_resolve_name(self, key: str) -> Any:
@@ -613,6 +619,7 @@ class _SequenceProxy(_ContainerProxy, Sequence):
             item_path = object.__getattribute__(self, "_jinest_path") + (normalized,)
 
             if mode is not None and isinstance(item, str):
+                key_context = object.__getattribute__(self, "_jinest_key_context")
                 value = owner._render(
                     self,
                     item,
@@ -620,6 +627,9 @@ class _SequenceProxy(_ContainerProxy, Sequence):
                     origin_source=source,
                     source_path=source.source_path + (normalized,),
                     context_path=item_path,
+                    keyname=None if key_context is None else key_context[0],
+                    effective_key=None if key_context is None else key_context[1],
+                    keymode=None if key_context is None else key_context[2],
                 )
                 value = owner._bind_child(
                     self,
@@ -880,6 +890,7 @@ class Resolver:
         origin: "Resolver | None" = None,
         source_path: tuple[Any, ...] | None = None,
         sequence_item_mode: str | None = None,
+        sequence_key_context: tuple[Any, Any, str | None] | None = None,
         path_kind: str = "global",
     ) -> Any:
         if isinstance(value, _ContainerProxy):
@@ -896,14 +907,20 @@ class Resolver:
         if isinstance(source.raw, Sequence) and not isinstance(
             source.raw, (str, bytes, bytearray)
         ):
-            if isinstance(value, _SequenceProxy) and sequence_item_mode is None:
-                sequence_item_mode = object.__getattribute__(value, "_jinest_item_mode")
+            if isinstance(value, _SequenceProxy):
+                if sequence_item_mode is None:
+                    sequence_item_mode = object.__getattribute__(value, "_jinest_item_mode")
+                if sequence_key_context is None:
+                    sequence_key_context = object.__getattribute__(
+                        value, "_jinest_key_context"
+                    )
             return _SequenceProxy(
                 self,
                 source,
                 parent,
                 path,
                 item_mode=sequence_item_mode,
+                key_context=sequence_key_context,
                 path_kind=path_kind,
             )
         return copy.deepcopy(source.raw)
@@ -917,6 +934,7 @@ class Resolver:
         origin: "Resolver | None" = None,
         source_path: tuple[Any, ...] | None = None,
         sequence_item_mode: str | None = None,
+        sequence_key_context: tuple[Any, Any, str | None] | None = None,
     ) -> Any:
         if not self._is_container(value):
             return self._copy_scalar(value)
@@ -939,6 +957,7 @@ class Resolver:
             id(source_origin),
             source_origin_path,
             sequence_item_mode,
+            sequence_key_context,
         )
         cached = children.get(key)
         if cached is not None and cached[0] == cache_token:
@@ -953,6 +972,7 @@ class Resolver:
             origin=source_origin,
             source_path=source_origin_path,
             sequence_item_mode=sequence_item_mode,
+            sequence_key_context=sequence_key_context,
             path_kind=path_kind,
         )
         children[key] = (cache_token, proxy)
@@ -1234,6 +1254,11 @@ class Resolver:
                 origin=source.resolver,
                 source_path=candidate_source_path,
                 sequence_item_mode=candidate.mode,
+                sequence_key_context=(
+                    logical_key,
+                    candidate.source_key,
+                    {"native": "$", "text": "@", "script": "^"}[candidate.mode],
+                ),
             )
 
         value = self._render(
@@ -1241,7 +1266,10 @@ class Resolver:
             candidate.template,
             mode=candidate.mode,
             origin_source=source,
-            source_key=str(candidate.source_key),
+            source_key=candidate.source_key,
+            keyname=logical_key,
+            effective_key=candidate.source_key,
+            keymode={"native": "$", "text": "@", "script": "^"}[candidate.mode],
         )
         if candidate.mode in {"native", "script"}:
             return self._bind_child(
@@ -1675,6 +1703,9 @@ class Resolver:
         source_key: Any | None = None,
         source_path: tuple[Any, ...] | None = None,
         context_path: tuple[Any, ...] | None = None,
+        keyname: Any | None = None,
+        effective_key: Any | None = None,
+        keymode: str | None = None,
     ) -> Any:
         if mode not in {"text", "native", "script"}:
             raise ValueError(f"Unsupported render mode: {mode!r}")
@@ -1714,6 +1745,9 @@ class Resolver:
             "global_root": self._global_owner.root,
             "_": object.__getattribute__(scope, "_jinest_parent"),
             "path": context_path_ref,
+            "keyname": keyname,
+            "effective_key": effective_key,
+            "keymode": keymode,
         }
         environment = (
             origin_source.resolver.script_environment

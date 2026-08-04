@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for Jinest 0.8.1.
+"""Regression tests for Jinest 0.9.0.
 
 Run:
     python jinest.test.py
@@ -60,7 +60,7 @@ except ImportError:
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.8.1")
+        self.assertEqual(jinest.__version__, "0.9.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -149,6 +149,56 @@ class JinestCoreTests(unittest.TestCase):
                 "base": {},
                 "service": {"port": 9000, "effective": 16000},
                 "next_answer": 43,
+            },
+        )
+
+    def test_field_key_context_variables(self) -> None:
+        result = jinest.resolve(
+            {
+                "native_context$": "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}",
+                "text_context@": "{{ keyname }}|{{ effective_key }}|{{ keymode }}",
+                "script_context^": "\n".join(
+                    [
+                        "% return {",
+                        '  "keyname": keyname,',
+                        '  "effective_key": effective_key,',
+                        '  "keymode": keymode,',
+                        "}",
+                    ]
+                ),
+                "array_context$": [
+                    "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}"
+                ],
+                ".hidden_context$": "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}",
+                "hidden_report$": "hidden_context",
+            }
+        )
+        self.assertEqual(
+            result,
+            {
+                "native_context": {
+                    "keyname": "native_context",
+                    "effective_key": "native_context$",
+                    "keymode": "$",
+                },
+                "text_context": "text_context|text_context@|@",
+                "script_context": {
+                    "keyname": "script_context",
+                    "effective_key": "script_context^",
+                    "keymode": "^",
+                },
+                "array_context": [
+                    {
+                        "keyname": "array_context",
+                        "effective_key": "array_context$",
+                        "keymode": "$",
+                    }
+                ],
+                "hidden_report": {
+                    "keyname": "hidden_context",
+                    "effective_key": ".hidden_context$",
+                    "keymode": "$",
+                },
             },
         )
 

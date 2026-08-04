@@ -14,3 +14,15 @@ service:
   special$: "at('global_root.config[\"not-a-name\"]')"
   source_path$: "context.source_path"
   source_file_known$: "source_file(context) is not none"
+
+  # Each field expression knows its logical name, exact declaration, and mode.
+  key_context$: "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}"
+  text_key_context@: "{{ keyname }}|{{ effective_key }}|{{ keymode }}"
+  script_key_context^: |
+    % return {
+      "keyname": keyname,
+      "effective_key": effective_key,
+      "keymode": keymode,
+    }
+  .hidden_context$: "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}"
+  hidden_context_report$: hidden_context

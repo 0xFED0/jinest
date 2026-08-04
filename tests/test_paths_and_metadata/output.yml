@@ -13,4 +13,17 @@ service:
   special: value
   source_path: root.service
   source_file_known: true
+  key_context:
+    keyname: key_context
+    effective_key: key_context$
+    keymode: $
+  text_key_context: text_key_context|text_key_context@|@
+  script_key_context:
+    keyname: script_key_context
+    effective_key: script_key_context^
+    keymode: ^
+  hidden_context_report:
+    keyname: hidden_context
+    effective_key: .hidden_context$
+    keymode: $
 

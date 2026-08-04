@@ -44,3 +44,11 @@ calc:
   origin_source_path: root.calc
   source_root_path: root
   source_file_known: true
+
+
+  # The metadata describes the declaration currently being evaluated.
+  field_key_context:
+    keyname: field_key_context
+    effective_key: field_key_context$
+    keymode: $
+  field_key_context_text: field_key_context_text|field_key_context_text@|@
