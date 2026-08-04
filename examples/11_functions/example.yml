@@ -1,0 +1,48 @@
+# Run from the repository root:
+#   python jinest.py examples/11_functions/example.yml --output-format yaml
+#
+# Function declarations are lazy helpers. Their suffixed declaration keys are
+# omitted from the final mapping; a namespace containing only functions remains {}.
+
+square(x)$: x * x
+quote(value, mark='"')@: "{{ mark }}{{ value }}{{ mark }}"
+
+clamp(value, minimum, maximum)^: |
+  % if value < minimum
+  %   return minimum
+  % endif
+  % if value > maximum
+  %   return maximum
+  % endif
+  % return value
+
+# A script function can return a native structure over several line statements.
+make_result(value)^: |
+  % return {
+  %   "value": value,
+  %   "type": "generated"
+  % }
+
+strings:
+  upper(value)$: value | upper
+  quote(value)@: "<{{ value }}>"
+
+defaults:
+  factor: 10
+scale(value, factor=global_root.defaults.factor)$: value * factor
+
+# `context` is the call-site mapping, even though the function is declared here.
+helpers:
+  prefix: helper-
+  format(value)@: "{{ context.prefix }}{{ value }}"
+
+native_result$: square(5)
+text_result@: "{{ quote(square(5)) }}"
+script_result$: clamp(15, 0, 10)
+structured_result$: make_result("hello")
+scaled_result$: scale(5)
+namespace_result@: "{{ strings.quote(strings.upper('hello')) }}"
+
+output:
+  prefix: output-
+  formatted@: "{{ global_root.helpers.format('name') }}"

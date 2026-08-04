@@ -10,6 +10,8 @@ Syntax
 * ``name$`` — evaluate one native Jinja expression.
 * ``name^`` — execute a multiline Jinja script with ``%`` line statements and
   ``return`` a native value.
+* ``name(args)$``, ``name(args)@``, and ``name(args)^`` — declare lazy safe
+  template functions in native, text, or script mode.
 * ``.name`` — a hidden field, available to Jinja as ``name`` but omitted from
   the final resolved mapping.
 * Local priority is ``name`` > ``name^`` > ``name$`` > ``name@``.
@@ -30,7 +32,7 @@ Syntax
   source ``root`` and file metadata remain independent.
 
 Requires: jinja2 >= 3.1
-Optional: PyYAML for YAML support.
+Optional: PyYAML >= 6.0 for YAML support.
 """
 
 from __future__ import annotations
@@ -59,6 +61,7 @@ from jinja2.sandbox import SandboxedEnvironment
 __all__ = [
     "JinestError",
     "JinestTemplateError",
+    "JinestFunctionError",
     "JinestMergeError",
     "JinestImportError",
     "JinestPathError",
@@ -69,11 +72,13 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
+_INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
 _RESERVED_NAMES = {
     _INTERNAL_SCOPE,
+    _INTERNAL_FUNCTION_LOCALS,
     "root",
     "global_root",
     "context",
@@ -163,6 +168,10 @@ class JinestTemplateError(JinestError):
     """A Jinja expression or template could not be evaluated."""
 
 
+class JinestFunctionError(JinestError):
+    """A Jinest template function could not be called safely."""
+
+
 class JinestMergeError(JinestError):
     """A merge directive did not produce a mapping."""
 
@@ -201,11 +210,139 @@ class _Candidate:
     mode: str  # concrete, native, text
 
 
+@dataclass(frozen=True, slots=True)
+class _FunctionParameter:
+    name: str
+    default: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FunctionSpec:
+    name: str
+    source_key: str
+    template: Any
+    mode: str  # native, text, script
+    parameters: tuple[_FunctionParameter, ...]
+
+
 @dataclass(slots=True)
 class _MapSchema:
     raw: Mapping[Any, Any]
     defaults: tuple[_LayerSpec, ...]
     overrides: tuple[_LayerSpec, ...]
+    functions: tuple[_FunctionSpec, ...]
+
+
+_FUNCTION_MODES = {"$": "native", "@": "text", "^": "script"}
+_FUNCTION_MODE_MARKERS = {value: key for key, value in _FUNCTION_MODES.items()}
+
+
+def _parse_function_declaration(key: Any, template: Any = _MISSING) -> _FunctionSpec | None:
+    """Parse a suffixed function declaration key without evaluating defaults."""
+    if not isinstance(key, str):
+        return None
+    marker = key[-1:] if key else ""
+    if marker not in _FUNCTION_MODES:
+        if (
+            re.match(r"^[A-Za-z_]\w*\(", key)
+            and not key.endswith(")")
+            and not key.endswith(":")
+        ):
+            raise JinestError(f"Malformed function declaration {key!r}")
+        return None
+
+    declaration = key[:-1]
+    opening = declaration.find("(")
+    if opening <= 0 or not declaration.endswith(")"):
+        if opening > 0:
+            raise JinestError(f"Malformed function declaration {key!r}")
+        return None
+
+    name = declaration[:opening]
+    if not name.isidentifier():
+        raise JinestError(f"Malformed function declaration {key!r}: invalid name")
+    parameters_text = declaration[opening + 1 : -1]
+    source = f"def __jinest_function__({parameters_text}):\n    pass\n"
+    try:
+        tree = ast.parse(source, mode="exec")
+    except SyntaxError as exc:
+        raise JinestError(
+            f"Malformed function declaration {key!r}: {exc.msg}"
+        ) from exc
+
+    function_node = tree.body[0]
+    if not isinstance(function_node, ast.FunctionDef):
+        raise JinestError(f"Malformed function declaration {key!r}")
+    arguments = function_node.args
+    if (
+        arguments.posonlyargs
+        or arguments.vararg is not None
+        or arguments.kwonlyargs
+        or arguments.kwarg is not None
+    ):
+        raise JinestError(
+            f"Unsupported parameters in function declaration {key!r}: "
+            "*args, **kwargs, positional-only, and keyword-only parameters are unsupported"
+        )
+    if any(argument.annotation is not None for argument in arguments.args):
+        raise JinestError(
+            f"Type annotations are unsupported in function declaration {key!r}"
+        )
+
+    positional = arguments.args
+    defaults_start = len(positional) - len(arguments.defaults)
+    parameters: list[_FunctionParameter] = []
+    seen: set[str] = set()
+    for index, argument in enumerate(positional):
+        if argument.arg in seen:
+            raise JinestError(
+                f"Duplicate parameter {argument.arg!r} in function declaration {key!r}"
+            )
+        seen.add(argument.arg)
+        default = None
+        if index >= defaults_start:
+            default_node = arguments.defaults[index - defaults_start]
+            default = ast.get_source_segment(source, default_node)
+            if default is None:
+                raise JinestError(
+                    f"Could not read default for parameter {argument.arg!r} "
+                    f"in function declaration {key!r}"
+                )
+        parameters.append(_FunctionParameter(argument.arg, default))
+
+    return _FunctionSpec(
+        name=name,
+        source_key=key,
+        template=template,
+        mode=_FUNCTION_MODES[marker],
+        parameters=tuple(parameters),
+    )
+
+
+class JinestFunction:
+    """Safe lazy callable exposed to Jinja for one function declaration."""
+
+    __slots__ = ("_jinest_owner", "_jinest_spec", "_jinest_source")
+
+    def __init__(
+        self,
+        owner: "Resolver",
+        spec: _FunctionSpec,
+        source: _Source,
+    ) -> None:
+        object.__setattr__(self, "_jinest_owner", owner)
+        object.__setattr__(self, "_jinest_spec", spec)
+        object.__setattr__(self, "_jinest_source", source)
+
+    @pass_context
+    def __call__(self, jinja_context: Context, *args: Any, **kwargs: Any) -> Any:
+        return object.__getattribute__(self, "_jinest_owner")._invoke_function(
+            self, jinja_context, args, kwargs
+        )
+
+    def __repr__(self) -> str:
+        spec = object.__getattribute__(self, "_jinest_spec")
+        return f"<JinestFunction {spec.name}>"
 
 
 class PathRef:
@@ -399,6 +536,18 @@ class _JinestContext(Context):
     def resolve_or_missing(self, key: str) -> Any:
         parent = self.parent
         scope = self.vars.get(_INTERNAL_SCOPE, parent.get(_INTERNAL_SCOPE))
+        function_locals = self.vars.get(
+            _INTERNAL_FUNCTION_LOCALS,
+            parent.get(_INTERNAL_FUNCTION_LOCALS),
+        )
+
+        # Function arguments and script locals are explicit context variables.
+        # They must shadow attachments and fields, while ordinary Jinest lookup
+        # retains its historical field-before-global priority.
+        if function_locals is not None:
+            value = super().resolve_or_missing(key)
+            if value is not missing:
+                return value
 
         if key not in _RESERVED_NAMES and isinstance(scope, _ContainerProxy):
             value = scope._jinest_resolve_name(key)
@@ -674,12 +823,18 @@ class Resolver:
         source_path: str | os.PathLike[str] | None = None,
         base_dir: str | os.PathLike[str] | None = None,
         import_roots: Sequence[str | os.PathLike[str]] | None = None,
+        function_max_depth: int = 100,
         _import_chain: tuple[Path, ...] | None = None,
         _global_owner: "Resolver | None" = None,
     ) -> None:
         self.in_place = in_place
         self.strict = strict
         self.sandboxed = sandboxed
+        if not isinstance(function_max_depth, int) or function_max_depth < 1:
+            raise ValueError("function_max_depth must be a positive integer")
+        self.function_max_depth = function_max_depth
+        self._function_depth = 0
+        self._function_stack: list[str] = []
         self._user_globals = dict(globals or {})
         self._user_filters = dict(filters or {})
         self._original = data
@@ -1030,7 +1185,20 @@ class Resolver:
 
         defaults: list[_LayerSpec] = []
         overrides: list[_LayerSpec] = []
+        functions: list[_FunctionSpec] = []
+        function_names: set[str] = set()
         for position, (key, template) in enumerate(raw.items()):
+            function = _parse_function_declaration(key, template)
+            if function is not None:
+                if function.name in function_names:
+                    raise JinestError(
+                        f"Duplicate function declaration {function.name!r} "
+                        f"at {_format_path_segments('root', (function.source_key,))}"
+                    )
+                function_names.add(function.name)
+                functions.append(function)
+                continue
+
             match = self._merge_key(key)
             if match is None:
                 continue
@@ -1046,9 +1214,32 @@ class Resolver:
             )
             (overrides if spec.override else defaults).append(spec)
 
+        # A function and an ordinary declaration cannot share one logical name.
+        ordinary_names: dict[str, Any] = {}
+        for key in raw:
+            if _parse_function_declaration(key) is not None:
+                continue
+            if self._merge_key(key):
+                continue
+            template_info = self._template_key(key)
+            logical = template_info[0] if template_info else key
+            if isinstance(logical, str) and logical.startswith("."):
+                logical = logical[1:]
+            if isinstance(logical, str):
+                ordinary_names.setdefault(logical, key)
+        for function in functions:
+            conflict = ordinary_names.get(function.name)
+            if conflict is not None:
+                raise JinestError(
+                    f"Function {function.name!r} at {function.source_key!r} "
+                    f"conflicts with field declaration {conflict!r}"
+                )
+
         defaults.sort(key=lambda item: (item.order, item.position))
         overrides.sort(key=lambda item: (item.order, item.position))
-        schema = _MapSchema(raw, tuple(defaults), tuple(overrides))
+        schema = _MapSchema(
+            raw, tuple(defaults), tuple(overrides), tuple(functions)
+        )
         self._schema_cache[raw_id] = schema
         return schema
 
@@ -1079,6 +1270,18 @@ class Resolver:
     @staticmethod
     def _hidden_name(key: Any) -> bool:
         return isinstance(key, str) and not key.startswith(".")
+
+    def _local_function(self, raw: Mapping[Any, Any], key: Any) -> _FunctionSpec | None:
+        if not isinstance(key, str) or key.startswith("."):
+            return None
+        schema = self._schema(raw)
+        for function in schema.functions:
+            if function.name == key:
+                return function
+        return None
+
+    def _function_value(self, source: _Source, spec: _FunctionSpec) -> JinestFunction:
+        return JinestFunction(self, spec, source)
 
     def _scope_has_logical(self, scope: _MappingProxy, key: Any) -> bool:
         resolved = object.__getattribute__(scope, "_jinest_resolved")
@@ -1122,6 +1325,8 @@ class Resolver:
                 ):
                     return True
 
+            if not hidden and self._local_function(source.raw, key) is not None:
+                return True
             if self._local_candidate(source.raw, key, hidden=hidden) is not None:
                 return True
 
@@ -1210,6 +1415,11 @@ class Resolver:
                 )
                 if value is not _MISSING:
                     return value
+
+            if not hidden:
+                function = self._local_function(source.raw, key)
+                if function is not None:
+                    return self._function_value(source, function)
 
             candidate = self._local_candidate(source.raw, key, hidden=hidden)
             if candidate is not None:
@@ -1693,6 +1903,174 @@ class Resolver:
     # Jinja rendering and imports
     # ------------------------------------------------------------------
 
+    def _invoke_function(
+        self,
+        function: JinestFunction,
+        jinja_context: Context,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> Any:
+        spec = object.__getattribute__(function, "_jinest_spec")
+        source = object.__getattribute__(function, "_jinest_source")
+        call_scope = jinja_context.vars.get(_INTERNAL_SCOPE)
+        if not isinstance(call_scope, _ContainerProxy):
+            parent = jinja_context.parent
+            call_scope = parent.get(_INTERNAL_SCOPE)
+        if not isinstance(call_scope, _ContainerProxy):
+            call_scope = self.root if isinstance(self.root, _ContainerProxy) else None
+        if not isinstance(call_scope, _ContainerProxy):
+            raise JinestFunctionError(
+                f"Function {spec.name!r} has no Jinest call-site context"
+            )
+
+        call_path = object.__getattribute__(call_scope, "_jinest_path")
+        declaration_path = source.source_path + (spec.source_key,)
+        display_declaration = _format_path_segments("root", declaration_path)
+        display_call = _format_path_segments("global_root", call_path)
+        call_chain = " -> ".join(self._function_stack + [spec.name])
+        if self._function_depth >= self.function_max_depth:
+            raise JinestFunctionError(
+                f"Jinest function recursion limit exceeded ({self.function_max_depth}) "
+                f"at {display_call}: {call_chain}"
+            )
+
+        parameters = spec.parameters
+        parameter_names = {parameter.name for parameter in parameters}
+        if len(args) > len(parameters):
+            raise JinestFunctionError(
+                f"Function {spec.name!r} at {display_declaration} received "
+                f"too many positional arguments at {display_call}"
+            )
+        unknown = [name for name in kwargs if name not in parameter_names]
+        if unknown:
+            raise JinestFunctionError(
+                f"Function {spec.name!r} at {display_declaration} received "
+                f"unknown argument {unknown[0]!r} at {display_call}"
+            )
+
+        bound: dict[str, Any] = {}
+        for parameter, value in zip(parameters, args):
+            bound[parameter.name] = value
+        for name, value in kwargs.items():
+            if name in bound:
+                raise JinestFunctionError(
+                    f"Function {spec.name!r} at {display_declaration} received "
+                    f"duplicate argument {name!r} at {display_call}"
+                )
+            bound[name] = value
+
+        marker = _FUNCTION_MODE_MARKERS[spec.mode]
+        metadata = {
+            "keyname": spec.name,
+            "effective_key": spec.source_key,
+            "keymode": marker,
+        }
+
+        self._function_depth += 1
+        self._function_stack.append(spec.name)
+        try:
+            for parameter in parameters:
+                if parameter.name in bound:
+                    continue
+                if parameter.default is None:
+                    raise JinestFunctionError(
+                        f"Function {spec.name!r} at {display_declaration} is missing "
+                        f"required argument {parameter.name!r} at {display_call}"
+                    )
+                try:
+                    bound[parameter.name] = self._render(
+                        call_scope,
+                        parameter.default,
+                        mode="native",
+                        origin_source=source,
+                        source_path=declaration_path + (
+                            f"default:{parameter.name}",
+                        ),
+                        context_path=call_path,
+                        keyname=metadata["keyname"],
+                        effective_key=metadata["effective_key"],
+                        keymode=metadata["keymode"],
+                        local_vars=bound,
+                    )
+                except JinestError as exc:
+                    raise JinestFunctionError(
+                        f"Failed to evaluate default for function {spec.name!r} "
+                        f"at {display_declaration}, call site {display_call}: {exc}"
+                    ) from exc
+
+            try:
+                return self._render(
+                    call_scope,
+                    spec.template,
+                    mode=spec.mode,
+                    origin_source=source,
+                    source_path=declaration_path,
+                    context_path=call_path,
+                    keyname=metadata["keyname"],
+                    effective_key=metadata["effective_key"],
+                    keymode=metadata["keymode"],
+                    local_vars=bound,
+                )
+            except JinestFunctionError:
+                raise
+            except JinestError as exc:
+                raise JinestFunctionError(
+                    f"Function {spec.name!r} failed at {display_call}; "
+                    f"declaration {display_declaration}; call chain {call_chain}: {exc}"
+                ) from exc
+            except Exception as exc:
+                raise JinestFunctionError(
+                    f"Function {spec.name!r} failed at {display_call}; "
+                    f"declaration {display_declaration}; call chain {call_chain}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+        finally:
+            self._function_stack.pop()
+            self._function_depth -= 1
+
+    @staticmethod
+    def _normalize_multiline_returns(template: str) -> str:
+        """Join line-statement ``return`` expressions spanning bracketed lines."""
+        lines = template.splitlines(keepends=True)
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            content = line.rstrip("\r\n")
+            marker = content.find("%")
+            if marker < 0:
+                index += 1
+                continue
+            statement = content[marker + 1 :].lstrip()
+            if not statement.startswith("return"):
+                index += 1
+                continue
+            expression = statement[len("return") :].lstrip()
+            if not expression or _balanced_delimiters(expression) <= 0:
+                index += 1
+                continue
+
+            combined = content[: marker + 1] + " return " + expression
+            consumed = index + 1
+            balance = _balanced_delimiters(expression)
+            while consumed < len(lines) and balance > 0:
+                continuation = lines[consumed].rstrip("\r\n")
+                continuation_marker = continuation.find("%")
+                if continuation_marker < 0:
+                    break
+                fragment = continuation[continuation_marker + 1 :].strip()
+                combined += " " + fragment
+                balance = _balanced_delimiters(combined.split(" return ", 1)[1])
+                consumed += 1
+            if balance == 0:
+                newline = "\n" if line.endswith("\n") else ""
+                lines[index] = combined + newline
+                for blank in range(index + 1, consumed):
+                    lines[blank] = newline
+                index = consumed
+                continue
+            index += 1
+        return "".join(lines)
+
     def _render(
         self,
         scope: _ContainerProxy,
@@ -1706,6 +2084,7 @@ class Resolver:
         keyname: Any | None = None,
         effective_key: Any | None = None,
         keymode: str | None = None,
+        local_vars: Mapping[str, Any] | None = None,
     ) -> Any:
         if mode not in {"text", "native", "script"}:
             raise ValueError(f"Unsupported render mode: {mode!r}")
@@ -1749,6 +2128,9 @@ class Resolver:
             "effective_key": effective_key,
             "keymode": keymode,
         }
+        if local_vars is not None:
+            context[_INTERNAL_FUNCTION_LOCALS] = local_vars
+            context.update(local_vars)
         environment = (
             origin_source.resolver.script_environment
             if mode == "script"
@@ -1771,7 +2153,9 @@ class Resolver:
                 return self._prepare_native(result)
 
             if mode == "script":
-                compiled = environment.from_string(template)
+                compiled = environment.from_string(
+                    self._normalize_multiline_returns(template)
+                )
                 try:
                     compiled.render(**context)
                 except _ScriptReturn as returned:
@@ -1779,7 +2163,10 @@ class Resolver:
                 return None
 
             compiled = environment.from_string(template)
-            return str(compiled.render(**context))
+            # NativeEnvironment.render() applies literal_eval to a complete
+            # textual result. Generate chunks directly so @ always remains text
+            # (for example, a template producing ``"hello"`` keeps its quotes).
+            return "".join(str(chunk) for chunk in compiled.generate(**context))
         except _ScriptReturn as returned:
             # Defensive fallback in case an environment layer lets the return
             # escape outside the inner render call.
@@ -1889,6 +2276,7 @@ class Resolver:
             filters=self._user_filters,
             source_path=path,
             import_roots=self.import_roots,
+            function_max_depth=self.function_max_depth,
             _import_chain=self._import_chain + (path,),
             _global_owner=self._global_owner,
         )
@@ -1933,6 +2321,8 @@ class Resolver:
 
             for source_key in source.raw:
                 if self._merge_key(source_key):
+                    continue
+                if _parse_function_declaration(source_key) is not None:
                     continue
                 template_info = self._template_key(source_key)
                 logical = template_info[0] if template_info else source_key
@@ -2153,6 +2543,31 @@ def _normalize_json_value(value: Any, *, active: set[int]) -> Any:
     raise JinestError(
         f"Unsupported value of type {type(value).__name__} for JSON serialization"
     )
+
+
+def _balanced_delimiters(value: str) -> int:
+    """Return unmatched opening bracket count, ignoring quoted strings."""
+    pairs = {"{": "}", "[": "]", "(": ")"}
+    closing = set(pairs.values())
+    stack: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for char in value:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif char in closing and stack and char == stack[-1]:
+            stack.pop()
+    return len(stack)
 
 
 def _format_from_path(path: Path) -> str:

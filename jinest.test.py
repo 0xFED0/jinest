@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for Jinest 0.9.0.
+"""Regression tests for Jinest 0.10.0.
 
 Run:
     python jinest.test.py
@@ -60,7 +60,7 @@ except ImportError:
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.9.0")
+        self.assertEqual(jinest.__version__, "0.10.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -279,6 +279,126 @@ class JinestCoreTests(unittest.TestCase):
         result = jinest.resolve(data, in_place=True)
         self.assertIs(result, data)
         self.assertEqual(data, {"x": 2, "y": 3})
+
+
+class JinestFunctionTests(unittest.TestCase):
+    def test_function_modes_namespace_and_structured_returns(self) -> None:
+        result = jinest.resolve(
+            {
+                "square(x)$": "x * x",
+                "quote(value, mark='\"')@": "{{ mark }}{{ value }}{{ mark }}",
+                "clamp(value, minimum, maximum)^": (
+                    "% if value < minimum\n"
+                    "%   return minimum\n"
+                    "% endif\n"
+                    "% if value > maximum\n"
+                    "%   return maximum\n"
+                    "% endif\n"
+                    "% return value\n"
+                ),
+                "make_result(value)^": (
+                    '% return {"value": value, "type": "generated"}\n'
+                ),
+                "strings": {
+                    "upper(value)$": "value | upper",
+                    "quote(value)@": "<{{ value }}>",
+                },
+                "native_result$": "square(5)",
+                "text_result@": "{{ quote(square(5)) }}",
+                "script_result$": "clamp(15, 0, 10)",
+                "struct_result$": 'make_result("hello")',
+                "namespace_result@": "{{ strings.quote(strings.upper('hello')) }}",
+                "ordinary(value)": "kept as an ordinary field",
+            }
+        )
+        self.assertEqual(
+            result,
+            {
+                "strings": {},
+                "native_result": 25,
+                "text_result": '"25"',
+                "script_result": 10,
+                "struct_result": {"value": "hello", "type": "generated"},
+                "namespace_result": "<HELLO>",
+                "ordinary(value)": "kept as an ordinary field",
+            },
+        )
+
+    def test_function_arguments_defaults_and_call_site_context(self) -> None:
+        result = jinest.resolve(
+            {
+                "value": 100,
+                "defaults": {"factor": 10},
+                "identity(value)$": "value",
+                "scale(value, factor=context.defaults.factor)$": "value * factor",
+                "helpers": {
+                    "prefix": "helper-",
+                    "format(value)@": "{{ context.prefix }}{{ value }}",
+                },
+                "identity_result$": "global_root.identity(5)",
+                "default_result$": "global_root.scale(5)",
+                "named_result$": "global_root.scale(5, factor=3)",
+                "output": {
+                    "prefix": "output-",
+                    "call_site@": "{{ global_root.helpers.format('name') }}",
+                },
+            }
+        )
+        self.assertEqual(result["identity_result"], 5)
+        self.assertEqual(result["default_result"], 50)
+        self.assertEqual(result["named_result"], 15)
+        self.assertEqual(result["output"]["call_site"], "output-name")
+
+    def test_function_script_local_shadows_argument(self) -> None:
+        result = jinest.resolve(
+            {
+                "rewrite(value)^": "% set value = 9\n% return value\n",
+                "result$": "rewrite(5)",
+            }
+        )
+        self.assertEqual(result, {"result": 9})
+
+    def test_functions_are_lazy_and_not_materialized(self) -> None:
+        result = jinest.resolve(
+            {
+                "unused(value)$": "missing.name",
+                "namespace": {"only(value)$": "missing.name"},
+                "ok": 1,
+            }
+        )
+        self.assertEqual(result, {"namespace": {}, "ok": 1})
+
+    def test_function_collisions_and_invalid_declarations(self) -> None:
+        invalid = [
+            {"same": 1, "same(x)$": "x"},
+            {"same(x)$": "x", "same(x)@": "x"},
+            {"same(x)$": "x", "same(y)$": "y"},
+            {"bad(x)@@": "x"},
+            {"bad(1x)$": "x"},
+            {"bad(a, a)$": "a"},
+        ]
+        for data in invalid:
+            with self.subTest(data=data), self.assertRaises(jinest.JinestError):
+                jinest.resolve(data)
+
+    def test_function_argument_errors_and_recursion_limit(self) -> None:
+        with self.assertRaisesRegex(jinest.JinestFunctionError, "missing required"):
+            jinest.resolve({"f(a, b)$": "a + b", "result$": "f(1)"})
+        with self.assertRaisesRegex(jinest.JinestFunctionError, "unknown argument"):
+            jinest.resolve({"f(a)$": "a", "result$": "f(a=1, b=2)"})
+        with self.assertRaisesRegex(jinest.JinestFunctionError, "duplicate argument"):
+            jinest.resolve({"f(a)$": "a", "result$": "f(1, a=2)"})
+        with self.assertRaisesRegex(jinest.JinestFunctionError, "recursion limit"):
+            jinest.Resolver(
+                {"loop()$": "loop()", "result$": "loop()"},
+                function_max_depth=4,
+            ).resolve()
+
+    def test_function_attributes_are_sandboxed(self) -> None:
+        with self.assertRaisesRegex(jinest.JinestTemplateError, "unsafe"):
+            jinest.resolve(
+                {"square(x)$": "x * x", "result$": "square.__class__"}
+            )
 
 
 class JinestLayerTests(unittest.TestCase):

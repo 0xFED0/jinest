@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.9.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.10.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Highlights
 
@@ -52,6 +52,7 @@ app:
 - Native Jinja expressions with `$`.
 - Full text templates with `@`.
 - Multiline Jinja scripts with `^`, `%` line statements, and native `return`.
+- Lazy safe template functions with positional, named, and default arguments.
 - Lazy default and override layers without eager dictionary merging.
 - Destination-aware reusable prototypes.
 - Independent source roots for imported YAML and JSON trees.
@@ -177,6 +178,40 @@ Rules:
 - Reaching the end without `return` also returns `null`.
 - `return` works inside `if`, `for`, and nested Jinja blocks.
 - Standard `{% ... %}` syntax remains accepted, but `%` line statements are the intended notation.
+
+## Template functions
+
+Mappings may declare lazy safe functions with an explicit mode suffix:
+
+```yaml
+square(x)$: x * x
+quote(value, mark='"')@: "{{ mark }}{{ value }}{{ mark }}"
+clamp(value, minimum, maximum)^: |
+  % if value < minimum
+  %   return minimum
+  % endif
+  % return value
+```
+
+Functions support positional arguments, named arguments, and defaults. Defaults
+are evaluated at call time with the normal Jinest evaluator:
+
+```yaml
+defaults:
+  factor: 10
+scale(value, factor=global_root.defaults.factor)$: value * factor
+result$: scale(5)
+```
+
+Function declarations are lazy runtime helpers and are omitted from the final
+mapping. A namespace containing only functions remains as an empty mapping.
+Function bodies use the normal call-site `context`, `path`, and `global_root`,
+while `origin` and `root` refer to the declaration source. Functions are safe
+Jinja callables; arbitrary Python attributes and APIs remain unavailable.
+
+Only `$`, `@`, and `^` function modes are supported in this version. An
+unsuffixed key such as `name(args)` is never interpreted as a function, and
+`*args`/`**kwargs` are not supported.
 
 ## Lazy layers
 

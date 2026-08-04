@@ -1,0 +1,8 @@
+strings: {}
+native_result: 25
+text_result: '"25"'
+structured_result:
+  value: hello
+  type: generated
+namespace_result: HELLO
+

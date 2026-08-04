@@ -1,0 +1,17 @@
+strings: {}
+defaults:
+  factor: 10
+helpers:
+  prefix: helper-
+native_result: 25
+text_result: '"25"'
+script_result: 10
+structured_result:
+  value: hello
+  type: generated
+scaled_result: 50
+namespace_result: <HELLO>
+output:
+  prefix: output-
+  formatted: output-name
+

@@ -1,0 +1,16 @@
+# Native, text, and script functions are omitted from materialized output.
+square(x)$: x * x
+quote(value, mark='"')@: "{{ mark }}{{ value }}{{ mark }}"
+make_result(value)^: |
+  % return {
+  %   "value": value,
+  %   "type": "generated"
+  % }
+
+strings:
+  upper(value)$: value | upper
+
+native_result$: square(5)
+text_result@: "{{ quote(square(5)) }}"
+structured_result$: make_result("hello")
+namespace_result@: "{{ strings.upper('hello') }}"
