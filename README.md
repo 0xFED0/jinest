@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.10.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.11.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Highlights
 
