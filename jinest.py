@@ -30,6 +30,8 @@ Syntax
   native-expression, text-template, or script mode respectively.
 * ``import_yaml`` (alias ``import``) and ``import_json`` load lazy trees whose
   source ``root`` and file metadata remain independent.
+* ``Resolver.messages`` collects ``warning`` and ``hint`` diagnostics; use
+  ``emit_messages=False`` or ``treat_warnings_as_errors=True`` to control them.
 
 Requires: jinja2 >= 3.1
 Optional: PyYAML >= 6.0 for YAML support.
@@ -44,6 +46,7 @@ import json
 import math
 import os
 import re
+import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -62,6 +65,8 @@ __all__ = [
     "JinestError",
     "JinestTemplateError",
     "JinestFunctionError",
+    "JinestMessage",
+    "JinestWarningError",
     "JinestMergeError",
     "JinestImportError",
     "JinestPathError",
@@ -72,7 +77,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -170,6 +175,23 @@ class JinestTemplateError(JinestError):
 
 class JinestFunctionError(JinestError):
     """A Jinest template function could not be called safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class JinestMessage:
+    """A diagnostic collected while resolving a Jinest tree.
+
+    ``level`` is currently ``"warning"`` or ``"hint"`` and ``msg`` is the
+    human-readable diagnostic text.  Message objects are intentionally small
+    and immutable so callers can safely inspect or copy ``Resolver.messages``.
+    """
+
+    level: str
+    msg: str
+
+
+class JinestWarningError(JinestError):
+    """Warnings were configured to abort resolution."""
 
 
 class JinestMergeError(JinestError):
@@ -824,6 +846,8 @@ class Resolver:
         base_dir: str | os.PathLike[str] | None = None,
         import_roots: Sequence[str | os.PathLike[str]] | None = None,
         function_max_depth: int = 100,
+        emit_messages: bool = True,
+        treat_warnings_as_errors: bool = False,
         _import_chain: tuple[Path, ...] | None = None,
         _global_owner: "Resolver | None" = None,
     ) -> None:
@@ -833,6 +857,20 @@ class Resolver:
         if not isinstance(function_max_depth, int) or function_max_depth < 1:
             raise ValueError("function_max_depth must be a positive integer")
         self.function_max_depth = function_max_depth
+        if not isinstance(emit_messages, bool):
+            raise TypeError("emit_messages must be a boolean")
+        if not isinstance(treat_warnings_as_errors, bool):
+            raise TypeError("treat_warnings_as_errors must be a boolean")
+        self.emit_messages = emit_messages
+        self.treat_warnings_as_errors = treat_warnings_as_errors
+        self._global_owner = _global_owner or self
+        if self._global_owner is self:
+            self.messages: list[JinestMessage] = []
+            self._message_keys: set[tuple[str, str]] = set()
+            self._emitted_message_count = 0
+        else:
+            self.messages = self._global_owner.messages
+            self._message_keys = self._global_owner._message_keys
         self._function_depth = 0
         self._function_stack: list[str] = []
         self._user_globals = dict(globals or {})
@@ -844,8 +882,6 @@ class Resolver:
         self._source_view_cache: dict[
             tuple[int, tuple[Any, ...]], _ContainerProxy
         ] = {}
-        self._global_owner = _global_owner or self
-
         self.source_path = Path(source_path).expanduser().resolve() if source_path else None
         if base_dir is not None:
             self.base_dir = Path(base_dir).expanduser().resolve()
@@ -976,6 +1012,44 @@ class Resolver:
 
         self._reset_root_views()
 
+    def _record_message(
+        self,
+        level: str,
+        msg: str,
+        *,
+        dedupe_key: tuple[Any, ...] | None = None,
+    ) -> None:
+        """Add one deduplicated diagnostic to the shared resolver message list."""
+        if level not in {"warning", "hint"}:
+            raise ValueError(f"Unsupported message level: {level!r}")
+        key = dedupe_key or (level, msg)
+        if key in self._message_keys:
+            return
+        self._message_keys.add(key)
+        self.messages.append(JinestMessage(level, msg))
+
+    def _flush_messages(self) -> None:
+        """Print newly collected diagnostics, if stderr output is enabled."""
+        owner = self._global_owner
+        if not owner.emit_messages:
+            owner._emitted_message_count = len(owner.messages)
+            return
+        pending = owner.messages[owner._emitted_message_count:]
+        for message in pending:
+            print(f"jinest: {message.level}: {message.msg}", file=sys.stderr)
+        owner._emitted_message_count = len(owner.messages)
+
+    def _finalize_messages(self) -> None:
+        """Apply warning policy and emit diagnostics after successful resolution."""
+        owner = self._global_owner
+        warnings = [message for message in owner.messages if message.level == "warning"]
+        if owner.treat_warnings_as_errors and warnings:
+            details = "\n".join(message.msg for message in warnings)
+            raise JinestWarningError(
+                f"Warnings treated as errors ({len(warnings)}):\n{details}"
+            )
+        self._flush_messages()
+
     def _reset_root_views(self) -> None:
         """Rebuild destination/source roots after initialization or in-place resolve."""
         root_kind = "global" if self._global_owner is self else "source"
@@ -1005,10 +1079,21 @@ class Resolver:
             # Scalars have no template scope or source-view metadata.
             self._source_root = self.root
         self.global_root = self._global_owner.root
+        if isinstance(self.data, Mapping):
+            # Make root diagnostics available immediately through ``messages``;
+            # nested mappings are discovered when their lazy scopes are visited.
+            self._schema(self.data)
 
     def resolve(self) -> Any:
         """Fully materialize the lazy tree into ordinary Python values."""
-        result = self._to_plain(self.root, active=set())
+        try:
+            result = self._to_plain(self.root, active=set())
+        except Exception:
+            # Diagnostics discovered before a rendering error are still useful
+            # to API callers and CLI users.
+            self._flush_messages()
+            raise
+        self._finalize_messages()
 
         if self.in_place:
             if isinstance(self._original, MutableMapping) and isinstance(result, Mapping):
@@ -1177,6 +1262,51 @@ class Resolver:
             return key[:-1], "text"
         return None
 
+    def _record_schema_messages(self, raw: Mapping[Any, Any]) -> None:
+        """Report declarations that are present but cannot become effective."""
+        declarations: dict[tuple[str, bool], list[tuple[int, str]]] = {}
+        priority = {"": 0, "^": 1, "$": 2, "@": 3}
+        for key in raw:
+            if not isinstance(key, str) or self._merge_key(key):
+                continue
+            if _parse_function_declaration(key) is not None:
+                continue
+            mode = ""
+            base = key
+            if key.endswith(("^", "$", "@")):
+                mode = key[-1]
+                base = key[:-1]
+            hidden = base.startswith(".")
+            logical = base[1:] if hidden else base
+            if not isinstance(logical, str):
+                continue
+            declarations.setdefault((logical, hidden), []).append(
+                (priority[mode], key)
+            )
+
+        for (logical, hidden), variants in declarations.items():
+            if len(variants) < 2:
+                continue
+            variants.sort(key=lambda item: item[0])
+            winner = variants[0][1]
+            for _, suppressed in variants[1:]:
+                self._record_message(
+                    "warning",
+                    f"Field {winner!r} suppresses {suppressed!r}; local priority is "
+                    "name > name^ > name$ > name@",
+                    dedupe_key=("warning", id(raw), winner, suppressed),
+                )
+
+        public_names = {logical for (logical, hidden) in declarations if not hidden}
+        hidden_names = {logical for (logical, hidden) in declarations if hidden}
+        for logical in sorted(public_names & hidden_names):
+            self._record_message(
+                "hint",
+                f"Hidden field '.{logical}' takes priority over field {logical!r} "
+                "in template calculations; the public field remains in the final dump",
+                dedupe_key=("hint", id(raw), logical),
+            )
+
     def _schema(self, raw: Mapping[Any, Any]) -> _MapSchema:
         raw_id = id(raw)
         cached = self._schema_cache.get(raw_id)
@@ -1241,6 +1371,7 @@ class Resolver:
             raw, tuple(defaults), tuple(overrides), tuple(functions)
         )
         self._schema_cache[raw_id] = schema
+        self._record_schema_messages(raw)
         return schema
 
     def _local_candidate(
@@ -2277,6 +2408,8 @@ class Resolver:
             source_path=path,
             import_roots=self.import_roots,
             function_max_depth=self.function_max_depth,
+            emit_messages=False,
+            treat_warnings_as_errors=False,
             _import_chain=self._import_chain + (path,),
             _global_owner=self._global_owner,
         )
@@ -2658,7 +2791,7 @@ def _self_test() -> None:
         ],
     }
 
-    resolver = Resolver(data)
+    resolver = Resolver(data, emit_messages=False)
     assert resolver.root.example.rank == "o2"
     assert resolver.root.example.z == 2
     assert resolver.root.priority.value == 42
@@ -2757,6 +2890,18 @@ def _main() -> None:
         action="store_true",
         help="Disable the Jinja sandbox (trusted templates only)",
     )
+    parser.add_argument(
+        "-silent",
+        "--no-messages",
+        action="store_true",
+        help="Do not print collected warnings and hints to stderr",
+    )
+    parser.add_argument(
+        "-Werror",
+        "--treat-warnings-as-errors",
+        action="store_true",
+        help="Abort when any warning is collected",
+    )
     parser.add_argument("--self-test", action="store_true", help="Run built-in tests")
     args = parser.parse_args()
 
@@ -2772,6 +2917,8 @@ def _main() -> None:
             output=args.output,
             output_format=args.output_format,
             sandboxed=not args.unsafe,
+            emit_messages=not args.no_messages,
+            treat_warnings_as_errors=args.treat_warnings_as_errors,
         )
     except (JinestError, OSError, ValueError) as exc:
         parser.exit(1, f"jinest: {exc}\n")

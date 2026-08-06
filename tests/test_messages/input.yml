@@ -1,0 +1,8 @@
+# Warnings are emitted for lower-priority declarations; hints explain hidden/public pairs.
+name: literal
+name^: "% return 'ignored'"
+name$: "'ignored'"
+name@: "ignored"
+.key: intermediate
+key: public
+result$: "name + ':' + key"

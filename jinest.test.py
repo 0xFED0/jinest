@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for Jinest 0.10.0.
+"""Regression tests for Jinest 0.10.1.
 
 Run:
     python jinest.test.py
@@ -10,7 +10,9 @@ Set JINEST_MODULE=/path/to/jinest.py to test another copy.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -60,7 +62,7 @@ except ImportError:
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.10.0")
+        self.assertEqual(jinest.__version__, "0.10.1")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -399,6 +401,64 @@ class JinestFunctionTests(unittest.TestCase):
             jinest.resolve(
                 {"square(x)$": "x * x", "result$": "square.__class__"}
             )
+
+
+class JinestMessageTests(unittest.TestCase):
+    def test_priority_warnings_and_hidden_hint_are_collected_and_printed(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "name": "literal",
+                "name^": "% return missing.value\n",
+                "name$": "missing.value",
+                "name@": "{{ missing.value }}",
+                ".key": "intermediate",
+                "key": "public",
+            }
+        )
+        self.assertEqual(len(resolver.messages), 4)
+        self.assertTrue(all(message.level == "warning" for message in resolver.messages[:3]))
+        self.assertEqual(resolver.messages[3].level, "hint")
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            self.assertEqual(resolver.resolve(), {"name": "literal", "key": "public"})
+        rendered = stream.getvalue()
+        self.assertIn("warning: Field 'name' suppresses 'name^'", rendered)
+        self.assertIn("warning: Field 'name' suppresses 'name$'", rendered)
+        self.assertIn("warning: Field 'name' suppresses 'name@'", rendered)
+        self.assertIn("hint: Hidden field '.key'", rendered)
+
+    def test_same_declarations_in_different_mappings_are_not_collapsed(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "left": {"value": 1, "value$": "2"},
+                "right": {"value": 3, "value$": "4"},
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(resolver.resolve(), {"left": {"value": 1}, "right": {"value": 3}})
+        warnings = [message for message in resolver.messages if message.level == "warning"]
+        self.assertEqual(len(warnings), 2)
+
+    def test_message_output_can_be_disabled(self) -> None:
+        resolver = jinest.Resolver(
+            {"value": 1, "value$": "2", ".value": 3},
+            emit_messages=False,
+        )
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            self.assertEqual(resolver.resolve(), {"value": 1})
+        self.assertEqual(stream.getvalue(), "")
+        self.assertEqual([message.level for message in resolver.messages], ["warning", "hint"])
+
+    def test_warnings_can_be_treated_as_errors(self) -> None:
+        resolver = jinest.Resolver(
+            {"value": 1, "value$": "2"},
+            emit_messages=False,
+            treat_warnings_as_errors=True,
+        )
+        with self.assertRaisesRegex(jinest.JinestWarningError, "Warnings treated as errors"):
+            resolver.resolve()
+        self.assertEqual(len(resolver.messages), 1)
 
 
 class JinestLayerTests(unittest.TestCase):

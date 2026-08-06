@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.10.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.10.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Highlights
 
@@ -124,6 +124,35 @@ total$: "price + tax"
 ```
 
 The result contains `price`, `shown_tax`, and `total: 120.0`, but no `.tax`.
+
+## Diagnostics: warnings and hints
+
+During schema discovery Jinest collects non-fatal diagnostics in
+`Resolver.messages`. Each item is an immutable `JinestMessage` with `level`
+(`"warning"` or `"hint"`) and `msg` fields. By default diagnostics are printed
+to stderr after a successful `resolve()`; they never change the resolved data.
+
+A literal field suppresses lower-priority declarations with the same logical
+name. For example, `name` wins over `name^`, `name$`, and `name@`, so each
+suppressed declaration gets a warning. If both `key` and `.key` exist, Jinest
+adds a hint because the hidden value has priority in template calculations
+while the public value remains in the final dump.
+
+```python
+from jinest import Resolver
+
+resolver = Resolver(
+    {"name": "used", "name$": "ignored", ".key": "temporary", "key": "shown"}
+)
+result = resolver.resolve()       # diagnostics go to stderr
+for message in resolver.messages:
+    print(message.level, message.msg)
+```
+
+Use `emit_messages=False` when the caller wants to process the list itself.
+Set `treat_warnings_as_errors=True` to raise `JinestWarningError` if any
+warning was collected (hints do not trigger this policy). The CLI equivalents
+are `--no-messages` (`-silent`) and `--treat-warnings-as-errors` (`-Werror`).
 
 ## Native expressions: `$`
 
@@ -607,7 +636,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The test suite contains 60 regression tests covering expressions, templates, scripts, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
+The test suite contains 73 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
 
 ## Security
 
