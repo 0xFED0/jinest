@@ -1,0 +1,22 @@
+literal$: native-looking literal key
+literal@: text-looking literal key
+literal^: script-looking literal key
+final`: one literal final backtick
+value: 4
+native: 8
+text: value=4
+script: 12
+escaped: =$value
+field: winner=@
+name: dynamic$
+dynamic$: 5
+items:
+- 6
+- item=4
+- 16
+- =@item={{ value }}
+legacy:
+- 5
+- text=4
+- 20
+

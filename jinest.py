@@ -14,6 +14,11 @@ Syntax
   template functions in native, text, or script mode.
 * ``.name`` — a hidden field, available to Jinja as ``name`` but omitted from
   the final resolved mapping.
+* A key ending in a backtick is a raw literal key; all Jinest key parsing is
+  disabled and the marker is removed.
+* ``=$expr``, ``=@text``, and ``=^script`` — inline scalar directives for
+  native expressions, text templates, and scripts; they also form dynamic
+  mapping keys when used as keys.
 * Local priority is ``name`` > ``name^`` > ``name$`` > ``name@``.
 * ``<<$`` / ``<<N$`` and ``<<^`` / ``<<N^`` add lazy default layers.
 * ``<<!$`` / ``<<N!$`` and ``<<!^`` / ``<<N!^`` add lazy override layers.
@@ -259,9 +264,60 @@ _FUNCTION_MODES = {"$": "native", "@": "text", "^": "script"}
 _FUNCTION_MODE_MARKERS = {value: key for key, value in _FUNCTION_MODES.items()}
 
 
+@dataclass(frozen=True, slots=True)
+class _MappingKeyEntry:
+    """One source mapping key after raw/dynamic-key normalization."""
+
+    source_key: Any
+    key: Any
+    raw: bool = False
+    dynamic: bool = False
+
+
+def _raw_key(key: Any) -> str | None:
+    """Return the literal key represented by one trailing raw-key marker."""
+    if isinstance(key, str) and key.endswith("`"):
+        return key[:-1]
+    return None
+
+
+def _inline_directive(value: Any) -> tuple[str, str] | None:
+    """Parse a scalar ``=<mode>`` directive without evaluating it."""
+    if (
+        isinstance(value, str)
+        and len(value) >= 2
+        and value[0] == "="
+        and value[1] in _FUNCTION_MODES
+    ):
+        return _FUNCTION_MODES[value[1]], value[2:]
+    return None
+
+
+def _escaped_inline_literal(value: Any) -> str | None:
+    """Return an escaped inline directive as a literal string, if applicable."""
+    if (
+        isinstance(value, str)
+        and len(value) >= 3
+        and value[0] == "`"
+        and value[1] == "="
+        and value[2] in _FUNCTION_MODES
+    ):
+        return value[1:]
+    return None
+
+
+def _literal_syntax_key(key: Any) -> bool:
+    """Whether a source key must bypass every Jinest key parser."""
+    return (
+        _raw_key(key) is not None
+        or _inline_directive(key) is not None
+        or _escaped_inline_literal(key) is not None
+    )
+
+
 def _parse_function_declaration(key: Any, template: Any = _MISSING) -> _FunctionSpec | None:
     """Parse a suffixed function declaration key without evaluating defaults."""
-    if not isinstance(key, str):
+    if not isinstance(key, str) or _literal_syntax_key(key):
         return None
     marker = key[-1:] if key else ""
     if marker not in _FUNCTION_MODES:
@@ -678,6 +734,7 @@ class _MappingProxy(_ContainerProxy, Mapping):
         "_jinest_resolved",
         "_jinest_public_resolved",
         "_jinest_layer_cache",
+        "_jinest_key_indexes",
     )
 
     def __init__(
@@ -692,6 +749,7 @@ class _MappingProxy(_ContainerProxy, Mapping):
         object.__setattr__(self, "_jinest_resolved", {})
         object.__setattr__(self, "_jinest_public_resolved", {})
         object.__setattr__(self, "_jinest_layer_cache", {})
+        object.__setattr__(self, "_jinest_key_indexes", {})
 
     def __getattribute__(self, name: str) -> Any:
         if name == "_" or name in _NODE_META_NAMES:
@@ -789,8 +847,34 @@ class _SequenceProxy(_ContainerProxy, Sequence):
             mode = object.__getattribute__(self, "_jinest_item_mode")
             item_path = object.__getattribute__(self, "_jinest_path") + (normalized,)
 
-            if mode is not None and isinstance(item, str):
-                key_context = object.__getattribute__(self, "_jinest_key_context")
+            key_context = object.__getattribute__(self, "_jinest_key_context")
+            explicit_directive = _inline_directive(item)
+            explicit, explicit_value = owner._resolve_inline_scalar(
+                self,
+                item,
+                origin_source=source,
+                source_key=normalized,
+                context_path=item_path,
+                keyname=None if key_context is None else key_context[0],
+                effective_key=None if key_context is None else key_context[1],
+            )
+            if explicit:
+                if mode is not None and explicit_directive is not None:
+                    owner._record_message(
+                        "warning",
+                        f"Inline directive at "
+                        f"{_format_path_segments('global_root', item_path)} takes "
+                        f"precedence over legacy {_FUNCTION_MODE_MARKERS[mode]} array mode",
+                        dedupe_key=("inline-array", id(raw), normalized),
+                    )
+                value = owner._bind_child(
+                    self,
+                    normalized,
+                    explicit_value,
+                    origin=source.resolver,
+                    source_path=source.source_path + (normalized,),
+                )
+            elif mode is not None and isinstance(item, str):
                 value = owner._render(
                     self,
                     item,
@@ -1248,11 +1332,17 @@ class Resolver:
 
     @staticmethod
     def _merge_key(key: Any) -> re.Match[str] | None:
-        return _MERGE_RE.fullmatch(key) if isinstance(key, str) else None
+        if not isinstance(key, str) or _literal_syntax_key(key):
+            return None
+        return _MERGE_RE.fullmatch(key)
 
     @classmethod
     def _template_key(cls, key: Any) -> tuple[Any, str] | None:
-        if not isinstance(key, str) or cls._merge_key(key):
+        if (
+            not isinstance(key, str)
+            or _literal_syntax_key(key)
+            or cls._merge_key(key)
+        ):
             return None
         if key.endswith("^"):
             return key[:-1], "script"
@@ -1262,12 +1352,142 @@ class Resolver:
             return key[:-1], "text"
         return None
 
+    def _mapping_entries(
+        self,
+        source: _Source,
+        bind: _MappingProxy,
+    ) -> tuple[_MappingKeyEntry, ...]:
+        """Build a destination-bound index of static, raw, and dynamic keys."""
+        indexes = object.__getattribute__(bind, "_jinest_key_indexes")
+        cache_key = (id(source.resolver), id(source.raw), source.source_path)
+        cached = indexes.get(cache_key, _MISSING)
+        if cached is not _MISSING:
+            # While dynamic keys are being evaluated, static keys are already
+            # present. This lets ``=$base`` use a sibling ``base`` field.
+            return tuple(cached) if isinstance(cached, list) else cached
+
+        entries: list[_MappingKeyEntry] = []
+        seen: dict[Any, _MappingKeyEntry] = {}
+        dynamic_source_keys: list[Any] = []
+        source_positions = {
+            key: position for position, key in enumerate(source.raw)
+        }
+
+        def is_literal_field(entry: _MappingKeyEntry) -> bool:
+            if entry.raw or entry.dynamic or not isinstance(entry.source_key, str):
+                return True
+            return (
+                self._merge_key(entry.source_key) is None
+                and _parse_function_declaration(entry.source_key) is None
+                and self._template_key(entry.source_key) is None
+            )
+
+        def add(entry: _MappingKeyEntry) -> None:
+            # ``value$`` is a declaration for logical ``value``. It may coexist
+            # with raw/dynamic literal key ``value$`` and is therefore excluded
+            # from final-key collision detection.
+            if is_literal_field(entry):
+                previous = seen.get(entry.key)
+                if previous is not None:
+                    kind = (
+                        "dynamic mapping key"
+                        if entry.dynamic or previous.dynamic
+                        else "mapping key"
+                    )
+                    raise JinestError(
+                        f"Duplicate {kind} {entry.key!r} from "
+                        f"{previous.source_key!r} and {entry.source_key!r}"
+                    )
+                seen[entry.key] = entry
+            entries.append(entry)
+
+        try:
+            # Index all non-dynamic keys before rendering expressions. Their
+            # availability preserves normal lazy sibling lookup semantics.
+            for source_key in source.raw:
+                if _inline_directive(source_key) is not None:
+                    dynamic_source_keys.append(source_key)
+                    continue
+                raw_key = _raw_key(source_key)
+                escaped = _escaped_inline_literal(source_key)
+                if raw_key is not None:
+                    add(_MappingKeyEntry(source_key, raw_key, raw=True))
+                elif escaped is not None:
+                    add(_MappingKeyEntry(source_key, escaped, raw=True))
+                else:
+                    add(_MappingKeyEntry(source_key, source_key))
+
+            # Expose the static prefix during dynamic-key rendering.
+            indexes[cache_key] = entries
+            for source_key in dynamic_source_keys:
+                mode, template = _inline_directive(source_key)  # known above
+                marker = _FUNCTION_MODE_MARKERS[mode]
+                key = self._render(
+                    bind,
+                    template,
+                    mode=mode,
+                    origin_source=source,
+                    source_key=source_key,
+                    keyname=None,
+                    effective_key=source_key,
+                    keymode=marker,
+                )
+                if not isinstance(key, str):
+                    raise JinestError(
+                        f"Dynamic mapping key {source_key!r} resolved to "
+                        f"{type(key).__name__}, expected a string"
+                    )
+                add(_MappingKeyEntry(source_key, key, dynamic=True))
+        except Exception:
+            indexes.pop(cache_key, None)
+            raise
+
+        entries.sort(key=lambda entry: source_positions[entry.source_key])
+        result = tuple(entries)
+        indexes[cache_key] = result
+        return result
+
+    def _resolve_inline_scalar(
+        self,
+        scope: _ContainerProxy,
+        value: Any,
+        *,
+        origin_source: _Source,
+        source_key: Any,
+        context_path: tuple[Any, ...] | None = None,
+        keyname: Any | None = None,
+        effective_key: Any | None = None,
+    ) -> tuple[bool, Any]:
+        """Resolve one explicit scalar directive or its leading-backtick escape."""
+        escaped = _escaped_inline_literal(value)
+        if escaped is not None:
+            return True, escaped
+        directive = _inline_directive(value)
+        if directive is None:
+            return False, value
+        mode, template = directive
+        return True, self._render(
+            scope,
+            template,
+            mode=mode,
+            origin_source=origin_source,
+            source_key=source_key,
+            context_path=context_path,
+            keyname=keyname,
+            effective_key=effective_key,
+            keymode=_FUNCTION_MODE_MARKERS[mode],
+        )
+
     def _record_schema_messages(self, raw: Mapping[Any, Any]) -> None:
         """Report declarations that are present but cannot become effective."""
         declarations: dict[tuple[str, bool], list[tuple[int, str]]] = {}
         priority = {"": 0, "^": 1, "$": 2, "@": 3}
         for key in raw:
-            if not isinstance(key, str) or self._merge_key(key):
+            if (
+                not isinstance(key, str)
+                or _literal_syntax_key(key)
+                or self._merge_key(key)
+            ):
                 continue
             if _parse_function_declaration(key) is not None:
                 continue
@@ -1347,7 +1567,10 @@ class Resolver:
         # A function and an ordinary declaration cannot share one logical name.
         ordinary_names: dict[str, Any] = {}
         for key in raw:
-            if _parse_function_declaration(key) is not None:
+            if (
+                _literal_syntax_key(key)
+                or _parse_function_declaration(key) is not None
+            ):
                 continue
             if self._merge_key(key):
                 continue
@@ -1376,26 +1599,43 @@ class Resolver:
 
     def _local_candidate(
         self,
-        raw: Mapping[Any, Any],
+        source: _Source,
+        bind: _MappingProxy,
         key: Any,
         *,
         hidden: bool,
     ) -> _Candidate | None:
         """Return one local declaration from the hidden or public namespace."""
         source_key = f".{key}" if hidden and isinstance(key, str) else key
-        if source_key in raw and self._merge_key(source_key) is None:
-            return _Candidate(source_key, raw[source_key], "concrete")
+        entries = self._mapping_entries(source, bind)
+        for concrete in entries:
+            if concrete.key != source_key:
+                continue
+            if (
+                concrete.raw
+                or concrete.dynamic
+                or self._template_key(concrete.source_key) is None
+            ):
+                if (
+                    self._merge_key(concrete.source_key) is None
+                    and _parse_function_declaration(concrete.source_key) is None
+                ):
+                    return _Candidate(
+                        concrete.source_key,
+                        source.raw[concrete.source_key],
+                        "concrete",
+                    )
 
         if isinstance(source_key, str):
-            script_key = f"{source_key}^"
-            native_key = f"{source_key}$"
-            text_key = f"{source_key}@"
-            if script_key in raw:
-                return _Candidate(script_key, raw[script_key], "script")
-            if native_key in raw:
-                return _Candidate(native_key, raw[native_key], "native")
-            if text_key in raw:
-                return _Candidate(text_key, raw[text_key], "text")
+            for suffix, mode in (("^", "script"), ("$", "native"), ("@", "text")):
+                physical = f"{source_key}{suffix}"
+                for entry in entries:
+                    if entry.key == physical and not entry.raw and not entry.dynamic:
+                        return _Candidate(
+                            entry.source_key,
+                            source.raw[entry.source_key],
+                            mode,
+                        )
         return None
 
     @staticmethod
@@ -1458,7 +1698,7 @@ class Resolver:
 
             if not hidden and self._local_function(source.raw, key) is not None:
                 return True
-            if self._local_candidate(source.raw, key, hidden=hidden) is not None:
+            if self._local_candidate(source, bind, key, hidden=hidden) is not None:
                 return True
 
             for layer in reversed(schema.defaults):
@@ -1552,7 +1792,7 @@ class Resolver:
                 if function is not None:
                     return self._function_value(source, function)
 
-            candidate = self._local_candidate(source.raw, key, hidden=hidden)
+            candidate = self._local_candidate(source, bind, key, hidden=hidden)
             if candidate is not None:
                 return self._resolve_candidate(candidate, source, bind, key)
 
@@ -1577,10 +1817,49 @@ class Resolver:
     ) -> Any:
         candidate_source_path = source.source_path + (candidate.source_key,)
         if candidate.mode == "concrete":
+            explicit, value = self._resolve_inline_scalar(
+                bind,
+                candidate.template,
+                origin_source=source,
+                source_key=candidate.source_key,
+                keyname=logical_key,
+                effective_key=candidate.source_key,
+            )
             return self._bind_child(
                 bind,
                 logical_key,
-                candidate.template,
+                value if explicit else candidate.template,
+                origin=source.resolver,
+                source_path=candidate_source_path,
+            )
+
+        explicit_directive = _inline_directive(candidate.template)
+        explicit, explicit_value = self._resolve_inline_scalar(
+            bind,
+            candidate.template,
+            origin_source=source,
+            source_key=candidate.source_key,
+            keyname=logical_key,
+            effective_key=candidate.source_key,
+        )
+        if explicit:
+            if explicit_directive is not None:
+                path = object.__getattribute__(bind, "_jinest_path") + (logical_key,)
+                self._record_message(
+                    "warning",
+                    f"Inline directive at "
+                    f"{_format_path_segments('global_root', path)} takes precedence "
+                    f"over {_FUNCTION_MODE_MARKERS[candidate.mode]} field mode",
+                    dedupe_key=(
+                        "inline-field",
+                        id(source.raw),
+                        candidate.source_key,
+                    ),
+                )
+            return self._bind_child(
+                bind,
+                logical_key,
+                explicit_value,
                 origin=source.resolver,
                 source_path=candidate_source_path,
             )
@@ -2452,13 +2731,19 @@ class Resolver:
                     active=active,
                 )
 
-            for source_key in source.raw:
-                if self._merge_key(source_key):
-                    continue
-                if _parse_function_declaration(source_key) is not None:
-                    continue
-                template_info = self._template_key(source_key)
-                logical = template_info[0] if template_info else source_key
+            for entry in self._mapping_entries(source, bind):
+                source_key = entry.key
+                if not entry.raw and not entry.dynamic:
+                    if self._merge_key(source_key):
+                        continue
+                    if _parse_function_declaration(source_key) is not None:
+                        continue
+                    template_info = self._template_key(source_key)
+                    logical = template_info[0] if template_info else source_key
+                else:
+                    # Raw and dynamic keys produce a literal final key; their
+                    # result is never fed back into Jinest's key grammar.
+                    logical = source_key
                 if isinstance(logical, str) and logical.startswith("."):
                     continue
                 if logical not in seen:

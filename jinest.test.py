@@ -461,6 +461,158 @@ class JinestMessageTests(unittest.TestCase):
         self.assertEqual(len(resolver.messages), 1)
 
 
+class JinestInlineSyntaxTests(unittest.TestCase):
+    def test_raw_keys_disable_all_key_parsing(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "value$`": "literal native-looking key",
+                "value@`": "literal text-looking key",
+                "value^`": "literal script-looking key",
+                "final``": "one final backtick",
+                "value$": "40 + 2",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            resolver.resolve(),
+            {
+                "value$": "literal native-looking key",
+                "value@": "literal text-looking key",
+                "value^": "literal script-looking key",
+                "final`": "one final backtick",
+                "value": 42,
+            },
+        )
+        self.assertEqual(resolver.messages, [])
+
+    def test_inline_directives_in_mappings_and_arrays(self) -> None:
+        result = jinest.resolve(
+            {
+                "value": 4,
+                "native": "=$value * 2",
+                "text": "=@value={{ value }}",
+                "script": "=^% return {'value': value * 3}\n",
+                "escaped": "`=$value",
+                "items": [
+                    "=$value + 1",
+                    "=@item={{ value }}",
+                    "=^% return value * 4\n",
+                    "`=@item={{ value }}",
+                ],
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "value": 4,
+                "native": 8,
+                "text": "value=4",
+                "script": {"value": 12},
+                "escaped": "=$value",
+                "items": [5, "item=4", 16, "=@item={{ value }}"],
+            },
+        )
+
+    def test_dynamic_keys_are_literal_cached_and_checked(self) -> None:
+        calls: list[None] = []
+
+        def dynamic_name() -> str:
+            calls.append(None)
+            return "result$"
+
+        resolver = jinest.Resolver(
+            {
+                "base": 21,
+                "=$dynamic_name()": "=$base * 2",
+                "=$'visible@'": "literal final key",
+                "=@text-key": "text dynamic key",
+                "=^% return 'script-key'\n": "script dynamic key",
+            },
+            globals={"dynamic_name": dynamic_name},
+            emit_messages=False,
+        )
+        self.assertEqual(
+            list(resolver.root),
+            ["base", "result$", "visible@", "text-key", "script-key"],
+        )
+        self.assertEqual(resolver.root["result$"], 42)
+        self.assertEqual(
+            resolver.resolve(),
+            {
+                "base": 21,
+                "result$": 42,
+                "visible@": "literal final key",
+                "text-key": "text dynamic key",
+                "script-key": "script dynamic key",
+            },
+        )
+        self.assertEqual(len(calls), 1)
+
+        with self.assertRaisesRegex(jinest.JinestError, "expected a string"):
+            jinest.resolve({"=$42": "value"}, emit_messages=False)
+        with self.assertRaisesRegex(jinest.JinestError, "Duplicate dynamic mapping key"):
+            jinest.resolve({"key": 1, "=$'key'": 2}, emit_messages=False)
+
+    def test_inline_directive_overrides_field_mode_and_keymode(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "value": 2,
+                "native$": "=@winner={{ keymode }}",
+                "text@": "=^% return {'winner': keymode, 'value': value}\n",
+                "equivalent_old$": "value + 1",
+                "equivalent_new": "=$value + 1",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            resolver.resolve(),
+            {
+                "value": 2,
+                "native": "winner=@",
+                "text": {"winner": "^", "value": 2},
+                "equivalent_old": 3,
+                "equivalent_new": 3,
+            },
+        )
+        self.assertEqual(
+            [message.msg for message in resolver.messages],
+            [
+                "Inline directive at global_root.native takes precedence over $ field mode",
+                "Inline directive at global_root.text takes precedence over @ field mode",
+            ],
+        )
+
+
+    def test_inline_directives_override_legacy_array_mode_with_warning(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "value": 2,
+                "items$": [
+                    "value + 1",
+                    "=@text={{ value }}",
+                    "=^% return value * 3\n",
+                    "`=$value",
+                ],
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            resolver.resolve(),
+            {"value": 2, "items": [3, "text=2", 6, "=$value"]},
+        )
+        self.assertEqual(
+            [message.level for message in resolver.messages],
+            ["warning", "warning"],
+        )
+        self.assertTrue(
+            all(
+                "takes precedence over legacy $ array mode" in message.msg
+                for message in resolver.messages
+            )
+        )
+
+
 class JinestLayerTests(unittest.TestCase):
     def test_layer_order_defaults_local_overrides(self) -> None:
         data = {

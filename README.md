@@ -94,6 +94,8 @@ jinest config.yaml
 | `name@` | Full Jinja text template; result is a string |
 | `name$` | One Jinja expression; result preserves its native type |
 | `name^` | Multiline Jinja script; `return` produces a native value |
+| `=$expr`, `=@text`, `=^script` | Inline native expression, text template, or script in a scalar value or a dynamic mapping key |
+| `key\`` | Raw key: remove the final backtick and disable all Jinest key parsing |
 | `.name`, `.name$`, `.name@`, `.name^` | Hidden field; use it in Jinja as `name`, but omit it from final output |
 | `<<$`, `<<N$` | Native-expression default layer |
 | `<<^`, `<<N^` | Script default layer |
@@ -107,6 +109,46 @@ name > name^ > name$ > name@
 ```
 
 Ignored lower-priority alternatives are not parsed or evaluated.
+
+## Raw and inline syntax
+
+A mapping key ending in a backtick is literal: the marker is removed and no
+Jinest key syntax is recognized. This is useful for keys that naturally end in
+`$`, `@`, or `^`. Two final backticks leave one literal backtick in the result.
+
+```yaml
+"price$`": literal key named "price$"
+"title@`": literal key named "title@"
+"final``": literal key named "final`"
+```
+
+Inline directives make only that scalar lazy, without changing the mapping
+key. `$` returns a native value, `@` returns text, and `^` executes a script.
+A leading backtick escapes a directive and is removed.
+
+```yaml
+value: 4
+native: "=$value * 2"
+label: "=@value={{ value }}"
+script: "=^% return value * 3"
+literal: "`=$value"       # becomes the literal string "=$value"
+items: ["=$value + 1", "=@item={{ value }}"]
+```
+
+An inline directive in a mapping key creates a dynamic key. It is evaluated
+once when that mapping is indexed, must return a string, and is then treated
+as a literal final key (its result is not parsed again as Jinest syntax).
+Duplicate final keys raise `JinestError`.
+
+```yaml
+name: generated$
+"=$name": "=$value + 1"  # final key is literally `generated$`
+```
+
+Mode fields and legacy mode-typed arrays such as `value$` or `items$` remain
+supported. An explicit inline `=$`, `=@`, or `=^` value takes precedence over
+the field or inherited array mode and produces a compatibility warning. Its
+`keymode` is the winning inline marker, not the marker on the field key.
 
 ## Hidden fields
 
@@ -636,7 +678,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The test suite contains 73 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
+The test suite contains 78 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
 
 ## Security
 

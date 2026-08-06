@@ -1,0 +1,29 @@
+# A trailing backtick makes a literal key and is then removed.
+literal$`: native-looking literal key
+literal@`: text-looking literal key
+literal^`: script-looking literal key
+final``: one literal final backtick
+
+value: 4
+native: "=$value * 2"
+text: "=@value={{ value }}"
+script: "=^% return value * 3"
+escaped: "`=$value"
+# An explicit inline directive beats the `$` mode of this field.
+field$: "=@winner={{ keymode }}"
+
+# This key is evaluated once, then used literally -- its trailing `$` is not a mode.
+name: dynamic$
+"=$name": "=$value + 1"
+
+items:
+  - "=$value + 2"
+  - "=@item={{ value }}"
+  - "=^% return value * 4"
+  - "`=@item={{ value }}"
+
+# Explicit inline elements override the legacy `$` array mode.
+legacy$:
+  - "value + 1"
+  - "=@text={{ value }}"
+  - "=^% return value * 5"

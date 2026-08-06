@@ -1,0 +1,2 @@
+# Dynamic mapping keys must evaluate to strings.
+"=$42": value

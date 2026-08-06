@@ -1,0 +1,3 @@
+jinest: warning: Inline directive at global_root.field takes precedence over $ field mode
+jinest: warning: Inline directive at global_root.legacy[1] takes precedence over legacy $ array mode
+jinest: warning: Inline directive at global_root.legacy[2] takes precedence over legacy $ array mode
