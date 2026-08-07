@@ -175,6 +175,17 @@ class _JinestJSONEncoder(json.JSONEncoder):
 class JinestError(Exception):
     """Base error raised by Jinest."""
 
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        path: str | None = None,
+        file: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.path = path
+        self.file = file
+
 
 class JinestTemplateError(JinestError):
     """A Jinja expression or template could not be evaluated."""
@@ -189,12 +200,15 @@ class JinestMessage:
     """A diagnostic collected while resolving a Jinest tree.
 
     ``level`` is currently ``"warning"`` or ``"hint"`` and ``msg`` is the
-    human-readable diagnostic text.  Message objects are intentionally small
-    and immutable so callers can safely inspect or copy ``Resolver.messages``.
+    human-readable diagnostic text. ``path`` and ``file`` identify the source
+    location when available. Message objects are intentionally small and
+    immutable so callers can safely inspect or copy ``Resolver.messages``.
     """
 
     level: str
     msg: str
+    path: str | None = None
+    file: str | None = None
 
 
 class JinestWarningError(JinestError):
@@ -949,6 +963,8 @@ class _SequenceProxy(_ContainerProxy, Sequence):
                         f"{_format_path_segments('global_root', item_path)} takes "
                         f"precedence over legacy {_FUNCTION_MODE_MARKERS[mode]} array mode",
                         dedupe_key=("inline-array", id(raw), normalized),
+                        source=source,
+                        path=item_path,
                     )
                 value = owner._bind_child(
                     self,
@@ -1015,6 +1031,7 @@ class Resolver:
         function_max_depth: int = 100,
         emit_messages: bool = True,
         treat_warnings_as_errors: bool = False,
+        debug: bool = False,
         _import_chain: tuple[Path, ...] | None = None,
         _global_owner: "Resolver | None" = None,
     ) -> None:
@@ -1028,9 +1045,13 @@ class Resolver:
             raise TypeError("emit_messages must be a boolean")
         if not isinstance(treat_warnings_as_errors, bool):
             raise TypeError("treat_warnings_as_errors must be a boolean")
+        if not isinstance(debug, bool):
+            raise TypeError("debug must be a boolean")
         self.emit_messages = emit_messages
         self.treat_warnings_as_errors = treat_warnings_as_errors
+        self.debug = debug
         self._global_owner = _global_owner or self
+        self._raw_sources: dict[int, _Source] = {}
         if self._global_owner is self:
             self.messages: list[JinestMessage] = []
             self._message_keys: set[tuple[str, str]] = set()
@@ -1038,6 +1059,7 @@ class Resolver:
         else:
             self.messages = self._global_owner.messages
             self._message_keys = self._global_owner._message_keys
+            self._raw_sources = self._global_owner._raw_sources
         self._function_depth = 0
         self._function_stack: list[str] = []
         self._user_globals = dict(globals or {})
@@ -1177,7 +1199,32 @@ class Resolver:
         self.script_environment.globals.update(self._user_globals)
         self.script_environment.filters.update(self._user_filters)
 
-        self._reset_root_views()
+        try:
+            self._reset_root_views()
+        except Exception as exc:
+            self._annotate_error(
+                exc,
+                path="root",
+                file=str(self.source_path) if self.source_path else None,
+            )
+            self._emit_debug_error(exc)
+            raise
+
+    def _source_location(
+        self,
+        source: _Source | None = None,
+        raw: Any | None = None,
+        path: tuple[Any, ...] | None = None,
+    ) -> tuple[str | None, str | None]:
+        if source is None and raw is not None:
+            source = self._raw_sources.get(id(raw))
+        if source is None:
+            return None, None
+        source_path = source.source_path if path is None else path
+        return (
+            _format_path_segments("root", source_path),
+            str(source.resolver.source_path) if source.resolver.source_path else None,
+        )
 
     def _record_message(
         self,
@@ -1185,6 +1232,9 @@ class Resolver:
         msg: str,
         *,
         dedupe_key: tuple[Any, ...] | None = None,
+        source: _Source | None = None,
+        raw: Any | None = None,
+        path: tuple[Any, ...] | None = None,
     ) -> None:
         """Add one deduplicated diagnostic to the shared resolver message list."""
         if level not in {"warning", "hint"}:
@@ -1192,8 +1242,38 @@ class Resolver:
         key = dedupe_key or (level, msg)
         if key in self._message_keys:
             return
+        message_path, message_file = self._source_location(source, raw, path)
         self._message_keys.add(key)
-        self.messages.append(JinestMessage(level, msg))
+        self.messages.append(JinestMessage(level, msg, message_path, message_file))
+
+    def _debug_lines(self, *, path: str | None, file: str | None) -> list[str]:
+        if not self.debug:
+            return []
+        return [f"  at {path or 'root'}", f"  in {file or '<memory>'}"]
+
+    def _annotate_error(
+        self,
+        error: BaseException,
+        *,
+        path: str | None = None,
+        file: str | None = None,
+    ) -> BaseException:
+        if isinstance(error, JinestError):
+            if getattr(error, "path", None) is None:
+                error.path = path
+            if getattr(error, "file", None) is None:
+                error.file = file
+        return error
+
+    def _emit_debug_error(self, error: BaseException) -> None:
+        if not self.debug or getattr(error, "_jinest_debug_emitted", False):
+            return
+        setattr(error, "_jinest_debug_emitted", True)
+        print(f"jinest: {error}", file=sys.stderr)
+        for line in self._debug_lines(
+            path=getattr(error, "path", None), file=getattr(error, "file", None)
+        ):
+            print(line, file=sys.stderr)
 
     def _flush_messages(self) -> None:
         """Print newly collected diagnostics, if stderr output is enabled."""
@@ -1204,6 +1284,8 @@ class Resolver:
         pending = owner.messages[owner._emitted_message_count:]
         for message in pending:
             print(f"jinest: {message.level}: {message.msg}", file=sys.stderr)
+            for line in owner._debug_lines(path=message.path, file=message.file):
+                print(line, file=sys.stderr)
         owner._emitted_message_count = len(owner.messages)
 
     def _finalize_messages(self) -> None:
@@ -1212,9 +1294,13 @@ class Resolver:
         warnings = [message for message in owner.messages if message.level == "warning"]
         if owner.treat_warnings_as_errors and warnings:
             details = "\n".join(message.msg for message in warnings)
-            raise JinestWarningError(
+            error = JinestWarningError(
                 f"Warnings treated as errors ({len(warnings)}):\n{details}"
             )
+            first = warnings[0]
+            error.path, error.file = first.path, first.file
+            owner._emit_debug_error(error)
+            raise error
         self._flush_messages()
 
     def _reset_root_views(self) -> None:
@@ -1255,10 +1341,11 @@ class Resolver:
         """Fully materialize the lazy tree into ordinary Python values."""
         try:
             result = self._to_plain(self.root, active=set())
-        except Exception:
+        except Exception as exc:
             # Diagnostics discovered before a rendering error are still useful
             # to API callers and CLI users.
             self._flush_messages()
+            self._emit_debug_error(exc)
             raise
         self._finalize_messages()
 
@@ -1343,6 +1430,7 @@ class Resolver:
         else:
             return self._copy_scalar(value)
 
+        self._raw_sources[id(source.raw)] = source
         if isinstance(source.raw, Mapping):
             return _MappingProxy(
                 self,
@@ -1696,6 +1784,7 @@ class Resolver:
                     f"Field {winner!r} suppresses {suppressed!r}; local priority is "
                     "name > name^ > name$ > name@",
                     dedupe_key=("warning", id(raw), winner, suppressed),
+                    raw=raw,
                 )
 
         public_names = {logical for (logical, hidden) in declarations if not hidden}
@@ -1706,6 +1795,7 @@ class Resolver:
                 f"Hidden field '.{logical}' takes priority over field {logical!r} "
                 "in template calculations; the public field remains in the final dump",
                 dedupe_key=("hint", id(raw), logical),
+                raw=raw,
             )
 
     def _schema(self, raw: Mapping[Any, Any]) -> _MapSchema:
@@ -2036,6 +2126,8 @@ class Resolver:
                         id(source.raw),
                         candidate.source_key,
                     ),
+                    source=source,
+                    path=source.source_path + (candidate.source_key,),
                 )
             return self._bind_child(
                 bind,
@@ -2799,18 +2891,35 @@ class Resolver:
             # Defensive fallback in case an environment layer lets the return
             # escape outside the inner render call.
             return self._prepare_native(returned.value)
-        except JinestError:
+        except JinestError as exc:
+            self._annotate_error(
+                exc,
+                path=display_path,
+                file=str(origin_source.resolver.source_path)
+                if origin_source.resolver.source_path
+                else None,
+            )
             raise
         except UndefinedError as exc:
             if not self.strict:
                 return "" if mode == "text" else None
-            raise JinestTemplateError(
-                f"Failed to render {display_path}: {exc}"
-            ) from exc
+            error = JinestTemplateError(
+                f"Failed to render {display_path}: {exc}",
+                path=display_path,
+                file=str(origin_source.resolver.source_path)
+                if origin_source.resolver.source_path
+                else None,
+            )
+            raise error from exc
         except Exception as exc:
-            raise JinestTemplateError(
-                f"Failed to render {display_path}: {exc}"
-            ) from exc
+            error = JinestTemplateError(
+                f"Failed to render {display_path}: {exc}",
+                path=display_path,
+                file=str(origin_source.resolver.source_path)
+                if origin_source.resolver.source_path
+                else None,
+            )
+            raise error from exc
 
     def _prepare_native(self, value: Any) -> Any:
         if isinstance(value, Undefined):
@@ -3405,6 +3514,11 @@ def _main() -> None:
         action="store_true",
         help="Abort when any warning is collected",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print source file and path for each message or error",
+    )
     parser.add_argument("--self-test", action="store_true", help="Run built-in tests")
     args = parser.parse_args()
 
@@ -3422,9 +3536,17 @@ def _main() -> None:
             sandboxed=not args.unsafe,
             emit_messages=not args.no_messages,
             treat_warnings_as_errors=args.treat_warnings_as_errors,
+            debug=args.debug,
         )
     except (JinestError, OSError, ValueError) as exc:
-        parser.exit(1, f"jinest: {exc}\n")
+        if args.debug and isinstance(exc, JinestError) and getattr(
+            exc, "_jinest_debug_emitted", False
+        ):
+            parser.exit(1)
+        details = f"jinest: {exc}\n"
+        if args.debug:
+            details += f"  at root\n  in {args.input}\n"
+        parser.exit(1, details)
     if args.output is None:
         print(rendered)
 

@@ -599,6 +599,40 @@ class JinestMessageTests(unittest.TestCase):
             resolver.resolve()
         self.assertEqual(len(resolver.messages), 1)
 
+    def test_debug_adds_message_location(self) -> None:
+        resolver = jinest.Resolver(
+            {"value": 1, "value$": "2"},
+            debug=True,
+        )
+        self.assertEqual(resolver.messages[0].path, "root")
+        self.assertIsNone(resolver.messages[0].file)
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            self.assertEqual(resolver.resolve(), {"value": 1})
+        self.assertIn("jinest: warning:", stream.getvalue())
+        self.assertIn("  at root\n  in <memory>\n", stream.getvalue())
+
+    def test_debug_adds_error_location(self) -> None:
+        resolver = jinest.Resolver({"broken$": "missing.value"}, debug=True)
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            with self.assertRaises(jinest.JinestTemplateError) as caught:
+                resolver.resolve()
+        error = caught.exception
+        self.assertEqual(error.path, "root['broken$']")
+        self.assertIsNone(error.file)
+        self.assertIn("jinest: Failed to render", stream.getvalue())
+        self.assertIn("  at root['broken$']\n  in <memory>\n", stream.getvalue())
+
+    def test_debug_message_file_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.yml"
+            path.write_text("value: 1\nvalue$: 2\n", encoding="utf-8")
+            data = jinest._parse_text(path.read_text(encoding="utf-8"), "yaml")
+            resolver = jinest.Resolver(data, source_path=path, debug=True)
+            self.assertEqual(resolver.messages[0].path, "root")
+            self.assertEqual(resolver.messages[0].file, str(path.resolve()))
+
 
 class JinestInlineSyntaxTests(unittest.TestCase):
     def test_raw_keys_disable_all_key_parsing(self) -> None:

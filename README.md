@@ -209,7 +209,7 @@ The result contains `price`, `shown_tax`, and `total: 120.0`, but no `.tax`.
 
 During schema discovery Jinest collects non-fatal diagnostics in
 `Resolver.messages`. Each item is an immutable `JinestMessage` with `level`
-(`"warning"` or `"hint"`) and `msg` fields. By default diagnostics are printed
+(`"warning"` or `"hint"`), `msg`, `path`, and `file` fields. By default diagnostics are printed
 to stderr after a successful `resolve()`; they never change the resolved data.
 
 A literal field suppresses lower-priority declarations with the same logical
@@ -230,6 +230,9 @@ for message in resolver.messages:
 ```
 
 Use `emit_messages=False` when the caller wants to process the list itself.
+Set `debug=True` to append the source location of each diagnostic or error to
+stderr as `at {path}` and `in {file}` lines. The same location is available on
+`JinestMessage.path`/`.file` and on Jinest exceptions.
 Set `treat_warnings_as_errors=True` to raise `JinestWarningError` if any
 warning was collected (hints do not trigger this policy). The CLI equivalents
 are `--no-messages` (`-silent`) and `--treat-warnings-as-errors` (`-Werror`).
@@ -687,6 +690,7 @@ When serializing JSON, date/time values use ISO 8601 strings. Every byte in a
 python jinest.py config.yaml
 python jinest.py config.yaml -o resolved.yaml
 python jinest.py config.yaml --output-format json
+python jinest.py config.yaml --debug
 python jinest.py --self-test
 ```
 
