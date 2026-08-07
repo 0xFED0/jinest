@@ -46,6 +46,44 @@ app:
 
 > **Status:** Jinest `0.12.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
+## Contents
+
+- [Highlights](#highlights)
+- [Installation](#installation)
+- [Syntax](#syntax)
+- [Raw and inline syntax](#raw-and-inline-syntax)
+- [Hidden fields](#hidden-fields)
+- [Diagnostics: warnings and hints](#diagnostics-warnings-and-hints)
+- [Native expressions: `$`](#native-expressions-)
+- [Text templates: `@`](#text-templates-)
+- [Multiline scripts: `^`](#multiline-scripts-)
+- [Template functions](#template-functions)
+- [Lazy layers](#lazy-layers)
+- [Evaluation context](#evaluation-context)
+- [Node metadata](#node-metadata)
+- [PathRef](#pathref)
+- [Path functions](#path-functions)
+  - [`path_of(node)`](#path_ofnode)
+  - [`source_path_of(node)`](#source_path_ofnode)
+  - [`normalize_path(value)`](#normalize_pathvalue)
+  - [`absolute_path(value, anchor=context)`](#absolute_pathvalue-anchorcontext)
+  - [`relative_path(target, base=context)`](#relative_pathtarget-basecontext)
+  - [`at(path, anchor=context)`](#atpath-anchorcontext)
+  - [`get(path, default=none, anchor=context)`](#getpath-defaultnone-anchorcontext)
+  - [Node indexing](#node-indexing)
+  - [Source helpers](#source-helpers)
+- [Lazy arrays](#lazy-arrays)
+- [Imports](#imports)
+- [Python API](#python-api)
+  - [Eager convenience](#eager-convenience)
+  - [Lazy access](#lazy-access)
+  - [Files](#files)
+- [CLI](#cli)
+- [Testing](#testing)
+- [Examples](#examples)
+- [Security](#security)
+- [License](#license)
+
 ## Highlights
 
 - Lazy field resolution and dependency tracking.
@@ -358,6 +396,7 @@ Every template or expression receives:
 | `keyname` | Logical output key of the field currently being evaluated |
 | `effective_key` | Exact source key that declared the field, including `.`, `$`, `@`, or `^` |
 | `keymode` | Field-mode marker: `$`, `@`, or `^`; `none` when there is no marker |
+| `keypath` | Path to the current field; equivalent to `path[keyname]` |
 
 This split allows imported prototypes to use their own absolute source references while adapting relative references to the destination:
 
