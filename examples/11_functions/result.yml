@@ -9,6 +9,13 @@ script_result: 10
 structured_result:
   value: hello
   type: generated
+deployments:
+  host: api.example.test
+  primary:
+    name: jinest
+    address: api.example.test:8080
+    path: global_root.deployments
+    label: JINEST
 scaled_result: 50
 namespace_result: <HELLO>
 output:

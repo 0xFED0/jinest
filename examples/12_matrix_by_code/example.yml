@@ -1,0 +1,40 @@
+server(ver,i)=:
+  version$: ver
+  binary@: 'python{{ver}}'
+  exec:
+    - '=$_.binary'
+    - 'server.py'
+    - '--port'
+    - '=$8080+i'
+
+versions: ['3.10', '3.11', '3.12', '3.13', '3.14']
+
+servers^: |
+  % set r = []
+  % for v in versions
+    % do r.append(server(v,loop.index0))
+  % endfor
+  % return r
+
+module(py, m, args)=:
+  binary$: py
+  module$: m
+  exec$: '[ binary, "-m", module ] + (args | list)'
+
+modules:
+  tojson: [ "file1.yml", "-o", "file1.json" ]
+  check: ["file1.yml", "file2.yml", "file3.yml"]
+  jinja: ["template1.txt", "template2.txt"]
+
+runs^: |
+  % set runs = {}
+  % for m in modules
+    % set args = modules[m]
+    % set execs = {}
+    % for v in versions
+      % set py = "python" ~ v
+      % do execs.update({ py: module(py, m, args) })
+    % endfor
+    % do runs.update({ m: execs })
+  % endfor
+  % return runs

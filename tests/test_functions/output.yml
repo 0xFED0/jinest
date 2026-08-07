@@ -5,4 +5,5 @@ structured_result:
   value: hello
   type: generated
 namespace_result: HELLO
+zero_result: 0
 

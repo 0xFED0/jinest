@@ -5,6 +5,8 @@ config:
 service:
   endpoint$: "'http://localhost:' ~ _.config.port"
   own_path$: path
+  nested:
+    path$: path
   config_path$: "path._.config"
   normalized$: "normalize_path('global_root.config.port')"
   absolute$: "absolute_path('_.config.port', anchor=context)"
@@ -16,13 +18,14 @@ service:
   source_file_known$: "source_file(context) is not none"
 
   # Each field expression knows its logical name, exact declaration, and mode.
-  key_context$: "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}"
-  text_key_context@: "{{ keyname }}|{{ effective_key }}|{{ keymode }}"
+  key_context$: "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode, 'keypath': keypath}"
+  text_key_context@: "{{ keyname }}|{{ effective_key }}|{{ keymode }}|{{ keypath }}"
   script_key_context^: |
     % return {
       "keyname": keyname,
       "effective_key": effective_key,
       "keymode": keymode,
+      "keypath": keypath,
     }
-  .hidden_context$: "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}"
+  .hidden_context$: "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode, 'keypath': keypath}"
   hidden_context_report$: hidden_context

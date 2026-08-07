@@ -62,7 +62,7 @@ except ImportError:
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.11.0")
+        self.assertEqual(jinest.__version__, "0.12.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -157,21 +157,22 @@ class JinestCoreTests(unittest.TestCase):
     def test_field_key_context_variables(self) -> None:
         result = jinest.resolve(
             {
-                "native_context$": "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}",
-                "text_context@": "{{ keyname }}|{{ effective_key }}|{{ keymode }}",
+                "native_context$": "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode, 'keypath': keypath}",
+                "text_context@": "{{ keyname }}|{{ effective_key }}|{{ keymode }}|{{ keypath }}",
                 "script_context^": "\n".join(
                     [
                         "% return {",
                         '  "keyname": keyname,',
                         '  "effective_key": effective_key,',
                         '  "keymode": keymode,',
+                        '  "keypath": keypath,',
                         "}",
                     ]
                 ),
                 "array_context$": [
-                    "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}"
+                    "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode, 'keypath': keypath}"
                 ],
-                ".hidden_context$": "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode}",
+                ".hidden_context$": "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode, 'keypath': keypath}",
                 "hidden_report$": "hidden_context",
             }
         )
@@ -182,24 +183,28 @@ class JinestCoreTests(unittest.TestCase):
                     "keyname": "native_context",
                     "effective_key": "native_context$",
                     "keymode": "$",
+                    "keypath": "global_root.native_context",
                 },
-                "text_context": "text_context|text_context@|@",
+                "text_context": "text_context|text_context@|@|global_root.text_context",
                 "script_context": {
                     "keyname": "script_context",
                     "effective_key": "script_context^",
                     "keymode": "^",
+                    "keypath": "global_root.script_context",
                 },
                 "array_context": [
                     {
                         "keyname": "array_context",
                         "effective_key": "array_context$",
                         "keymode": "$",
+                        "keypath": "global_root.array_context[0].array_context",
                     }
                 ],
                 "hidden_report": {
                     "keyname": "hidden_context",
                     "effective_key": ".hidden_context$",
                     "keymode": "$",
+                    "keypath": "global_root.hidden_context",
                 },
             },
         )
@@ -350,6 +355,140 @@ class JinestFunctionTests(unittest.TestCase):
         self.assertEqual(result["default_result"], 50)
         self.assertEqual(result["named_result"], 15)
         self.assertEqual(result["output"]["call_site"], "output-name")
+
+    def test_structural_functions_rebind_body_at_call_site(self) -> None:
+        result = jinest.resolve(
+            {
+                "declared": "declaration-value",
+                "make(x, y=global_root.default, k='generated', v=x * y)=": {
+                    "x$": "x",
+                    "nested": {
+                        "product$": "x * y",
+                        "context_path$": "context.path",
+                    },
+                    "label@": "{{ context.prefix }}{{ x }}",
+                    "where@": "{{ path }}",
+                    "origin_value$": "origin.declared",
+                    "root_value$": "root.declared",
+                    "=$k": "=$v",
+                },
+                "pair(a, b=global_root.default)=": ["=$a", "=@{{ b }}"],
+                "default": 10,
+                "left": {"prefix": "left-", "result": "=$global_root.make(2)"},
+                "right": {"prefix": "right-", "result": "=$global_root.make(3, y=4, k='answer')"},
+                "array": "=$pair(7)",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "declared": "declaration-value",
+                "default": 10,
+                "left": {
+                    "prefix": "left-",
+                    "result": {
+                        "x": 2,
+                        "nested": {
+                            "product": 20,
+                            "context_path": "global_root.left.nested",
+                        },
+                        "label": "left-2",
+                        "where": "global_root.left",
+                        "origin_value": "declaration-value",
+                        "root_value": "declaration-value",
+                        "generated": 20,
+                    },
+                },
+                "right": {
+                    "prefix": "right-",
+                    "result": {
+                        "x": 3,
+                        "nested": {
+                            "product": 12,
+                            "context_path": "global_root.right.nested",
+                        },
+                        "label": "right-3",
+                        "where": "global_root.right",
+                        "origin_value": "declaration-value",
+                        "root_value": "declaration-value",
+                        "answer": 12,
+                    },
+                },
+                "array": [7, "10"],
+            },
+        )
+
+    def test_structural_function_layers_in_body_and_nested_node(self) -> None:
+        result = jinest.resolve(
+            {
+                ".root_native0": {"native0": True, "shared": "native0"},
+                ".root_native1": {"native1": True, "shared": "native1"},
+                ".root_script0": {"script0": True, "shared": "script0"},
+                ".root_script1": {"script1": True, "shared": "script1"},
+                ".nested_native0": {"native0": True, "shared": "native0"},
+                ".nested_native1": {"native1": True, "shared": "native1"},
+                ".nested_script0": {"script0": True, "shared": "script0"},
+                ".nested_script1": {"script1": True, "shared": "script1"},
+                "layered()=": {
+                    "<<$": "root.root_native0",
+                    "<<1$": "root.root_native1",
+                    "<<^": "% return root.root_script0\n",
+                    "<<1^": "% return root.root_script1\n",
+                    "nested": {
+                        "<<$": "root.nested_native0",
+                        "<<1$": "root.nested_native1",
+                        "<<^": "% return root.nested_script0\n",
+                        "<<1^": "% return root.nested_script1\n",
+                    },
+                },
+                "result": "=$layered()",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "result": {
+                    "native0": True,
+                    "native1": True,
+                    "script0": True,
+                    "script1": True,
+                    "shared": "script1",
+                    "nested": {
+                        "native0": True,
+                        "native1": True,
+                        "script0": True,
+                        "script1": True,
+                        "shared": "script1",
+                    },
+                }
+            },
+        )
+
+
+    def test_structural_function_declaration_and_argument_errors(self) -> None:
+        invalid = [
+            {"scalar(x)=": "x"},
+            {"unsuffixed(x)": {"value": 1}},
+            {"bad(1x)=": {}},
+            {"same(x)=": {}, "same(x)$": "x"},
+        ]
+        for data in invalid:
+            with self.subTest(data=data), self.assertRaises(jinest.JinestError):
+                jinest.resolve(data, emit_messages=False)
+
+        with self.assertRaisesRegex(jinest.JinestFunctionError, "missing required"):
+            jinest.resolve(
+                {"build(value)=": {"value$": "value"}, "result": "=$build()"},
+                emit_messages=False,
+            )
+        with self.assertRaisesRegex(jinest.JinestFunctionError, "unknown argument"):
+            jinest.resolve(
+                {"build(value)=": {"value$": "value"}, "result": "=$build(other=1)"},
+                emit_messages=False,
+            )
+
 
     def test_function_script_local_shadows_argument(self) -> None:
         result = jinest.resolve(

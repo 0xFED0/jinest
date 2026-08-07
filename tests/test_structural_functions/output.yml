@@ -1,0 +1,46 @@
+declared: declaration-value
+default: 10
+left:
+  prefix: left-
+  result:
+    x: 2
+    nested:
+      product: 20
+      path: global_root.left.nested
+      keyvars: '@, "keyvars", "keyvars@", "global_root.left.nested.keyvars"'
+    keyvars: '@, "keyvars", "keyvars@", "global_root.left.keyvars"'
+    label: left-2
+    where: global_root.left
+    origin_value: declaration-value
+    root_value: declaration-value
+    generated: 20
+right:
+  prefix: right-
+  result:
+    x: 3
+    nested:
+      product: 12
+      path: global_root.right.nested
+      keyvars: '@, "keyvars", "keyvars@", "global_root.right.nested.keyvars"'
+    keyvars: '@, "keyvars", "keyvars@", "global_root.right.keyvars"'
+    label: right-3
+    where: global_root.right
+    origin_value: declaration-value
+    root_value: declaration-value
+    answer: 12
+array:
+- 7
+- '10'
+result:
+  native0: true
+  shared: script1
+  script0: true
+  native1: true
+  script1: true
+  nested:
+    native0: true
+    shared: script1
+    script0: true
+    native1: true
+    script1: true
+

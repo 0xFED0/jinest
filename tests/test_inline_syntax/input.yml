@@ -7,7 +7,7 @@ final``: one literal final backtick
 value: 4
 native: "=$value * 2"
 text: "=@value={{ value }}"
-script: "=^% return value * 3"
+script: =^% return value * 3
 escaped: "`=$value"
 # An explicit inline directive beats the `$` mode of this field.
 field$: "=@winner={{ keymode }}"

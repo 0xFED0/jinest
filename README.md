@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.11.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.12.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Highlights
 
@@ -280,8 +280,25 @@ Function bodies use the normal call-site `context`, `path`, and `global_root`,
 while `origin` and `root` refer to the declaration source. Functions are safe
 Jinja callables; arbitrary Python attributes and APIs remain unavailable.
 
-Only `$`, `@`, and `^` function modes are supported in this version. An
-unsuffixed key such as `name(args)` is never interpreted as a function, and
+Structural functions use a final `=` and have a mapping or array body. Each
+call creates a fresh lazy binding of that body, so its caches and parameters
+are isolated from other calls. The body uses call-site `context` and `path`,
+while `origin` and `root` still point to the declaration.
+
+```yaml
+record(x, key, value)=:
+  value$: x
+  =$key: =$value
+pair(a, b)=: ["=$a", "=$b"]
+
+result: "=$record(2, 'answer', 42)"
+values: "=$pair('left', 'right')"
+```
+
+Structural functions also support positional arguments, named arguments, and
+defaults. Their bodies must be mappings or arrays; scalar bodies and
+unsuffixed structural-looking declarations such as `name(args): {}` are
+errors. `$`, `@`, `^`, and `=` are the supported function declaration modes;
 `*args`/`**kwargs` are not supported.
 
 ## Lazy layers
@@ -678,7 +695,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The test suite contains 78 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
+The test suite contains 81 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
 
 ## Security
 

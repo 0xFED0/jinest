@@ -51,4 +51,5 @@ calc:
     keyname: field_key_context
     effective_key: field_key_context$
     keymode: $
-  field_key_context_text: field_key_context_text|field_key_context_text@|@
+    keypath: global_root.calc.field_key_context
+  field_key_context_text: field_key_context_text|field_key_context_text@|@|global_root.calc.field_key_context_text

@@ -6,6 +6,7 @@ make_result(value)^: |
   %   "value": value,
   %   "type": "generated"
   % }
+zero()$: 0
 
 strings:
   upper(value)$: value | upper
@@ -14,3 +15,4 @@ native_result$: square(5)
 text_result@: "{{ quote(square(5)) }}"
 structured_result$: make_result("hello")
 namespace_result@: "{{ strings.upper('hello') }}"
+zero_result$: zero()

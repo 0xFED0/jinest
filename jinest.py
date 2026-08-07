@@ -12,6 +12,8 @@ Syntax
   ``return`` a native value.
 * ``name(args)$``, ``name(args)@``, and ``name(args)^`` — declare lazy safe
   template functions in native, text, or script mode.
+* ``name(args)=`` — declare a structural function with a lazy mapping or array
+  body rebound at each call site.
 * ``.name`` — a hidden field, available to Jinja as ``name`` but omitted from
   the final resolved mapping.
 * A key ending in a backtick is a raw literal key; all Jinest key parsing is
@@ -82,7 +84,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -248,7 +250,7 @@ class _FunctionSpec:
     name: str
     source_key: str
     template: Any
-    mode: str  # native, text, script
+    mode: str  # native, text, script, structural
     parameters: tuple[_FunctionParameter, ...]
 
 
@@ -261,6 +263,7 @@ class _MapSchema:
 
 
 _FUNCTION_MODES = {"$": "native", "@": "text", "^": "script"}
+_FUNCTION_DECLARATION_MODES = {**_FUNCTION_MODES, "=": "structural"}
 _FUNCTION_MODE_MARKERS = {value: key for key, value in _FUNCTION_MODES.items()}
 
 
@@ -320,7 +323,16 @@ def _parse_function_declaration(key: Any, template: Any = _MISSING) -> _Function
     if not isinstance(key, str) or _literal_syntax_key(key):
         return None
     marker = key[-1:] if key else ""
-    if marker not in _FUNCTION_MODES:
+    if marker not in _FUNCTION_DECLARATION_MODES:
+        if (
+            template is not _MISSING
+            and key.endswith(")")
+            and isinstance(template, (Mapping, Sequence))
+            and not isinstance(template, (str, bytes, bytearray))
+        ):
+            raise JinestError(
+                f"Structural function declaration {key!r} requires a trailing '='"
+            )
         if (
             re.match(r"^[A-Za-z_]\w*\(", key)
             and not key.endswith(")")
@@ -388,11 +400,20 @@ def _parse_function_declaration(key: Any, template: Any = _MISSING) -> _Function
                 )
         parameters.append(_FunctionParameter(argument.arg, default))
 
+    mode = _FUNCTION_DECLARATION_MODES[marker]
+    if template is not _MISSING and mode == "structural" and not (
+        isinstance(template, (Mapping, Sequence))
+        and not isinstance(template, (str, bytes, bytearray))
+    ):
+        raise JinestError(
+            f"Structural function {key!r} must have a mapping or array body"
+        )
+
     return _FunctionSpec(
         name=name,
         source_key=key,
         template=template,
-        mode=_FUNCTION_MODES[marker],
+        mode=mode,
         parameters=tuple(parameters),
     )
 
@@ -661,6 +682,11 @@ class _ContainerProxy:
         "_jinest_path",
         "_jinest_path_kind",
         "_jinest_children",
+        "_jinest_local_vars",
+        "_jinest_function_scope",
+        "_jinest_function_context_path",
+        "_jinest_function_origin_source",
+        "_jinest_function_body_source_path",
     )
 
     def __init__(
@@ -670,6 +696,11 @@ class _ContainerProxy:
         parent: "_ContainerProxy | None",
         path: tuple[Any, ...],
         path_kind: str = "global",
+        local_vars: Mapping[str, Any] | None = None,
+        function_scope: "_ContainerProxy | None" = None,
+        function_context_path: tuple[Any, ...] | None = None,
+        function_origin_source: _Source | None = None,
+        function_body_source_path: tuple[Any, ...] | None = None,
     ) -> None:
         object.__setattr__(self, "_jinest_owner", owner)
         object.__setattr__(self, "_jinest_source", source)
@@ -677,6 +708,23 @@ class _ContainerProxy:
         object.__setattr__(self, "_jinest_path", path)
         object.__setattr__(self, "_jinest_path_kind", path_kind)
         object.__setattr__(self, "_jinest_children", {})
+        object.__setattr__(self, "_jinest_local_vars", local_vars)
+        object.__setattr__(self, "_jinest_function_scope", function_scope)
+        object.__setattr__(
+            self,
+            "_jinest_function_context_path",
+            function_context_path,
+        )
+        object.__setattr__(
+            self,
+            "_jinest_function_origin_source",
+            function_origin_source,
+        )
+        object.__setattr__(
+            self,
+            "_jinest_function_body_source_path",
+            function_body_source_path,
+        )
 
     def __getattribute__(self, name: str) -> Any:
         if name == "_":
@@ -694,7 +742,7 @@ class _ContainerProxy:
                 owner,
                 root,
                 kind,
-                object.__getattribute__(self, "_jinest_path"),
+                owner._function_context_path(self),
             )
         if name == "source_path":
             source = object.__getattribute__(self, "_jinest_source")
@@ -744,8 +792,24 @@ class _MappingProxy(_ContainerProxy, Mapping):
         parent: _ContainerProxy | None,
         path: tuple[Any, ...],
         path_kind: str = "global",
+        local_vars: Mapping[str, Any] | None = None,
+        function_scope: "_ContainerProxy | None" = None,
+        function_context_path: tuple[Any, ...] | None = None,
+        function_origin_source: _Source | None = None,
+        function_body_source_path: tuple[Any, ...] | None = None,
     ) -> None:
-        super().__init__(owner, source, parent, path, path_kind)
+        super().__init__(
+            owner,
+            source,
+            parent,
+            path,
+            path_kind,
+            local_vars,
+            function_scope,
+            function_context_path,
+            function_origin_source,
+            function_body_source_path,
+        )
         object.__setattr__(self, "_jinest_resolved", {})
         object.__setattr__(self, "_jinest_public_resolved", {})
         object.__setattr__(self, "_jinest_layer_cache", {})
@@ -756,9 +820,9 @@ class _MappingProxy(_ContainerProxy, Mapping):
             return super().__getattribute__(name)
 
         if not name.startswith("_jinest_") and not name.startswith("__"):
-            owner = object.__getattribute__(self, "_jinest_owner")
-            if owner._scope_has_logical(self, name):
-                return owner._get_field(self, name)
+            value = self._jinest_resolve_name(name)
+            if value is not _MISSING:
+                return value
 
         return object.__getattribute__(self, name)
 
@@ -766,6 +830,9 @@ class _MappingProxy(_ContainerProxy, Mapping):
         owner = object.__getattribute__(self, "_jinest_owner")
         if owner._scope_has_logical(self, key):
             return owner._get_field(self, key)
+        function_scope = object.__getattribute__(self, "_jinest_function_scope")
+        if isinstance(function_scope, _ContainerProxy) and function_scope is not self:
+            return function_scope._jinest_resolve_name(key)
         return _MISSING
 
     def __getitem__(self, key: Any) -> Any:
@@ -802,8 +869,24 @@ class _SequenceProxy(_ContainerProxy, Sequence):
         item_mode: str | None = None,
         key_context: tuple[Any, Any, str | None] | None = None,
         path_kind: str = "global",
+        local_vars: Mapping[str, Any] | None = None,
+        function_scope: "_ContainerProxy | None" = None,
+        function_context_path: tuple[Any, ...] | None = None,
+        function_origin_source: _Source | None = None,
+        function_body_source_path: tuple[Any, ...] | None = None,
     ) -> None:
-        super().__init__(owner, source, parent, path, path_kind)
+        super().__init__(
+            owner,
+            source,
+            parent,
+            path,
+            path_kind,
+            local_vars,
+            function_scope,
+            function_context_path,
+            function_origin_source,
+            function_body_source_path,
+        )
         if item_mode not in {None, "native", "text", "script"}:
             raise ValueError(f"Unsupported sequence item mode: {item_mode!r}")
         object.__setattr__(self, "_jinest_item_mode", item_mode)
@@ -997,7 +1080,7 @@ class Resolver:
         self.environment = environment_type(undefined=undefined_type)
         self.script_environment = environment_type(
             undefined=undefined_type,
-            extensions=[_ReturnExtension],
+            extensions=[_ReturnExtension, 'jinja2.ext.do'],
             line_statement_prefix="%",
         )
         self.environment.context_class = _JinestContext
@@ -1205,6 +1288,19 @@ class Resolver:
     # Binding and source ownership
     # ------------------------------------------------------------------
 
+    def _function_context_path(self, scope: _ContainerProxy) -> tuple[Any, ...]:
+        """Return the structural body path rebased onto its call-site path."""
+        base = object.__getattribute__(scope, "_jinest_function_context_path")
+        body_source_path = object.__getattribute__(
+            scope, "_jinest_function_body_source_path"
+        )
+        source = object.__getattribute__(scope, "_jinest_source")
+        if base is not None and body_source_path is not None:
+            current = source.source_path
+            if current[: len(body_source_path)] == body_source_path:
+                return base + current[len(body_source_path):]
+        return object.__getattribute__(scope, "_jinest_path")
+
     def _wrap(
         self,
         value: Any,
@@ -1216,9 +1312,30 @@ class Resolver:
         sequence_item_mode: str | None = None,
         sequence_key_context: tuple[Any, Any, str | None] | None = None,
         path_kind: str = "global",
+        local_vars: Mapping[str, Any] | None = None,
+        function_scope: _ContainerProxy | None = None,
+        function_context_path: tuple[Any, ...] | None = None,
+        function_origin_source: _Source | None = None,
+        function_body_source_path: tuple[Any, ...] | None = None,
     ) -> Any:
         if isinstance(value, _ContainerProxy):
             source = object.__getattribute__(value, "_jinest_source")
+            if local_vars is None:
+                local_vars = object.__getattribute__(value, "_jinest_local_vars")
+            if function_scope is None:
+                function_scope = object.__getattribute__(value, "_jinest_function_scope")
+            if function_context_path is None:
+                function_context_path = object.__getattribute__(
+                    value, "_jinest_function_context_path"
+                )
+            if function_origin_source is None:
+                function_origin_source = object.__getattribute__(
+                    value, "_jinest_function_origin_source"
+                )
+            if function_body_source_path is None:
+                function_body_source_path = object.__getattribute__(
+                    value, "_jinest_function_body_source_path"
+                )
         elif isinstance(value, Mapping):
             source = _Source(origin or self, value, tuple(source_path or ()))
         elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
@@ -1227,7 +1344,18 @@ class Resolver:
             return self._copy_scalar(value)
 
         if isinstance(source.raw, Mapping):
-            return _MappingProxy(self, source, parent, path, path_kind)
+            return _MappingProxy(
+                self,
+                source,
+                parent,
+                path,
+                path_kind,
+                local_vars,
+                function_scope,
+                function_context_path,
+                function_origin_source,
+                function_body_source_path,
+            )
         if isinstance(source.raw, Sequence) and not isinstance(
             source.raw, (str, bytes, bytearray)
         ):
@@ -1246,6 +1374,11 @@ class Resolver:
                 item_mode=sequence_item_mode,
                 key_context=sequence_key_context,
                 path_kind=path_kind,
+                local_vars=local_vars,
+                function_scope=function_scope,
+                function_context_path=function_context_path,
+                function_origin_source=function_origin_source,
+                function_body_source_path=function_body_source_path,
             )
         return copy.deepcopy(source.raw)
 
@@ -1259,14 +1392,52 @@ class Resolver:
         source_path: tuple[Any, ...] | None = None,
         sequence_item_mode: str | None = None,
         sequence_key_context: tuple[Any, Any, str | None] | None = None,
+        local_vars: Mapping[str, Any] | None = None,
+        function_scope: _ContainerProxy | None = None,
+        function_context_path: tuple[Any, ...] | None = None,
+        function_origin_source: _Source | None = None,
+        function_body_source_path: tuple[Any, ...] | None = None,
     ) -> Any:
         if not self._is_container(value):
             return self._copy_scalar(value)
+
+        if local_vars is None:
+            local_vars = object.__getattribute__(parent, "_jinest_local_vars")
+        if function_scope is None:
+            function_scope = object.__getattribute__(parent, "_jinest_function_scope")
+        if function_context_path is None:
+            function_context_path = object.__getattribute__(
+                parent, "_jinest_function_context_path"
+            )
+        if function_origin_source is None:
+            function_origin_source = object.__getattribute__(
+                parent, "_jinest_function_origin_source"
+            )
+        if function_body_source_path is None:
+            function_body_source_path = object.__getattribute__(
+                parent, "_jinest_function_body_source_path"
+            )
 
         if isinstance(value, _ContainerProxy):
             source = object.__getattribute__(value, "_jinest_source")
             raw = source.raw
             source_origin = source.resolver
+            if local_vars is None:
+                local_vars = object.__getattribute__(value, "_jinest_local_vars")
+            if function_scope is None:
+                function_scope = object.__getattribute__(value, "_jinest_function_scope")
+            if function_context_path is None:
+                function_context_path = object.__getattribute__(
+                    value, "_jinest_function_context_path"
+                )
+            if function_origin_source is None:
+                function_origin_source = object.__getattribute__(
+                    value, "_jinest_function_origin_source"
+                )
+            if function_body_source_path is None:
+                function_body_source_path = object.__getattribute__(
+                    value, "_jinest_function_body_source_path"
+                )
         else:
             raw = value
             source_origin = origin or self
@@ -1282,6 +1453,11 @@ class Resolver:
             source_origin_path,
             sequence_item_mode,
             sequence_key_context,
+            id(local_vars) if local_vars is not None else None,
+            id(function_scope) if function_scope is not None else None,
+            function_context_path,
+            id(function_origin_source) if function_origin_source is not None else None,
+            function_body_source_path,
         )
         cached = children.get(key)
         if cached is not None and cached[0] == cache_token:
@@ -1298,6 +1474,11 @@ class Resolver:
             sequence_item_mode=sequence_item_mode,
             sequence_key_context=sequence_key_context,
             path_kind=path_kind,
+            local_vars=local_vars,
+            function_scope=function_scope,
+            function_context_path=function_context_path,
+            function_origin_source=function_origin_source,
+            function_body_source_path=function_body_source_path,
         )
         children[key] = (cache_token, proxy)
         return proxy
@@ -2369,7 +2550,7 @@ class Resolver:
                 )
             bound[name] = value
 
-        marker = _FUNCTION_MODE_MARKERS[spec.mode]
+        marker = "=" if spec.mode == "structural" else _FUNCTION_MODE_MARKERS[spec.mode]
         metadata = {
             "keyname": spec.name,
             "effective_key": spec.source_key,
@@ -2407,6 +2588,24 @@ class Resolver:
                         f"Failed to evaluate default for function {spec.name!r} "
                         f"at {display_declaration}, call site {display_call}: {exc}"
                     ) from exc
+
+            if spec.mode == "structural":
+                # The returned proxy is rebound once more by the enclosing
+                # field/container.  Keeping this temporary binding separate
+                # gives each invocation an isolated parameter cache.
+                return self._wrap(
+                    spec.template,
+                    parent=call_scope,
+                    path=call_path,
+                    origin=source.resolver,
+                    source_path=declaration_path,
+                    path_kind=object.__getattribute__(call_scope, "_jinest_path_kind"),
+                    local_vars=bound,
+                    function_scope=call_scope,
+                    function_context_path=call_path,
+                    function_origin_source=source,
+                    function_body_source_path=declaration_path,
+                )
 
             try:
                 return self._render(
@@ -2500,6 +2699,15 @@ class Resolver:
             raise ValueError(f"Unsupported render mode: {mode!r}")
 
         scope_path = object.__getattribute__(scope, "_jinest_path")
+        context_scope = scope
+        if context_path is None:
+            context_path = self._function_context_path(scope)
+        if local_vars is None:
+            local_vars = object.__getattribute__(scope, "_jinest_local_vars")
+        function_origin_source = object.__getattribute__(
+            scope, "_jinest_function_origin_source"
+        )
+        context_origin_source = function_origin_source or origin_source
         if source_path is None:
             source_path = (
                 origin_source.source_path
@@ -2512,39 +2720,49 @@ class Resolver:
         if not isinstance(template, str):
             return str(template) if mode == "text" else self._prepare_native(template)
 
-        path_kind = object.__getattribute__(scope, "_jinest_path_kind")
+        path_kind = object.__getattribute__(context_scope, "_jinest_path_kind")
         path_root = (
             self._global_owner.root
             if path_kind == "global"
-            else origin_source.resolver._source_root
+            else context_origin_source.resolver._source_root
         )
-        path_owner = self if path_kind == "global" else origin_source.resolver
+        path_owner = self if path_kind == "global" else context_origin_source.resolver
         context_path_ref = PathRef(
             path_owner,
             path_root,
             path_kind,
             context_path,
         )
-        origin_context = origin_source.resolver._source_view(origin_source)
+        # `keypath` is the path to the field currently being evaluated.  It is
+        # deliberately derived from the same logical key and context path as
+        # the other key metadata, so it also works for hidden and overridden
+        # declarations.
+        keypath = (
+            None if keyname is None else context_path_ref[keyname]
+        )
+        origin_context = context_origin_source.resolver._source_view(
+            context_origin_source
+        )
         context = {
             _INTERNAL_SCOPE: scope,
-            "context": scope,
+            "context": context_scope,
             "origin": origin_context,
-            "root": origin_source.resolver._source_root,
+            "root": context_origin_source.resolver._source_root,
             "global_root": self._global_owner.root,
-            "_": object.__getattribute__(scope, "_jinest_parent"),
+            "_": object.__getattribute__(context_scope, "_jinest_parent"),
             "path": context_path_ref,
             "keyname": keyname,
             "effective_key": effective_key,
             "keymode": keymode,
+            "keypath": keypath,
         }
         if local_vars is not None:
             context[_INTERNAL_FUNCTION_LOCALS] = local_vars
             context.update(local_vars)
         environment = (
-            origin_source.resolver.script_environment
+            context_origin_source.resolver.script_environment
             if mode == "script"
-            else origin_source.resolver.environment
+            else context_origin_source.resolver.environment
         )
         display_path = _format_path_segments("root", source_path)
 

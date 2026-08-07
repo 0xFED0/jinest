@@ -1,0 +1,203 @@
+versions:
+- '3.10'
+- '3.11'
+- '3.12'
+- '3.13'
+- '3.14'
+servers:
+- version: '3.10'
+  binary: python3.10
+  exec:
+  - python3.10
+  - server.py
+  - --port
+  - 8080
+- version: '3.11'
+  binary: python3.11
+  exec:
+  - python3.11
+  - server.py
+  - --port
+  - 8081
+- version: '3.12'
+  binary: python3.12
+  exec:
+  - python3.12
+  - server.py
+  - --port
+  - 8082
+- version: '3.13'
+  binary: python3.13
+  exec:
+  - python3.13
+  - server.py
+  - --port
+  - 8083
+- version: '3.14'
+  binary: python3.14
+  exec:
+  - python3.14
+  - server.py
+  - --port
+  - 8084
+modules:
+  tojson:
+  - file1.yml
+  - -o
+  - file1.json
+  check:
+  - file1.yml
+  - file2.yml
+  - file3.yml
+  jinja:
+  - template1.txt
+  - template2.txt
+runs:
+  tojson:
+    python3.10:
+      binary: python3.10
+      module: tojson
+      exec:
+      - python3.10
+      - -m
+      - tojson
+      - file1.yml
+      - -o
+      - file1.json
+    python3.11:
+      binary: python3.11
+      module: tojson
+      exec:
+      - python3.11
+      - -m
+      - tojson
+      - file1.yml
+      - -o
+      - file1.json
+    python3.12:
+      binary: python3.12
+      module: tojson
+      exec:
+      - python3.12
+      - -m
+      - tojson
+      - file1.yml
+      - -o
+      - file1.json
+    python3.13:
+      binary: python3.13
+      module: tojson
+      exec:
+      - python3.13
+      - -m
+      - tojson
+      - file1.yml
+      - -o
+      - file1.json
+    python3.14:
+      binary: python3.14
+      module: tojson
+      exec:
+      - python3.14
+      - -m
+      - tojson
+      - file1.yml
+      - -o
+      - file1.json
+  check:
+    python3.10:
+      binary: python3.10
+      module: check
+      exec:
+      - python3.10
+      - -m
+      - check
+      - file1.yml
+      - file2.yml
+      - file3.yml
+    python3.11:
+      binary: python3.11
+      module: check
+      exec:
+      - python3.11
+      - -m
+      - check
+      - file1.yml
+      - file2.yml
+      - file3.yml
+    python3.12:
+      binary: python3.12
+      module: check
+      exec:
+      - python3.12
+      - -m
+      - check
+      - file1.yml
+      - file2.yml
+      - file3.yml
+    python3.13:
+      binary: python3.13
+      module: check
+      exec:
+      - python3.13
+      - -m
+      - check
+      - file1.yml
+      - file2.yml
+      - file3.yml
+    python3.14:
+      binary: python3.14
+      module: check
+      exec:
+      - python3.14
+      - -m
+      - check
+      - file1.yml
+      - file2.yml
+      - file3.yml
+  jinja:
+    python3.10:
+      binary: python3.10
+      module: jinja
+      exec:
+      - python3.10
+      - -m
+      - jinja
+      - template1.txt
+      - template2.txt
+    python3.11:
+      binary: python3.11
+      module: jinja
+      exec:
+      - python3.11
+      - -m
+      - jinja
+      - template1.txt
+      - template2.txt
+    python3.12:
+      binary: python3.12
+      module: jinja
+      exec:
+      - python3.12
+      - -m
+      - jinja
+      - template1.txt
+      - template2.txt
+    python3.13:
+      binary: python3.13
+      module: jinja
+      exec:
+      - python3.13
+      - -m
+      - jinja
+      - template1.txt
+      - template2.txt
+    python3.14:
+      binary: python3.14
+      module: jinja
+      exec:
+      - python3.14
+      - -m
+      - jinja
+      - template1.txt
+      - template2.txt

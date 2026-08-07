@@ -4,6 +4,8 @@ config:
 service:
   endpoint: http://localhost:8080
   own_path: global_root.service
+  nested:
+    path: global_root.service.nested
   config_path: global_root.config
   normalized: global_root.config.port
   absolute: global_root.config.port
@@ -17,13 +19,16 @@ service:
     keyname: key_context
     effective_key: key_context$
     keymode: $
-  text_key_context: text_key_context|text_key_context@|@
+    keypath: global_root.service.key_context
+  text_key_context: text_key_context|text_key_context@|@|global_root.service.text_key_context
   script_key_context:
     keyname: script_key_context
     effective_key: script_key_context^
     keymode: ^
+    keypath: global_root.service.script_key_context
   hidden_context_report:
     keyname: hidden_context
     effective_key: .hidden_context$
     keymode: $
+    keypath: global_root.service.hidden_context
 
