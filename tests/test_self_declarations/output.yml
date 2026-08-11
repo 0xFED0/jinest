@@ -1,0 +1,27 @@
+value: 2
+suffix: 3
+inline: 3
+wrapped: 3
+pipeline: 3
+nested: 3
+items:
+- 3
+- 2
+- 6
+- =$value
+function_name: make
+function_result: 7
+compose_name: expanded
+items_for_compose:
+- a
+- b
+expanded:
+- a
+- b
+array_values:
+- 1
+- 2
+array_slot:
+- - 1
+  - 2
+

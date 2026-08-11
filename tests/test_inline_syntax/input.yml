@@ -9,8 +9,8 @@ native: "=$value * 2"
 text: "=@value={{ value }}"
 script: =^% return value * 3
 escaped: "`=$value"
-# An explicit inline directive beats the `$` mode of this field.
-field$: "=@winner={{ keymode }}"
+# Inline and field modes compose: the inner @ yields a quoted string, then outer $ evaluates it.
+field$: "=@'winner={{ keymode }}'"
 
 # This key is evaluated once, then used literally -- its trailing `$` is not a mode.
 name: dynamic$
@@ -22,8 +22,8 @@ items:
   - "=^% return value * 4"
   - "`=@item={{ value }}"
 
-# Explicit inline elements override the legacy `$` array mode.
+# Inline elements form inner layers before the legacy `$` array mode.
 legacy$:
   - "value + 1"
-  - "=@text={{ value }}"
-  - "=^% return value * 5"
+  - "=@{{ value }}"
+  - '=^% return "value * 5"'

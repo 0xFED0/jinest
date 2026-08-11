@@ -1,0 +1,42 @@
+# The three one-layer `$` declarations all produce the same native value.
+value: 2
+suffix: 3
+inline: 3
+wrapped: 3
+
+# The nested layers evaluate the inner expression string first.
+pipeline: 3
+nested: 3
+
+# Inline array layers run before the outer legacy `$` mode.
+items:
+- 3
+- 2
+- 6
+- =$value
+
+# The dynamic function declaration is omitted; only its result remains.
+function_name: make
+function_result: 7
+
+# Self-compose emits one item per source value.
+compose_name: expanded
+items_for_compose:
+- a
+- b
+expanded:
+- a
+- b
+
+# The self-compose result is the value of array_slot[0].
+array_values:
+- 1
+- 2
+array_slot:
+- - 1
+  - 2
+
+# This mapping had two keys, so `<$` remained ordinary data.
+ordinary:
+  <$: not a wrapper
+  other: data

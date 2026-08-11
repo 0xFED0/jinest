@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.13.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.14.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -52,6 +52,7 @@ app:
 - [Installation](#installation)
 - [Syntax](#syntax)
 - [Raw and inline syntax](#raw-and-inline-syntax)
+- [Self-declaration wrappers](#self-declaration-wrappers)
 - [Hidden fields](#hidden-fields)
 - [Diagnostics: warnings and hints](#diagnostics-warnings-and-hints)
 - [Native expressions: `$`](#native-expressions-)
@@ -187,9 +188,32 @@ name: generated$
 ```
 
 Mode fields and legacy mode-typed arrays such as `value$` or `items$` remain
-supported. An explicit inline `=$`, `=@`, or `=^` value takes precedence over
-the field or inherited array mode and produces a compatibility warning. Its
-`keymode` is the winning inline marker, not the marker on the field key.
+supported. Inline directives are inner layers and the field/array suffix is an
+outer layer, so both are evaluated in order. The inner result must be a string
+when it is passed to an outer renderer; this makes `value$: '=$chain'` a genuine
+two-stage `$` pipeline. Escaped inline literals remain literal values.
+
+## Self-declaration wrappers
+
+A mapping containing exactly one special `<...` key can apply that declaration
+to its own value slot. The marker is never materialized:
+
+```yaml
+value:
+  <$: "base + 1"
+record:
+  <(x)=:
+    value$: x
+items:
+  <[item=values]=:
+    - =@{{ item }}
+```
+
+`<$` is equivalent to a `$` field layer and may be nested for pipelines.
+`<(args)=` and `<[axis=source]=` reuse structural-function and compose
+validation, argument locals, rebinding, and lazy caches. A wrapper is only
+recognized for an exactly-one-key mapping; ordinary mappings with additional
+keys remain ordinary data.
 
 ## Hidden fields
 
@@ -770,7 +794,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The test suite contains 88 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
+The test suite contains 94 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
 
 ## Security
 

@@ -1,0 +1,31 @@
+# Self wrappers apply a declaration to the current slot; their marker is hidden.
+value: 2
+suffix$: value + 1
+inline: =$value + 1
+wrapped:
+  <$: value + 1
+pipeline$:
+  <$: "\"value + 1\""
+nested:
+  <$:
+    <$: "\"value + 1\""
+items$:
+  - =$"value + 1"
+  - =@{{ value }}
+  - =^% return "value * 3"
+  - '`=$value'
+function_name: make
+=$function_name:
+  <(x)=:
+    value$: x
+function_result$: make(7).value
+compose_name: expanded
+items_for_compose: [a, b]
+=$compose_name:
+  <[item=items_for_compose]=:
+    - =@{{ item }}
+# A self compose can also occupy an array element; it binds to that index.
+array_values: [1, 2]
+array_slot:
+  - <[item=array_values]=:
+      - =$item

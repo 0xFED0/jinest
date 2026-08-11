@@ -1,0 +1,57 @@
+# Run from the repository root:
+#   python jinest.py examples/14_self_declarations/example.yml --output-format yaml
+#
+# A self wrapper applies its declaration to the current value slot. The
+# special wrapper key is never emitted.
+
+value: 2
+
+# These three declarations are equivalent one-layer native evaluations.
+suffix$: value + 1
+inline: =$value + 1
+wrapped:
+  <$: value + 1
+
+# Layers compose inside-out: the inner layer returns the expression string,
+# then the outer `$` layer evaluates that string.
+pipeline$:
+  <$: "\"value + 1\""
+nested:
+  <$:
+    <$: "\"value + 1\""
+
+# Legacy lazy-array `$` mode remains available. Inline directives are inner
+# layers, so each item is evaluated by its inline mode and then by `$`.
+items$:
+  - '=$"value + 1"'
+  - '=@{{ value }}'
+  - |
+    =^% return "value * 3"
+  - '`=$value'                 # escaped inline syntax stays literal
+
+# A dynamic key can host a self structural-function declaration. The function
+# itself is omitted from the final output, while its returned node is normal.
+function_name: make
+=$function_name:
+  <(x)=:
+    value$: x
+function_result$: make(7).value
+
+# Self compose uses the normal Cartesian-product and rebinding machinery.
+compose_name: expanded
+items_for_compose: [a, b]
+=$compose_name:
+  <[item=items_for_compose]=:
+    - '=@{{ item }}'
+
+# A self compose in a sequence attaches to that specific array slot.
+array_values: [1, 2]
+array_slot:
+  - <[item=array_values]=:
+      - '=$item'
+
+# A wrapper is recognized only for an exactly-one-key mapping. This remains
+# ordinary data because the mapping has another key.
+ordinary:
+  <$: not a wrapper
+  other: data

@@ -21,6 +21,8 @@ Syntax
 * ``=$expr``, ``=@text``, and ``=^script`` — inline scalar directives for
   native expressions, text templates, and scripts; they also form dynamic
   mapping keys when used as keys.
+* ``<$``, ``<(args)=``, and ``<[axis=source]=`` — self-declaration wrappers
+  that apply one declaration to the current value slot.
 * Local priority is ``name`` > ``name^`` > ``name$`` > ``name@``.
 * ``<<$`` / ``<<N$`` and ``<<^`` / ``<<N^`` add lazy default layers.
 * ``<<!$`` / ``<<N!$`` and ``<<!^`` / ``<<N!^`` add lazy override layers.
@@ -85,7 +87,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -284,6 +286,15 @@ class _ComposeSpec:
     axes: tuple[_ComposeAxis, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _SelfSpec:
+    """One parsed declaration wrapper applied to its containing value slot."""
+
+    source_key: str
+    mode: str  # native, structural, compose_structural
+    payload: Any  # expression body, _FunctionSpec, or _ComposeSpec
+
+
 @dataclass(slots=True)
 class _MapSchema:
     raw: Mapping[Any, Any]
@@ -341,10 +352,27 @@ def _escaped_inline_literal(value: Any) -> str | None:
     return None
 
 
+def _self_syntax_key(key: Any) -> bool:
+    """Whether a key is reserved for current-slot wrapper syntax.
+
+    These keys stay literal unless their containing mapping is recognized as a
+    one-key self wrapper.  Do not reserve arbitrary ``<...`` keys: they retain
+    the ordinary Jinest key grammar.
+    """
+    if not isinstance(key, str) or _raw_key(key) is not None:
+        return False
+    return (
+        key in {"<$", "<@", "<^"}
+        or (key.startswith("<(") and key.endswith(")="))
+        or (key.startswith("<[") and key.endswith("]="))
+    )
+
+
 def _literal_syntax_key(key: Any) -> bool:
     """Whether a source key must bypass every Jinest key parser."""
     return (
-        _raw_key(key) is not None
+        _self_syntax_key(key)
+        or _raw_key(key) is not None
         or _inline_directive(key) is not None
         or _escaped_inline_literal(key) is not None
     )
@@ -514,6 +542,48 @@ def _parse_compose_declaration(
         if mode == "text" and not isinstance(template, str):
             raise JinestError(f"Text compose {key!r} must have a string body")
     return _ComposeSpec(name, key, template, mode, tuple(axes))
+
+
+def _parse_self_declaration(value: Any) -> _SelfSpec | None:
+    """Parse a one-key ``<...`` wrapper without materializing its marker."""
+    if not isinstance(value, Mapping) or len(value) != 1:
+        return None
+    key, body = next(iter(value.items()))
+    if not isinstance(key, str) or not key.startswith("<"):
+        return None
+    if key == "<$":
+        return _SelfSpec(key, "native", body)
+    if key.startswith("<(") and key.endswith(")="):
+        synthetic_key = "__jinest_self" + key[1:]
+        try:
+            function = _parse_function_declaration(synthetic_key, body)
+        except JinestError as exc:
+            raise JinestError(str(exc).replace(repr(synthetic_key), repr(key), 1)) from exc
+        assert function is not None
+        function = _FunctionSpec(
+            name="__jinest_self",
+            source_key=key,
+            template=function.template,
+            mode=function.mode,
+            parameters=function.parameters,
+        )
+        return _SelfSpec(key, "structural", function)
+    if key.startswith("<[") and key.endswith("]="):
+        synthetic_key = "__jinest_self" + key[1:]
+        try:
+            compose = _parse_compose_declaration(synthetic_key, body)
+        except JinestError as exc:
+            raise JinestError(str(exc).replace(repr(synthetic_key), repr(key), 1)) from exc
+        assert compose is not None
+        compose = _ComposeSpec(
+            name="__jinest_self",
+            source_key=key,
+            template=compose.template,
+            mode=compose.mode,
+            axes=compose.axes,
+        )
+        return _SelfSpec(key, "compose_structural", compose)
+    return None
 
 
 class JinestFunction:
@@ -1029,58 +1099,50 @@ class _SequenceProxy(_ContainerProxy, Sequence):
             item_path = object.__getattribute__(self, "_jinest_path") + (normalized,)
 
             key_context = object.__getattribute__(self, "_jinest_key_context")
-            explicit_directive = _inline_directive(item)
-            explicit, explicit_value = owner._resolve_inline_scalar(
+            keyname = None if key_context is None else key_context[0]
+            effective_key = None if key_context is None else key_context[1]
+            outer_keymode = None if key_context is None else key_context[2]
+            value, layered, escaped = owner._resolve_layer_input(
                 self,
                 item,
                 origin_source=source,
                 source_key=normalized,
                 context_path=item_path,
-                keyname=None if key_context is None else key_context[0],
-                effective_key=None if key_context is None else key_context[1],
+                keyname=keyname,
+                effective_key=effective_key,
             )
-            if explicit:
-                if mode is not None and explicit_directive is not None:
-                    owner._record_message(
-                        "warning",
-                        f"Inline directive at "
-                        f"{_format_path_segments('global_root', item_path)} takes "
-                        f"precedence over legacy {_FUNCTION_MODE_MARKERS[mode]} array mode",
-                        dedupe_key=("inline-array", id(raw), normalized),
-                        source=source,
-                        path=item_path,
+            if mode is not None and not escaped:
+                if layered:
+                    value = owner._apply_render_layer(
+                        self,
+                        value,
+                        mode=mode,
+                        origin_source=source,
+                        source_key=normalized,
+                        context_path=item_path,
+                        keyname=keyname,
+                        effective_key=effective_key,
+                        keymode=outer_keymode,
                     )
-                value = owner._bind_child(
-                    self,
-                    normalized,
-                    explicit_value,
-                    origin=source.resolver,
-                    source_path=source.source_path + (normalized,),
-                )
-            elif mode is not None and isinstance(item, str):
-                value = owner._render(
-                    self,
-                    item,
-                    mode=mode,
-                    origin_source=source,
-                    source_path=source.source_path + (normalized,),
-                    context_path=item_path,
-                    keyname=None if key_context is None else key_context[0],
-                    effective_key=None if key_context is None else key_context[1],
-                    keymode=None if key_context is None else key_context[2],
-                )
+                elif isinstance(item, str):
+                    value = owner._render(
+                        self,
+                        item,
+                        mode=mode,
+                        origin_source=source,
+                        source_path=source.source_path + (normalized,),
+                        context_path=item_path,
+                        keyname=keyname,
+                        effective_key=effective_key,
+                        keymode=outer_keymode,
+                    )
+            elif not layered and not escaped:
+                value = item
+            if owner._is_container(value):
                 value = owner._bind_child(
                     self,
                     normalized,
                     value,
-                    origin=source.resolver,
-                    source_path=source.source_path + (normalized,),
-                )
-            else:
-                value = owner._bind_child(
-                    self,
-                    normalized,
-                    item,
                     origin=source.resolver,
                     source_path=source.source_path + (normalized,),
                 )
@@ -1835,7 +1897,45 @@ class Resolver:
         indexes[cache_key] = result
         return result
 
-    def _resolve_inline_scalar(
+    def _apply_render_layer(
+        self,
+        scope: _ContainerProxy,
+        value: Any,
+        *,
+        mode: str,
+        origin_source: _Source,
+        source_key: Any,
+        context_path: tuple[Any, ...] | None,
+        keyname: Any | None,
+        effective_key: Any | None,
+        keymode: str | None,
+    ) -> Any:
+        """Apply an outer mode to a result produced by an inner layer."""
+        if not isinstance(value, str):
+            marker = _FUNCTION_MODE_MARKERS[mode]
+            path = context_path or object.__getattribute__(scope, "_jinest_path")
+            raise JinestTemplateError(
+                f"Nested {marker} layer for {source_key!r} requires a string body, "
+                f"got {type(value).__name__}",
+                path=_format_path_segments("global_root", path),
+                file=str(origin_source.resolver.source_path)
+                if origin_source.resolver.source_path
+                else None,
+            )
+        return self._render(
+            scope,
+            value,
+            mode=mode,
+            origin_source=origin_source,
+            source_key=source_key,
+            source_path=origin_source.source_path + (source_key,),
+            context_path=context_path,
+            keyname=keyname,
+            effective_key=effective_key,
+            keymode=keymode,
+        )
+
+    def _resolve_layer_input(
         self,
         scope: _ContainerProxy,
         value: Any,
@@ -1845,26 +1945,102 @@ class Resolver:
         context_path: tuple[Any, ...] | None = None,
         keyname: Any | None = None,
         effective_key: Any | None = None,
-    ) -> tuple[bool, Any]:
-        """Resolve one explicit scalar directive or its leading-backtick escape."""
+    ) -> tuple[Any, bool, bool]:
+        """Resolve an inner inline/self layer.
+
+        The booleans indicate ``(was_layer, was_escaped_literal)``.  Keeping
+        this information lets a field/array suffix act as a true outer layer
+        while preserving escaped inline literals.
+        """
         escaped = _escaped_inline_literal(value)
         if escaped is not None:
-            return True, escaped
+            return escaped, False, True
+
+        self_spec = _parse_self_declaration(value)
+        if self_spec is not None:
+            if self_spec.mode == "native":
+                inner, _, _ = self._resolve_layer_input(
+                    scope,
+                    self_spec.payload,
+                    origin_source=origin_source,
+                    source_key=source_key,
+                    context_path=context_path,
+                    keyname=keyname,
+                    effective_key=effective_key,
+                )
+                result = self._apply_render_layer(
+                    scope,
+                    inner,
+                    mode="native",
+                    origin_source=origin_source,
+                    source_key=self_spec.source_key,
+                    context_path=context_path,
+                    keyname=keyname,
+                    effective_key=effective_key,
+                    keymode="$",
+                )
+                return result, True, False
+            if self_spec.mode == "structural":
+                function = self_spec.payload
+                assert isinstance(function, _FunctionSpec)
+                spec = _FunctionSpec(
+                    name=str(keyname),
+                    source_key=self_spec.source_key,
+                    template=function.template,
+                    mode="structural",
+                    parameters=function.parameters,
+                )
+                return self._function_value(origin_source, spec), True, False
+            if self_spec.mode == "compose_structural":
+                compose = self_spec.payload
+                assert isinstance(compose, _ComposeSpec)
+                spec = _ComposeSpec(
+                    name=str(keyname),
+                    source_key=self_spec.source_key,
+                    template=compose.template,
+                    mode="structural",
+                    axes=compose.axes,
+                )
+                evaluation_scope = scope
+                while isinstance(evaluation_scope, _SequenceProxy):
+                    evaluation_scope = object.__getattribute__(
+                        evaluation_scope, "_jinest_parent"
+                    )
+                if not isinstance(evaluation_scope, _MappingProxy):
+                    raise JinestError(
+                        f"Self structural compose {self_spec.source_key!r} "
+                        "requires a mapping evaluation scope"
+                    )
+                destination_key = (
+                    source_key if isinstance(scope, _SequenceProxy) else keyname
+                )
+                return self._resolve_compose(
+                    spec,
+                    origin_source,
+                    evaluation_scope,
+                    keyname,
+                    destination_parent=scope,
+                    destination_key=destination_key,
+                ), True, False
+            raise JinestError(f"Unsupported self declaration mode {self_spec.mode!r}")
+
         directive = _inline_directive(value)
         if directive is None:
-            return False, value
+            return value, False, False
         mode, template = directive
-        return True, self._render(
+        result = self._render(
             scope,
             template,
             mode=mode,
             origin_source=origin_source,
             source_key=source_key,
+            source_path=origin_source.source_path + (source_key,),
             context_path=context_path,
             keyname=keyname,
             effective_key=effective_key,
             keymode=_FUNCTION_MODE_MARKERS[mode],
         )
+        return result, True, False
 
     def _record_schema_messages(self, raw: Mapping[Any, Any]) -> None:
         """Report declarations that are present but cannot become effective."""
@@ -2239,6 +2415,9 @@ class Resolver:
         source: _Source,
         bind: _MappingProxy,
         logical_key: Any,
+        *,
+        destination_parent: _ContainerProxy | None = None,
+        destination_key: Any = _MISSING,
     ) -> Any:
         """Expand one compose declaration through ordinary lazy bindings."""
         declaration_path = source.source_path + (spec.source_key,)
@@ -2268,10 +2447,14 @@ class Resolver:
                 ) from exc
 
         inherited_locals = object.__getattribute__(bind, "_jinest_local_vars")
+        if destination_parent is None:
+            destination_parent = bind
+        if destination_key is _MISSING:
+            destination_key = logical_key
         destination_path = object.__getattribute__(
-            bind, "_jinest_path"
-        ) + (logical_key,)
-        path_kind = object.__getattribute__(bind, "_jinest_path_kind")
+            destination_parent, "_jinest_path"
+        ) + (destination_key,)
+        path_kind = object.__getattribute__(destination_parent, "_jinest_path_kind")
 
         if spec.mode == "text":
             parts: list[str] = []
@@ -2309,7 +2492,7 @@ class Resolver:
             frame.update({axis.name: value for axis, value in zip(spec.axes, values)})
             body = self._wrap(
                 spec.template,
-                parent=bind,
+                parent=destination_parent,
                 path=destination_path,
                 origin=source.resolver,
                 source_path=declaration_path,
@@ -2334,8 +2517,8 @@ class Resolver:
                 combined[key] = self._get_public_field(body, key)
 
         return self._bind_child(
-            bind,
-            logical_key,
+            destination_parent,
+            destination_key,
             combined,
             origin=source.resolver,
             source_path=declaration_path,
@@ -2352,58 +2535,53 @@ class Resolver:
             spec = _parse_compose_declaration(candidate.source_key, candidate.template)
             assert spec is not None
             return self._resolve_compose(spec, source, bind, logical_key)
-        candidate_source_path = source.source_path + (candidate.source_key,)
-        if candidate.mode == "concrete":
-            explicit, value = self._resolve_inline_scalar(
-                bind,
-                candidate.template,
-                origin_source=source,
-                source_key=candidate.source_key,
-                keyname=logical_key,
-                effective_key=candidate.source_key,
-            )
-            return self._bind_child(
-                bind,
-                logical_key,
-                value if explicit else candidate.template,
-                origin=source.resolver,
-                source_path=candidate_source_path,
-            )
 
-        explicit_directive = _inline_directive(candidate.template)
-        explicit, explicit_value = self._resolve_inline_scalar(
+        candidate_source_path = source.source_path + (candidate.source_key,)
+        value, layered, escaped = self._resolve_layer_input(
             bind,
             candidate.template,
             origin_source=source,
             source_key=candidate.source_key,
+            context_path=object.__getattribute__(bind, "_jinest_path") + (logical_key,),
             keyname=logical_key,
             effective_key=candidate.source_key,
         )
-        if explicit:
-            if explicit_directive is not None:
-                path = object.__getattribute__(bind, "_jinest_path") + (logical_key,)
-                self._record_message(
-                    "warning",
-                    f"Inline directive at "
-                    f"{_format_path_segments('global_root', path)} takes precedence "
-                    f"over {_FUNCTION_MODE_MARKERS[candidate.mode]} field mode",
-                    dedupe_key=(
-                        "inline-field",
-                        id(source.raw),
-                        candidate.source_key,
-                    ),
-                    source=source,
-                    path=source.source_path + (candidate.source_key,),
-                )
+
+        if candidate.mode == "concrete":
+            if layered or escaped:
+                if self._is_container(value):
+                    return self._bind_child(
+                        bind,
+                        logical_key,
+                        value,
+                        origin=source.resolver,
+                        source_path=candidate_source_path,
+                    )
+                return value
             return self._bind_child(
                 bind,
                 logical_key,
-                explicit_value,
+                candidate.template,
                 origin=source.resolver,
                 source_path=candidate_source_path,
             )
 
-        if isinstance(candidate.template, Sequence) and not isinstance(
+        mode_marker = {"native": "$", "text": "@", "script": "^"}[candidate.mode]
+        if layered:
+            value = self._apply_render_layer(
+                bind,
+                value,
+                mode=candidate.mode,
+                origin_source=source,
+                source_key=candidate.source_key,
+                context_path=object.__getattribute__(bind, "_jinest_path") + (logical_key,),
+                keyname=logical_key,
+                effective_key=candidate.source_key,
+                keymode=mode_marker,
+            )
+        elif escaped:
+            return value
+        elif isinstance(candidate.template, Sequence) and not isinstance(
             candidate.template, (str, bytes, bytearray)
         ):
             return self._bind_child(
@@ -2413,24 +2591,21 @@ class Resolver:
                 origin=source.resolver,
                 source_path=candidate_source_path,
                 sequence_item_mode=candidate.mode,
-                sequence_key_context=(
-                    logical_key,
-                    candidate.source_key,
-                    {"native": "$", "text": "@", "script": "^"}[candidate.mode],
-                ),
+                sequence_key_context=(logical_key, candidate.source_key, mode_marker),
+            )
+        else:
+            value = self._render(
+                bind,
+                candidate.template,
+                mode=candidate.mode,
+                origin_source=source,
+                source_key=candidate.source_key,
+                keyname=logical_key,
+                effective_key=candidate.source_key,
+                keymode=mode_marker,
             )
 
-        value = self._render(
-            bind,
-            candidate.template,
-            mode=candidate.mode,
-            origin_source=source,
-            source_key=candidate.source_key,
-            keyname=logical_key,
-            effective_key=candidate.source_key,
-            keymode={"native": "$", "text": "@", "script": "^"}[candidate.mode],
-        )
-        if candidate.mode in {"native", "script"}:
+        if candidate.mode in {"native", "script"} or self._is_container(value):
             return self._bind_child(
                 bind,
                 logical_key,
@@ -3344,6 +3519,13 @@ class Resolver:
                     # Raw and dynamic keys produce a literal final key; their
                     # result is never fed back into Jinest's key grammar.
                     logical = source_key
+                self_wrapper = _parse_self_declaration(
+                    source.raw[entry.source_key]
+                ) if isinstance(source.raw, Mapping) else None
+                if self_wrapper is not None and self_wrapper.mode == "structural":
+                    continue
+                if logical in seen:
+                    continue
                 if isinstance(logical, str) and logical.startswith("."):
                     continue
                 if logical not in seen:

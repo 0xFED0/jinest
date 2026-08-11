@@ -62,7 +62,7 @@ except ImportError:
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.13.0")
+        self.assertEqual(jinest.__version__, "0.14.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -770,12 +770,112 @@ class JinestInlineSyntaxTests(unittest.TestCase):
         with self.assertRaisesRegex(jinest.JinestError, "Duplicate dynamic mapping key"):
             jinest.resolve({"key": 1, "=$'key'": 2}, emit_messages=False)
 
-    def test_inline_directive_overrides_field_mode_and_keymode(self) -> None:
+    def test_self_dollar_and_inline_layers_are_equivalent(self) -> None:
+        result = jinest.resolve(
+            {
+                "x": 2,
+                "suffix$": "x + 1",
+                "inline": "=$x + 1",
+                "wrapped": {"<$": "x + 1"},
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {"x": 2, "suffix": 3, "inline": 3, "wrapped": 3},
+        )
+
+    def test_self_dollar_pipeline_and_type_validation(self) -> None:
+        result = jinest.resolve(
+            {
+                "x": 2,
+                "pipeline$": {"<$": '"x + 1"'},
+                "nested": {"<$": {"<$": '"x + 1"'}},
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(result, {"x": 2, "pipeline": 3, "nested": 3})
+        with self.assertRaisesRegex(jinest.JinestError, "requires a string body"):
+            jinest.resolve({"x": 2, "bad$": {"<$": "x + 1"}}, emit_messages=False)
+
+    def test_lazy_array_layers_compose_instead_of_override(self) -> None:
+        result = jinest.resolve(
+            {
+                "value": 2,
+                "items$": [
+                    '=$"value + 1"',
+                    "=@{{ value }}",
+                    '=^% return "value * 3"\n',
+                    "`=$value",
+                ],
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(result, {"value": 2, "items": [3, 2, 6, "=$value"]})
+
+    def test_self_structural_function_and_compose(self) -> None:
+        result = jinest.resolve(
+            {
+                "function_name": "make",
+                "=$function_name": {"<(x)=": {"value$": "x"}},
+                "function_result$": "make(7).value",
+                "items": [1, 2],
+                "compose_name": "expanded",
+                "=$compose_name": {"<[item=items]=": ["=$item"]},
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "function_name": "make",
+                "function_result": 7,
+                "items": [1, 2],
+                "compose_name": "expanded",
+                "expanded": [1, 2],
+            },
+        )
+
+    def test_self_compose_rebinds_an_array_slot(self) -> None:
+        result = jinest.resolve(
+            {
+                "values": [1, 2],
+                "items": [
+                    {
+                        "<[value=values]=": [
+                            {"value$": "value", "where$": "path"}
+                        ]
+                    }
+                ],
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "values": [1, 2],
+                "items": [
+                    [
+                        {"value": 1, "where": "global_root.items[0][0]"},
+                        {"value": 2, "where": "global_root.items[0][1]"},
+                    ]
+                ],
+            },
+        )
+
+    def test_self_wrapper_requires_exactly_one_mapping_key(self) -> None:
+        result = jinest.resolve(
+            {"x": 2, "value": {"<$": "x + 1", "other": 4}},
+            emit_messages=False,
+        )
+        self.assertEqual(result, {"x": 2, "value": {"<$": "x + 1", "other": 4}})
+
+    def test_inline_directive_composes_with_field_mode(self) -> None:
         resolver = jinest.Resolver(
             {
                 "value": 2,
-                "native$": "=@winner={{ keymode }}",
-                "text@": "=^% return {'winner': keymode, 'value': value}\n",
+                "native$": "=@'winner={{ keymode }}'",
+                "text@": '=^% return "winner={{ keymode }}"\n',
                 "equivalent_old$": "value + 1",
                 "equivalent_new": "=$value + 1",
             },
@@ -786,28 +886,21 @@ class JinestInlineSyntaxTests(unittest.TestCase):
             {
                 "value": 2,
                 "native": "winner=@",
-                "text": {"winner": "^", "value": 2},
+                "text": "winner=@",
                 "equivalent_old": 3,
                 "equivalent_new": 3,
             },
         )
-        self.assertEqual(
-            [message.msg for message in resolver.messages],
-            [
-                "Inline directive at global_root.native takes precedence over $ field mode",
-                "Inline directive at global_root.text takes precedence over @ field mode",
-            ],
-        )
+        self.assertEqual(resolver.messages, [])
 
-
-    def test_inline_directives_override_legacy_array_mode_with_warning(self) -> None:
+    def test_inline_directives_compose_with_legacy_array_mode(self) -> None:
         resolver = jinest.Resolver(
             {
                 "value": 2,
                 "items$": [
-                    "value + 1",
-                    "=@text={{ value }}",
-                    "=^% return value * 3\n",
+                    '=$"value + 1"',
+                    "=@{{ value }}",
+                    '=^% return "value * 3"\n',
                     "`=$value",
                 ],
             },
@@ -815,18 +908,9 @@ class JinestInlineSyntaxTests(unittest.TestCase):
         )
         self.assertEqual(
             resolver.resolve(),
-            {"value": 2, "items": [3, "text=2", 6, "=$value"]},
+            {"value": 2, "items": [3, 2, 6, "=$value"]},
         )
-        self.assertEqual(
-            [message.level for message in resolver.messages],
-            ["warning", "warning"],
-        )
-        self.assertTrue(
-            all(
-                "takes precedence over legacy $ array mode" in message.msg
-                for message in resolver.messages
-            )
-        )
+        self.assertEqual(resolver.messages, [])
 
 
 class JinestComposeTests(unittest.TestCase):
