@@ -1,0 +1,21 @@
+# Cartesian product: v is outermost, d is innermost.
+versions: [3.10, 3.11]
+dirs: [bin, lib]
+prefix: run
+
+items[v=versions, d=dirs]=:
+  - '=@{{ prefix }}-{{ v }}-{{ d }}'
+  - '=$v ~ ":" ~ d'
+
+by_version[v=versions]=:
+  =$"py" ~ v: '=$v'
+
+text[v=versions, d=dirs]@: '{{ v }}:{{ d }};'
+
+# Every list-body instance is rebound at its final list index.
+nodes[v=versions]=:
+  - value$: v
+    path$: path
+    nested:
+      value$: v
+      path$: path

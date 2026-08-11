@@ -1,0 +1,29 @@
+# The same matrix as 12_matrix_by_code, expressed with compose declarations.
+# Compose axes form a Cartesian product in declaration order.
+versions: ['3.10', '3.11', '3.12', '3.13', '3.14']
+modules:
+  tojson: ["file1.yml", "-o", "file1.json"]
+  check: ["file1.yml", "file2.yml", "file3.yml"]
+  jinja: ["template1.txt", "template2.txt"]
+
+# These are intermediate values only; hidden fields stay out of the final dump.
+.version_indexes$: range(versions | length) | list
+.module_names$: modules.keys() | list
+
+# One structural body instance is emitted for every version.
+servers[vi=version_indexes]=:
+  - version$: versions[vi]
+    binary@: 'python{{ version }}'
+    exec:
+      - '=$_.binary'
+      - server.py
+      - --port
+      - '=$8080+vi'
+
+# Modules are the outer axis and versions the inner axis, matching the
+# ordering of the original nested loops. The dynamic mapping key names runs.
+runs[m=module_names, v=versions]=:
+  =$m ~ "__python" ~ v:
+    binary$: "'python' ~ v"
+    module$: m
+    exec$: '[binary, "-m", module] + (global_root.modules[m] | list)'

@@ -1,0 +1,32 @@
+versions:
+- 3.1
+- 3.11
+dirs:
+- bin
+- lib
+prefix: run
+items:
+- run-3.1-bin
+- 3.1:bin
+- run-3.1-lib
+- 3.1:lib
+- run-3.11-bin
+- 3.11:bin
+- run-3.11-lib
+- 3.11:lib
+by_version:
+  py3.1: 3.1
+  py3.11: 3.11
+text: 3.1:bin;3.1:lib;3.11:bin;3.11:lib;
+nodes:
+- value: 3.1
+  path: global_root.nodes[0]
+  nested:
+    value: 3.1
+    path: global_root.nodes[0].nested
+- value: 3.11
+  path: global_root.nodes[1]
+  nested:
+    value: 3.11
+    path: global_root.nodes[1].nested
+

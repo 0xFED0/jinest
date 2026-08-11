@@ -62,7 +62,7 @@ except ImportError:
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.12.1")
+        self.assertEqual(jinest.__version__, "0.13.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -827,6 +827,91 @@ class JinestInlineSyntaxTests(unittest.TestCase):
                 for message in resolver.messages
             )
         )
+
+
+class JinestComposeTests(unittest.TestCase):
+    def test_structural_compose_axis_order_mapping_and_text(self) -> None:
+        result = jinest.resolve(
+            {
+                "versions": ["3.10", "3.11"],
+                "dirs": ["bin", "lib"],
+                "prefix": "run",
+                "items[v=versions, d=dirs]=": [
+                    "=@{{ prefix }}-{{ v }}-{{ d }}",
+                    "=$v ~ ':' ~ d",
+                ],
+                "by_version[v=versions]=": {"=$'py' ~ v": "=$v"},
+                "text[v=versions, d=dirs]@": "{{ v }}:{{ d }};",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "versions": ["3.10", "3.11"],
+                "dirs": ["bin", "lib"],
+                "prefix": "run",
+                "items": [
+                    "run-3.10-bin", "3.10:bin",
+                    "run-3.10-lib", "3.10:lib",
+                    "run-3.11-bin", "3.11:bin",
+                    "run-3.11-lib", "3.11:lib",
+                ],
+                "by_version": {"py3.10": "3.10", "py3.11": "3.11"},
+                "text": "3.10:bin;3.10:lib;3.11:bin;3.11:lib;",
+            },
+        )
+
+    def test_structural_compose_rebinds_each_body_and_keeps_axis_frame(self) -> None:
+        result = jinest.resolve(
+            {
+                "values": [10, 20],
+                "items[value=values]=": [
+                    {
+                        "value$": "value",
+                        "path$": "path",
+                        "nested": {"path$": "path", "value$": "value"},
+                    }
+                ],
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result["items"],
+            [
+                {
+                    "value": 10,
+                    "path": "global_root.items[0]",
+                    "nested": {
+                        "path": "global_root.items[0].nested",
+                        "value": 10,
+                    },
+                },
+                {
+                    "value": 20,
+                    "path": "global_root.items[1]",
+                    "nested": {
+                        "path": "global_root.items[1].nested",
+                        "value": 20,
+                    },
+                },
+            ],
+        )
+
+    def test_compose_errors(self) -> None:
+        with self.assertRaisesRegex(jinest.JinestError, "must resolve to an iterable"):
+            jinest.resolve({"bad[value=42]=": []}, emit_messages=False)
+        with self.assertRaisesRegex(jinest.JinestError, "Duplicate dynamic mapping key"):
+            jinest.resolve(
+                {"values": [1, 2], "bad[value=values]=": {"same": "=$value"}},
+                emit_messages=False,
+            )
+        with self.assertRaisesRegex(jinest.JinestError, "must have a mapping or array body"):
+            jinest.Resolver({"bad[value=[1]]=": "not structural"})
+        with self.assertRaisesRegex(jinest.JinestError, "must have a string body"):
+            jinest.Resolver({"bad[value=[1]]@": []})
+        with self.assertRaisesRegex(jinest.JinestError, "must use name=source syntax"):
+            jinest.Resolver({"bad[value]=": []})
 
 
 class JinestLayerTests(unittest.TestCase):

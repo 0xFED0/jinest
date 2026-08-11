@@ -55,7 +55,8 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from itertools import product
 from dataclasses import dataclass
 from datetime import date, time
 from pathlib import Path
@@ -84,7 +85,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.12.1"
+__version__ = "0.13.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -268,12 +269,28 @@ class _FunctionSpec:
     parameters: tuple[_FunctionParameter, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _ComposeAxis:
+    name: str
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposeSpec:
+    name: str
+    source_key: str
+    template: Any
+    mode: str  # structural, text
+    axes: tuple[_ComposeAxis, ...]
+
+
 @dataclass(slots=True)
 class _MapSchema:
     raw: Mapping[Any, Any]
     defaults: tuple[_LayerSpec, ...]
     overrides: tuple[_LayerSpec, ...]
     functions: tuple[_FunctionSpec, ...]
+    composes: tuple[_ComposeSpec, ...]
 
 
 _FUNCTION_MODES = {"$": "native", "@": "text", "^": "script"}
@@ -289,6 +306,7 @@ class _MappingKeyEntry:
     key: Any
     raw: bool = False
     dynamic: bool = False
+    compose: bool = False
 
 
 def _raw_key(key: Any) -> str | None:
@@ -430,6 +448,72 @@ def _parse_function_declaration(key: Any, template: Any = _MISSING) -> _Function
         mode=mode,
         parameters=tuple(parameters),
     )
+
+
+def _parse_compose_declaration(
+    key: Any,
+    template: Any = _MISSING,
+) -> _ComposeSpec | None:
+    """Parse ``name[axis=source, ...]=`` and ``...@`` declarations."""
+    if not isinstance(key, str) or _literal_syntax_key(key):
+        return None
+    marker = key[-1:] if key else ""
+    if marker not in {"=", "@"}:
+        return None
+    declaration = key[:-1]
+    match = re.fullmatch(r"([A-Za-z_]\w*)\[(.*)\]", declaration, flags=re.DOTALL)
+    if match is None:
+        if "[" in declaration or "]" in declaration:
+            raise JinestError(f"Malformed compose declaration {key!r}")
+        return None
+    name, axes_text = match.groups()
+    if not axes_text.strip():
+        raise JinestError(f"Compose declaration {key!r} requires at least one axis")
+    source = f"def __jinest_compose__({axes_text}):\n    pass\n"
+    try:
+        tree = ast.parse(source, mode="exec")
+    except SyntaxError as exc:
+        raise JinestError(
+            f"Malformed compose declaration {key!r}: {exc.msg}"
+        ) from exc
+    function_node = tree.body[0]
+    if not isinstance(function_node, ast.FunctionDef):
+        raise JinestError(f"Malformed compose declaration {key!r}")
+    arguments = function_node.args
+    if (
+        arguments.posonlyargs
+        or arguments.vararg is not None
+        or arguments.kwonlyargs
+        or arguments.kwarg is not None
+    ):
+        raise JinestError(
+            f"Unsupported axes in compose declaration {key!r}: "
+            "*args, **kwargs, positional-only, and keyword-only axes are unsupported"
+        )
+    if len(arguments.defaults) != len(arguments.args):
+        raise JinestError(
+            f"Every compose axis in {key!r} must use name=source syntax"
+        )
+    axes: list[_ComposeAxis] = []
+    for argument, default_node in zip(arguments.args, arguments.defaults):
+        axis_source = ast.get_source_segment(source, default_node)
+        if axis_source is None:
+            raise JinestError(
+                f"Could not read source for compose axis {argument.arg!r} in {key!r}"
+            )
+        axes.append(_ComposeAxis(argument.arg, axis_source))
+    mode = "structural" if marker == "=" else "text"
+    if template is not _MISSING:
+        if mode == "structural" and not (
+            isinstance(template, (Mapping, Sequence))
+            and not isinstance(template, (str, bytes, bytearray))
+        ):
+            raise JinestError(
+                f"Structural compose {key!r} must have a mapping or array body"
+            )
+        if mode == "text" and not isinstance(template, str):
+            raise JinestError(f"Text compose {key!r} must have a string body")
+    return _ComposeSpec(name, key, template, mode, tuple(axes))
 
 
 class JinestFunction:
@@ -1672,6 +1756,10 @@ class Resolver:
                 return True
             return (
                 self._merge_key(entry.source_key) is None
+                and _parse_compose_declaration(
+                    entry.source_key, source.raw[entry.source_key]
+                )
+                is None
                 and _parse_function_declaration(entry.source_key) is None
                 and self._template_key(entry.source_key) is None
             )
@@ -1699,6 +1787,12 @@ class Resolver:
             # Index all non-dynamic keys before rendering expressions. Their
             # availability preserves normal lazy sibling lookup semantics.
             for source_key in source.raw:
+                compose = _parse_compose_declaration(
+                    source_key, source.raw[source_key]
+                )
+                if compose is not None:
+                    add(_MappingKeyEntry(source_key, compose.name, compose=True))
+                    continue
                 if _inline_directive(source_key) is not None:
                     dynamic_source_keys.append(source_key)
                     continue
@@ -1783,7 +1877,10 @@ class Resolver:
                 or self._merge_key(key)
             ):
                 continue
-            if _parse_function_declaration(key) is not None:
+            if (
+                _parse_compose_declaration(key, raw[key]) is not None
+                or _parse_function_declaration(key) is not None
+            ):
                 continue
             mode = ""
             base = key
@@ -1832,8 +1929,20 @@ class Resolver:
         defaults: list[_LayerSpec] = []
         overrides: list[_LayerSpec] = []
         functions: list[_FunctionSpec] = []
+        composes: list[_ComposeSpec] = []
         function_names: set[str] = set()
+        compose_names: set[str] = set()
         for position, (key, template) in enumerate(raw.items()):
+            compose = _parse_compose_declaration(key, template)
+            if compose is not None:
+                if compose.name in compose_names:
+                    raise JinestError(
+                        f"Duplicate compose declaration {compose.name!r} "
+                        f"at {_format_path_segments('root', (compose.source_key,))}"
+                    )
+                compose_names.add(compose.name)
+                composes.append(compose)
+                continue
             function = _parse_function_declaration(key, template)
             if function is not None:
                 if function.name in function_names:
@@ -1865,6 +1974,7 @@ class Resolver:
         for key in raw:
             if (
                 _literal_syntax_key(key)
+                or _parse_compose_declaration(key, raw[key]) is not None
                 or _parse_function_declaration(key) is not None
             ):
                 continue
@@ -1876,6 +1986,14 @@ class Resolver:
                 logical = logical[1:]
             if isinstance(logical, str):
                 ordinary_names.setdefault(logical, key)
+        for compose in composes:
+            conflict = ordinary_names.get(compose.name)
+            if conflict is not None:
+                raise JinestError(
+                    f"Compose {compose.name!r} at {compose.source_key!r} "
+                    f"conflicts with field declaration {conflict!r}"
+                )
+            ordinary_names[compose.name] = compose.source_key
         for function in functions:
             conflict = ordinary_names.get(function.name)
             if conflict is not None:
@@ -1887,7 +2005,7 @@ class Resolver:
         defaults.sort(key=lambda item: (item.order, item.position))
         overrides.sort(key=lambda item: (item.order, item.position))
         schema = _MapSchema(
-            raw, tuple(defaults), tuple(overrides), tuple(functions)
+            raw, tuple(defaults), tuple(overrides), tuple(functions), tuple(composes)
         )
         self._schema_cache[raw_id] = schema
         self._record_schema_messages(raw)
@@ -1903,6 +2021,14 @@ class Resolver:
     ) -> _Candidate | None:
         """Return one local declaration from the hidden or public namespace."""
         source_key = f".{key}" if hidden and isinstance(key, str) else key
+        if not hidden and isinstance(source_key, str):
+            for compose in self._schema(source.raw).composes:
+                if compose.name == source_key:
+                    return _Candidate(
+                        compose.source_key,
+                        compose.template,
+                        f"compose_{compose.mode}",
+                    )
         entries = self._mapping_entries(source, bind)
         for concrete in entries:
             if concrete.key != source_key:
@@ -1914,6 +2040,9 @@ class Resolver:
             ):
                 if (
                     self._merge_key(concrete.source_key) is None
+                    and _parse_compose_declaration(
+                        concrete.source_key, source.raw[concrete.source_key]
+                    ) is None
                     and _parse_function_declaration(concrete.source_key) is None
                 ):
                     return _Candidate(
@@ -2104,6 +2233,114 @@ class Resolver:
         finally:
             active.remove(token)
 
+    def _resolve_compose(
+        self,
+        spec: _ComposeSpec,
+        source: _Source,
+        bind: _MappingProxy,
+        logical_key: Any,
+    ) -> Any:
+        """Expand one compose declaration through ordinary lazy bindings."""
+        declaration_path = source.source_path + (spec.source_key,)
+        axis_values: list[list[Any]] = []
+        for axis in spec.axes:
+            value = self._render(
+                bind,
+                axis.source,
+                mode="native",
+                origin_source=source,
+                source_path=declaration_path + (f"axis:{axis.name}",),
+                keyname=logical_key,
+                effective_key=spec.source_key,
+                keymode="=" if spec.mode == "structural" else "@",
+            )
+            if not isinstance(value, Iterable):
+                raise JinestError(
+                    f"Compose axis {axis.name!r} in {spec.source_key!r} "
+                    f"must resolve to an iterable, got {type(value).__name__}"
+                )
+            try:
+                axis_values.append(list(value))
+            except TypeError as exc:
+                raise JinestError(
+                    f"Compose axis {axis.name!r} in {spec.source_key!r} "
+                    "must resolve to an iterable"
+                ) from exc
+
+        inherited_locals = object.__getattribute__(bind, "_jinest_local_vars")
+        destination_path = object.__getattribute__(
+            bind, "_jinest_path"
+        ) + (logical_key,)
+        path_kind = object.__getattribute__(bind, "_jinest_path_kind")
+
+        if spec.mode == "text":
+            parts: list[str] = []
+            for values in product(*axis_values):
+                frame = dict(inherited_locals or {})
+                frame.update(
+                    {axis.name: value for axis, value in zip(spec.axes, values)}
+                )
+                parts.append(
+                    self._render(
+                        bind,
+                        spec.template,
+                        mode="text",
+                        origin_source=source,
+                        source_path=declaration_path,
+                        keyname=logical_key,
+                        effective_key=spec.source_key,
+                        keymode="@",
+                        local_vars=frame,
+                    )
+                )
+            return "".join(parts)
+
+        if isinstance(spec.template, Mapping):
+            combined: dict[Any, Any] = {}
+            seen: set[Any] = set()
+            structural_kind = "mapping"
+        else:
+            combined = []
+            seen = set()
+            structural_kind = "list"
+
+        for values in product(*axis_values):
+            frame = dict(inherited_locals or {})
+            frame.update({axis.name: value for axis, value in zip(spec.axes, values)})
+            body = self._wrap(
+                spec.template,
+                parent=bind,
+                path=destination_path,
+                origin=source.resolver,
+                source_path=declaration_path,
+                path_kind=path_kind,
+                local_vars=frame,
+                function_scope=bind,
+                function_origin_source=source,
+            )
+            if structural_kind == "list":
+                assert isinstance(body, _SequenceProxy)
+                combined.extend(body[index] for index in range(len(body)))
+                continue
+
+            assert isinstance(body, _MappingProxy)
+            for key in self._public_keys(body):
+                if key in seen:
+                    raise JinestError(
+                        f"Duplicate dynamic mapping key {key!r} from compose "
+                        f"{spec.source_key!r}"
+                    )
+                seen.add(key)
+                combined[key] = self._get_public_field(body, key)
+
+        return self._bind_child(
+            bind,
+            logical_key,
+            combined,
+            origin=source.resolver,
+            source_path=declaration_path,
+        )
+
     def _resolve_candidate(
         self,
         candidate: _Candidate,
@@ -2111,6 +2348,10 @@ class Resolver:
         bind: _MappingProxy,
         logical_key: Any,
     ) -> Any:
+        if candidate.mode.startswith("compose_"):
+            spec = _parse_compose_declaration(candidate.source_key, candidate.template)
+            assert spec is not None
+            return self._resolve_compose(spec, source, bind, logical_key)
         candidate_source_path = source.source_path + (candidate.source_key,)
         if candidate.mode == "concrete":
             explicit, value = self._resolve_inline_scalar(
@@ -3090,7 +3331,9 @@ class Resolver:
 
             for entry in self._mapping_entries(source, bind):
                 source_key = entry.key
-                if not entry.raw and not entry.dynamic:
+                if entry.compose:
+                    logical = entry.key
+                elif not entry.raw and not entry.dynamic:
                     if self._merge_key(source_key):
                         continue
                     if _parse_function_declaration(source_key) is not None:

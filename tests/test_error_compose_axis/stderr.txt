@@ -1,0 +1,1 @@
+jinest: Compose axis 'value' in 'bad[value=42]=' must resolve to an iterable, got int

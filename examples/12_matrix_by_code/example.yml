@@ -33,8 +33,8 @@ runs^: |
     % set execs = {}
     % for v in versions
       % set py = "python" ~ v
-      % do execs.update({ py: module(py, m, args) })
+      % set key = m ~ "__" ~ py
+      % do runs.update({ key: module(py, m, args) })
     % endfor
-    % do runs.update({ m: execs })
   % endfor
   % return runs

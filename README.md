@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.12.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.13.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -58,6 +58,7 @@ app:
 - [Text templates: `@`](#text-templates-)
 - [Multiline scripts: `^`](#multiline-scripts-)
 - [Template functions](#template-functions)
+- [Compose declarations](#compose-declarations)
 - [Lazy layers](#lazy-layers)
 - [Evaluation context](#evaluation-context)
 - [Node metadata](#node-metadata)
@@ -132,6 +133,8 @@ jinest config.yaml
 | `name@` | Full Jinja text template; result is a string |
 | `name$` | One Jinja expression; result preserves its native type |
 | `name^` | Multiline Jinja script; `return` produces a native value |
+| `name[axis=source, ...]=` | Cartesian structural compose: flatten list bodies or merge mapping bodies |
+| `name[axis=source, ...]@` | Cartesian text compose: concatenate one rendered string per combination |
 | `=$expr`, `=@text`, `=^script` | Inline native expression, text template, or script in a scalar value or a dynamic mapping key |
 | `key\`` | Raw key: remove the final backtick and disable all Jinest key parsing |
 | `.name`, `.name$`, `.name@`, `.name^` | Hidden field; use it in Jinja as `name`, but omit it from final output |
@@ -343,6 +346,32 @@ defaults. Their bodies must be mappings or arrays; scalar bodies and
 unsuffixed structural-looking declarations such as `name(args): {}` are
 errors. `$`, `@`, `^`, and `=` are the supported function declaration modes;
 `*args`/`**kwargs` are not supported.
+
+## Compose declarations
+
+Compose declarations expand one structural or text body across a Cartesian
+product. Every `axis=source` is a native Jinest expression that must resolve to
+an iterable. Axes follow declaration order: the first is outermost and the
+last is innermost. Axis names are local variables in each body instance.
+Compose declarations are not helpers and only their final `name` is emitted.
+
+```yaml
+versions: ["3.10", "3.11"]
+dirs: [bin, lib]
+prefix: run
+
+items[v=versions, d=dirs]=:
+  - '=@{{ prefix }}/{{ d }}/py{{ v }}'
+  - '=$prefix ~ ":" ~ d ~ ":" ~ v'
+
+summary[v=versions]@: "py{{ v }};"
+```
+
+The list body emits two flattened items per combination; `items` is ordered as
+`3.10/bin`, `3.10/lib`, `3.11/bin`, `3.11/lib`. A mapping body contributes its
+keys for each combination, supports dynamic keys, and rejects duplicate final
+keys. Every generated container is rebound at its final destination, so paths,
+contexts, and caches remain independent.
 
 ## Lazy layers
 
@@ -732,7 +761,8 @@ JINEST_MODULE=/path/to/jinest.py python jinest.test.py
 
 The [`examples/`](examples/) directory contains runnable, commented examples
 covering field modes, scripts, arrays, layers, prototypes, paths, imports,
-cycles, Python API extensions, extended scalar values, and scalar roots.
+cycles, functions, composition, Python API extensions, extended scalar values,
+and scalar roots.
 
 Validate every documented result with:
 
@@ -740,7 +770,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The test suite contains 85 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
+The test suite contains 88 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
 
 ## Security
 

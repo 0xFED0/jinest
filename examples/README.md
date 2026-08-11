@@ -42,6 +42,9 @@ commented result files, and checks the exact JSON byte escapes in example 09.
 | `08_python_api` | Custom globals/filters, lazy access, `in_place=True`, and `strict=False` |
 | `09_extended_values` | Native date/datetime/bytes plus ISO 8601 and pure `\uHHHH` JSON normalization |
 | `10_scalar_root` | Non-container scalar root documents |
+| `11_functions` | Native/text/script and structural functions, defaults, namespaces, and call-site rebinding |
+| `12_matrix_by_code` | Building a version/module matrix with script loops and structural functions |
+| `13_matrix_by_composition` | The same version/module matrix with Cartesian structural and text compose declarations |
 
 Comments are intentionally retained in checked-in `result.yml` files. A fresh
 CLI output is therefore value-equivalent rather than byte-for-byte identical.

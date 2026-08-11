@@ -34,6 +34,7 @@ def main() -> int:
     failed = False
     with tempfile.TemporaryDirectory(prefix="jinest-examples-") as temp_dir:
         temporary = Path(temp_dir)
+        actual_results: dict[str, Any] = {}
 
         for example in sorted(EXAMPLES.glob("*/example.yml")):
             name = example.parent.name
@@ -64,12 +65,28 @@ def main() -> int:
 
             expected = load_yaml(example.parent / "result.yml")
             actual = load_yaml(output)
+            actual_results[name] = actual
             if actual != expected:
                 failed = True
                 print(f"FAIL {name}: YAML result differs")
                 print(yaml.safe_dump(actual, allow_unicode=True, sort_keys=False))
             else:
                 print(f"OK   {name}")
+
+        # The code-loop and compose versions intentionally implement the same
+        # matrix. Keep this invariant checked independently of their fixtures.
+        code_matrix = actual_results.get("12_matrix_by_code")
+        compose_matrix = actual_results.get("13_matrix_by_composition")
+        if code_matrix is not None and compose_matrix is not None:
+            if code_matrix != compose_matrix:
+                failed = True
+                print("FAIL matrix equivalence: 12_matrix_by_code != 13_matrix_by_composition")
+                print("matrix_by_code:")
+                print(yaml.safe_dump(code_matrix, allow_unicode=True, sort_keys=False))
+                print("matrix_by_composition:")
+                print(yaml.safe_dump(compose_matrix, allow_unicode=True, sort_keys=False))
+            else:
+                print("OK   matrix equivalence: 12_matrix_by_code == 13_matrix_by_composition")
 
         # Byte escapes are a textual JSON contract, so compare them exactly.
         extended = EXAMPLES / "09_extended_values"
