@@ -62,7 +62,7 @@ except ImportError:
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.12.0")
+        self.assertEqual(jinest.__version__, "0.12.1")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -391,10 +391,10 @@ class JinestFunctionTests(unittest.TestCase):
                         "x": 2,
                         "nested": {
                             "product": 20,
-                            "context_path": "global_root.left.nested",
+                            "context_path": "global_root.left.result.nested",
                         },
                         "label": "left-2",
-                        "where": "global_root.left",
+                        "where": "global_root.left.result",
                         "origin_value": "declaration-value",
                         "root_value": "declaration-value",
                         "generated": 20,
@@ -406,16 +406,59 @@ class JinestFunctionTests(unittest.TestCase):
                         "x": 3,
                         "nested": {
                             "product": 12,
-                            "context_path": "global_root.right.nested",
+                            "context_path": "global_root.right.result.nested",
                         },
                         "label": "right-3",
-                        "where": "global_root.right",
+                        "where": "global_root.right.result",
                         "origin_value": "declaration-value",
                         "root_value": "declaration-value",
                         "answer": 12,
                     },
                 },
                 "array": [7, "10"],
+            },
+        )
+
+    def test_structural_function_result_rebinds_each_attachment(self) -> None:
+        result = jinest.resolve(
+            {
+                "make(value)=": {
+                    "value$": "value",
+                    "path$": "path",
+                    "where$": "path",
+                    "nested": {"path$": "path"},
+                },
+                "result^": "\n".join(
+                    [
+                        "% set x = global_root.make(10)",
+                        # Warm the temporary call-site node before attaching it.
+                        "% set warmed = x.value",
+                        "% set warmed_nested = x.nested.path",
+                        "% set tmp = x.where",
+                        '% return {"x": x, "y": x, "tmp": tmp}',
+                    ]
+                ),
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "result": {
+                    "x": {
+                        "value": 10,
+                        "path": "global_root.result.x",
+                        "where": "global_root.result.x",
+                        "nested": {"path": "global_root.result.x.nested"},
+                    },
+                    "y": {
+                        "value": 10,
+                        "path": "global_root.result.y",
+                        "where": "global_root.result.y",
+                        "nested": {"path": "global_root.result.y.nested"},
+                    },
+                    "tmp": "global_root.result",
+                }
             },
         )
 

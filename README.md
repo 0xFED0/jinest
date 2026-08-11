@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.12.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.12.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -317,14 +317,16 @@ result$: scale(5)
 
 Function declarations are lazy runtime helpers and are omitted from the final
 mapping. A namespace containing only functions remains as an empty mapping.
-Function bodies use the normal call-site `context`, `path`, and `global_root`,
-while `origin` and `root` refer to the declaration source. Functions are safe
+Function bodies use the destination binding's normal `context`, `path`, and
+`global_root`, while `origin` and `root` refer to the declaration source.
+Functions are safe
 Jinja callables; arbitrary Python attributes and APIs remain unavailable.
 
 Structural functions use a final `=` and have a mapping or array body. Each
 call creates a fresh lazy binding of that body, so its caches and parameters
-are isolated from other calls. The body uses call-site `context` and `path`,
-while `origin` and `root` still point to the declaration.
+are isolated from other calls. The body is rebound at its destination, so
+`context` and `path` follow that binding while `origin` and `root` still point
+to the declaration.
 
 ```yaml
 record(x, key, value)=:
@@ -738,7 +740,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The test suite contains 81 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
+The test suite contains 85 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
 
 ## Security
 

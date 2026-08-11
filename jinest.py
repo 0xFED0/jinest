@@ -84,7 +84,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -1510,10 +1510,30 @@ class Resolver:
             source = object.__getattribute__(value, "_jinest_source")
             raw = source.raw
             source_origin = source.resolver
-            if local_vars is None:
-                local_vars = object.__getattribute__(value, "_jinest_local_vars")
-            if function_scope is None:
-                function_scope = object.__getattribute__(value, "_jinest_function_scope")
+            value_local_vars = object.__getattribute__(value, "_jinest_local_vars")
+            value_body_source_path = object.__getattribute__(
+                value, "_jinest_function_body_source_path"
+            )
+            if value_body_source_path is not None:
+                # A structural function result carries its parameter frame,
+                # but its temporary call-site scope must never leak into the
+                # destination binding. Merge outer locals only when rebinding
+                # from inside another function.
+                if value_local_vars is not None:
+                    if local_vars is None:
+                        local_vars = value_local_vars
+                    elif local_vars is not value_local_vars:
+                        merged_locals = dict(local_vars)
+                        merged_locals.update(value_local_vars)
+                        local_vars = merged_locals
+                function_scope = None
+                function_context_path = None
+                function_body_source_path = value_body_source_path
+            else:
+                if local_vars is None:
+                    local_vars = value_local_vars
+                if function_scope is None:
+                    function_scope = object.__getattribute__(value, "_jinest_function_scope")
             if function_context_path is None:
                 function_context_path = object.__getattribute__(
                     value, "_jinest_function_context_path"
@@ -1568,6 +1588,11 @@ class Resolver:
             function_origin_source=function_origin_source,
             function_body_source_path=function_body_source_path,
         )
+        if function_body_source_path is not None and isinstance(proxy, _ContainerProxy):
+            # Nested body fields resolve through the fresh destination
+            # parent, never through the temporary proxy created at the call
+            # site. The parameter frame remains on the structural node.
+            object.__setattr__(proxy, "_jinest_function_scope", parent)
         children[key] = (cache_token, proxy)
         return proxy
 
@@ -2607,6 +2632,11 @@ class Resolver:
             )
 
         call_path = object.__getattribute__(call_scope, "_jinest_path")
+        binding_path = call_path
+        keypath = self._frame_get(jinja_context, "keypath")
+        if isinstance(keypath, PathRef):
+            absolute_keypath = keypath._jinest_absolute()
+            binding_path = object.__getattribute__(absolute_keypath, "_jinest_segments")
         declaration_path = source.source_path + (spec.source_key,)
         display_declaration = _format_path_segments("root", declaration_path)
         display_call = _format_path_segments("global_root", call_path)
@@ -2688,13 +2718,13 @@ class Resolver:
                 return self._wrap(
                     spec.template,
                     parent=call_scope,
-                    path=call_path,
+                    path=binding_path,
                     origin=source.resolver,
                     source_path=declaration_path,
                     path_kind=object.__getattribute__(call_scope, "_jinest_path_kind"),
                     local_vars=bound,
                     function_scope=call_scope,
-                    function_context_path=call_path,
+                    function_context_path=None,
                     function_origin_source=source,
                     function_body_source_path=declaration_path,
                 )

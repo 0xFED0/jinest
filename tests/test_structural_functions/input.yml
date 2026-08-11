@@ -46,3 +46,17 @@ layered()=:
     <<^: "% return root.nested_script0"
     <<1^: "% return root.nested_script1"
 result: "=$layered()"
+
+duplicate(value)=:
+  value$: value
+  path$: path
+  where$: path
+  nested:
+    path$: path
+
+duplicate_result^: |
+  % set x = global_root.duplicate(10)
+  % set warmed = x.value
+  % set warmed_nested = x.nested.path
+  % set tmp = x.where
+  % return {"x": x, "y": x, "tmp": tmp}

@@ -23,9 +23,9 @@ make_result(value)^: |
   %   "type": "generated"
   % }
 
-# A structural function returns a fresh lazy mapping at every call site.
-# Its `context` and `path` are those of the call-site mapping, while `origin`
-# remains at this declaration. Parameters are available inside the body.
+# A structural function returns a fresh lazy mapping for every destination.
+# Its `context` and `path` are derived from that destination binding, while
+# `origin` remains at this declaration. Parameters are available in the body.
 service_config(name, port, key='label')=:
   name$: name
   address@: "{{ context.host }}:{{ port }}"
@@ -51,8 +51,8 @@ text_result@: "{{ quote(square(5)) }}"
 script_result$: clamp(15, 0, 10)
 structured_result$: make_result("hello")
 
-# The returned mapping is evaluated lazily at this call site. `context` within
-# it therefore sees `deployments`, and its dynamic label is materialized here.
+# The returned mapping is evaluated lazily at this destination. Its path is
+# `global_root.deployments.primary`, and its dynamic label is materialized here.
 deployments:
   host: api.example.test
   primary: "=$global_root.service_config('jinest', 8080)"

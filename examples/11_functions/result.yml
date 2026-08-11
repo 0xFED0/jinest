@@ -14,7 +14,7 @@ deployments:
   primary:
     name: jinest
     address: api.example.test:8080
-    path: global_root.deployments
+    path: global_root.deployments.primary
     label: JINEST
 scaled_result: 50
 namespace_result: <HELLO>
