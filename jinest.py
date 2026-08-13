@@ -122,60 +122,6 @@ _EMPTY_MAPPING: Mapping[Any, Any] = {}
 _NODE_META_NAMES = {"path", "source_path", "root", "file"}
 
 
-class _UnicodeHexBytes(str):
-    """A byte string whose JSON form must use one ``\\uHHHH`` per byte."""
-
-
-def _encode_json_string(value: str) -> str:
-    if isinstance(value, _UnicodeHexBytes):
-        return '"' + "".join(f"\\u{ord(char):04X}" for char in value) + '"'
-    return json.encoder.encode_basestring(value)
-
-
-class _JinestJSONEncoder(json.JSONEncoder):
-    """JSON encoder preserving the requested pure Unicode byte escapes."""
-
-    def encode(self, value: Any) -> str:
-        # JSONEncoder special-cases top-level strings before iterencode().
-        if isinstance(value, _UnicodeHexBytes):
-            return _encode_json_string(value)
-        return super().encode(value)
-
-    def iterencode(self, value: Any, _one_shot: bool = False) -> Iterator[str]:
-        markers = {} if self.check_circular else None
-
-        def floatstr(number: float) -> str:
-            if math.isfinite(number):
-                return float.__repr__(number)
-            if not self.allow_nan:
-                raise ValueError(
-                    f"Out of range float values are not JSON compliant: {number!r}"
-                )
-            if math.isnan(number):
-                return "NaN"
-            return "Infinity" if number > 0 else "-Infinity"
-
-        # Python 3.13 expects a prepared indent string here; older versions
-        # also accept it, so normalize before using this private helper.
-        indent = self.indent
-        if indent is not None and not isinstance(indent, str):
-            indent = " " * indent
-
-        encoder = json.encoder._make_iterencode(
-            markers,
-            self.default,
-            _encode_json_string,
-            indent,
-            floatstr,
-            self.key_separator,
-            self.item_separator,
-            self.sort_keys,
-            self.skipkeys,
-            _one_shot,
-        )
-        return encoder(value, 0)
-
-
 class JinestError(Exception):
     """Base error raised by Jinest."""
 
@@ -3942,7 +3888,6 @@ def _serialize(value: Any, format: str) -> str:
             ensure_ascii=False,
             allow_nan=False,
             indent=2,
-            cls=_JinestJSONEncoder,
         )
     if format in {"yaml", "yml"}:
         return _import_yaml_module().safe_dump(
@@ -4000,7 +3945,9 @@ def _normalize_yaml_value(value: Any, *, active: set[int]) -> Any:
 def _normalize_json_value(value: Any, *, active: set[int]) -> Any:
     """Convert extended scalar values to standards-compliant JSON."""
     if isinstance(value, (bytes, bytearray)):
-        return _UnicodeHexBytes("".join(chr(byte) for byte in value))
+        # Latin-1 maps every byte 0x00..0xFF to the matching Unicode code point.
+        # json.loads(...).encode("latin-1") therefore reconstructs the bytes.
+        return bytes(value).decode("latin-1")
     if isinstance(value, (date, time)):
         return value.isoformat()
     if value is None or isinstance(value, (str, bool, int)):

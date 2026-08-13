@@ -41,7 +41,7 @@ commented result files, and checks the exact JSON byte escapes in example 09.
 | `06_imports` | YAML/JSON imports, filter forms, nested relative imports, independent source roots, and `import_roots` |
 | `07_cycles` | Field, script, layer, null-layer, and cross-file import cycles |
 | `08_python_api` | Custom globals/filters, lazy access, diagnostics, `in_place=True`, and `strict=False` |
-| `09_extended_values` | Native date/datetime/bytes plus ISO 8601 and pure `\uHHHH` JSON normalization |
+| `09_extended_values` | Native date/datetime/bytes plus ISO 8601 and lossless Latin-1 JSON byte strings |
 | `10_scalar_root` | Non-container scalar root documents |
 | `11_functions` | Native/text/script and mapping/list structural functions, defaults, namespaces, and independent destination rebinding |
 | `12_matrix_by_code` | Building a version/module matrix with script loops and structural functions |

@@ -115,7 +115,7 @@ def main() -> int:
                 failed = True
                 print("FAIL 09_extended_values: JSON result differs")
             else:
-                print("OK   09_extended_values JSON escapes")
+                print("OK   09_extended_values JSON Latin-1 bytes")
 
     return 1 if failed else 0
 

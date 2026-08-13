@@ -875,10 +875,13 @@ rendered = resolve_file(
 )
 ```
 
-JSON serialization converts date/time values to ISO 8601 strings. Every byte
-uses one pure Unicode escape (`\uHHHH`). Mapping keys are normalized by the
-same rules; unsupported keys or collisions after conversion raise
-`JinestError`.
+JSON serialization converts date/time values to ISO 8601 strings. `bytes` and
+`bytearray` become lossless Latin-1 strings: byte `0xNN` maps to Unicode
+`U+00NN`. A receiver that knows a field is binary restores its exact value with
+`.encode("latin-1")` after JSON decoding. JSON does not retain the distinction
+between a binary field and an ordinary Latin-1 string, so that type belongs in
+the surrounding schema. Mapping keys follow the same conversion rules;
+unsupported keys or collisions after conversion raise `JinestError`.
 
 ### Resolver options
 

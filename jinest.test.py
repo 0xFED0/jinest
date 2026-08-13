@@ -1406,10 +1406,7 @@ class JinestFormatAndImportTests(unittest.TestCase):
             output_format="json",
         )
         self.assertIn('"date": "2026-08-02"', rendered)
-        self.assertIn(
-            '"payload": "\\u0000\\u00FF\\u0041"',
-            rendered,
-        )
+        self.assertIn('"payload": "\\u0000ÿA"', rendered)
         self.assertEqual(
             json.loads(rendered),
             {"date": "2026-08-02", "payload": "\x00ÿA"},
@@ -1420,7 +1417,23 @@ class JinestFormatAndImportTests(unittest.TestCase):
             format="yaml",
             output_format="json",
         )
-        self.assertEqual(root_bytes, '"\\u0000\\u00FF\\u0041"')
+        self.assertEqual(root_bytes, '"\\u0000ÿA"')
+
+    def test_json_bytes_use_lossless_latin1_strings(self) -> None:
+        payload = bytes(range(256))
+        rendered = jinest._serialize(
+            {
+                "bytes": payload,
+                "bytearray": bytearray(payload),
+                "mapping": {payload: "value"},
+            },
+            "json",
+        )
+        decoded = json.loads(rendered)
+        self.assertEqual(decoded["bytes"].encode("latin-1"), payload)
+        self.assertEqual(decoded["bytearray"].encode("latin-1"), payload)
+        [decoded_key] = decoded["mapping"]
+        self.assertEqual(decoded_key.encode("latin-1"), payload)
 
     def test_yaml_serializes_time_and_bytearray(self) -> None:
         rendered = jinest._serialize(
