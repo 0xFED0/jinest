@@ -1,6 +1,6 @@
 base: 4
 
-# Native expressions retained booleans, mappings, integers, and PathRef strings.
+# Native expressions may return structures; numeric/boolean bodies pass through.
 native_values:
   - 5
   - 8
@@ -9,22 +9,29 @@ native_values:
   - global_root.native_values[4]
   - 99
 
-# Text templates always became strings; the literal integer stayed literal.
+# Text templates always become strings.
 text_values:
   - base=4
   - root=4
   - item path=global_root.text_values[2]
-  - 99
+  - '99'
 
 script_values:
   - 14
   - doubled: 8
   - 99
 
-# These strings were returned by a single expression, so they were not re-rendered.
+# These plain strings were returned by one expression and contain no explicit
+# inline directive, so they remain data.
 computed_list:
   - base + 1
   - root.base
+
+# Generated structures are normal Jinest subtrees unless escaped.
+generated_tree:
+  literal$: not evaluated
+  computed: 10
+  escaped_inline: =$base
 
 first_large: 7
 summary:

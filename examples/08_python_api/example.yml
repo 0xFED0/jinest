@@ -2,7 +2,8 @@
 #   python examples/08_python_api/run.py
 #
 # This document needs the custom globals/filters installed by run.py. The runner
-# also demonstrates lazy access, in_place=True, and non-strict undefined values.
+# also demonstrates lazy access, in_place=True, non-strict undefined values,
+# collected diagnostics, debug locations, and warnings-as-errors.
 
 value: 5
 
@@ -19,3 +20,12 @@ missing_script^: |
 
 # Missing text values render as empty text in non-strict mode.
 missing_text@: "before{{ missing.deep.value }}after"
+
+# These declarations intentionally produce one warning and one hint. debug=True
+# adds their source path and filename to stderr; the runner also inspects the
+# same structured messages through Resolver.messages.
+selected: literal-wins
+selected$: missing.suppressed.expression
+
+.lookup_value: private-for-lookup
+lookup_value: public-for-output

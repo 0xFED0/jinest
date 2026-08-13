@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for Jinest 0.10.1.
+"""Regression tests for Jinest.
 
 Run:
     python jinest.test.py
@@ -18,7 +18,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, time
 from pathlib import Path
 from typing import Any
 
@@ -62,7 +62,7 @@ except ImportError:
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.14.0")
+        self.assertEqual(jinest.__version__, "0.14.1")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -84,9 +84,83 @@ class JinestCoreTests(unittest.TestCase):
         )
 
     def test_unsupported_scalars_follow_strict_mode(self) -> None:
-        with self.assertRaisesRegex(jinest.JinestError, "Unsupported scalar value"):
-            jinest.resolve(object())
-        self.assertIsNone(jinest.resolve(object(), strict=False))
+        class Uncopyable:
+            def __deepcopy__(self, memo: dict[int, Any]) -> Any:
+                raise RuntimeError("cannot copy")
+
+        for value in (object(), Uncopyable()):
+            with self.subTest(value=value, strict=True):
+                with self.assertRaisesRegex(
+                    jinest.JinestError,
+                    "Unsupported scalar value",
+                ):
+                    jinest.resolve(value)
+            with self.subTest(value=value, strict=False):
+                self.assertIsNone(jinest.resolve(value, strict=False))
+
+    def test_generated_mapping_invalid_keys_never_degrade_in_non_strict_mode(self) -> None:
+        class InvalidKey:
+            pass
+
+        invalid_key = InvalidKey()
+        with self.assertRaisesRegex(jinest.JinestError, "Unsupported mapping key"):
+            jinest.resolve(
+                {"value$": "make()"},
+                globals={"make": lambda: {invalid_key: 1}},
+                strict=False,
+                emit_messages=False,
+            )
+
+    def test_evaluator_body_types_are_strict(self) -> None:
+        self.assertEqual(
+            jinest.resolve(
+                {
+                    "integer$": 42,
+                    "boolean$": True,
+                    "float^": 3.5,
+                    "false^": False,
+                    "wrapped": {"<$": 7},
+                },
+                emit_messages=False,
+            ),
+            {
+                "integer": 42,
+                "boolean": True,
+                "float": 3.5,
+                "false": False,
+                "wrapped": 7,
+            },
+        )
+
+        invalid = [
+            {"value$": {"nested": 1}},
+            {"value^": {"nested": 1}},
+            {"value@": {"nested": 1}},
+            {"value@": 42},
+            {"value@": True},
+            {"values$": [{"nested": 1}]},
+            {"values^": [None]},
+            {"values@": [42]},
+        ]
+        for source in invalid:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    jinest.JinestTemplateError,
+                    "requires a string body",
+                ):
+                    jinest.resolve(source, emit_messages=False)
+
+        for declaration in (
+            {"bad()$": {}},
+            {"bad()^": []},
+            {"bad()@": 1},
+        ):
+            with self.subTest(declaration=declaration):
+                with self.assertRaisesRegex(
+                    jinest.JinestError,
+                    "requires a string body",
+                ):
+                    jinest.Resolver(declaration, emit_messages=False)
 
     def test_text_and_native_fields(self) -> None:
         result = jinest.resolve(
@@ -225,6 +299,19 @@ class JinestCoreTests(unittest.TestCase):
         )
         self.assertEqual(result["native_wins"], {"value": 42})
         self.assertEqual(result["concrete_wins"], {"value": "literal"})
+
+        # A malformed self declaration inside a suppressed mode alternative
+        # must not be parsed during diagnostic collection.
+        self.assertEqual(
+            jinest.resolve(
+                {
+                    "value": "literal",
+                    "value$": {"<(x x)=": {}},
+                },
+                emit_messages=False,
+            ),
+            {"value": "literal"},
+        )
 
     def test_unrelated_field_remains_lazy(self) -> None:
         resolver = jinest.Resolver(
@@ -532,6 +619,18 @@ class JinestFunctionTests(unittest.TestCase):
                 emit_messages=False,
             )
 
+    def test_structural_function_recursion_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            jinest.JinestFunctionError,
+            "Recursive structural function.*not supported",
+        ):
+            jinest.resolve(
+                {
+                    "node(n)=": {"child": "=$global_root.node(n - 1)"},
+                    "result": "=$global_root.node(1)",
+                },
+                emit_messages=False,
+            )
 
     def test_function_script_local_shadows_argument(self) -> None:
         result = jinest.resolve(
@@ -655,6 +754,25 @@ class JinestMessageTests(unittest.TestCase):
         self.assertIn("jinest: warning:", stream.getvalue())
         self.assertIn("  at root\n  in <memory>\n", stream.getvalue())
 
+    def test_cli_reports_unexpected_exceptions_without_a_traceback(self) -> None:
+        def fail(*args: Any, **kwargs: Any) -> str:
+            raise RuntimeError("unexpected failure")
+
+        original = jinest.resolve_file
+        original_argv = sys.argv
+        stream = io.StringIO()
+        try:
+            jinest.resolve_file = fail
+            sys.argv = ["jinest", "input.yml"]
+            with contextlib.redirect_stderr(stream):
+                with self.assertRaises(SystemExit) as caught:
+                    jinest._main()
+        finally:
+            jinest.resolve_file = original
+            sys.argv = original_argv
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(stream.getvalue(), "jinest: unexpected failure\n")
+
     def test_debug_adds_error_location(self) -> None:
         resolver = jinest.Resolver({"broken$": "missing.value"}, debug=True)
         stream = io.StringIO()
@@ -700,6 +818,17 @@ class JinestInlineSyntaxTests(unittest.TestCase):
             },
         )
         self.assertEqual(resolver.messages, [])
+
+    def test_raw_and_dynamic_dot_keys_remain_literal(self) -> None:
+        result = jinest.resolve(
+            {
+                "=$'.dynamic'": 1,
+                ".raw`": 2,
+                ".hidden": 3,
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(result, {".dynamic": 1, ".raw": 2})
 
     def test_inline_directives_in_mappings_and_arrays(self) -> None:
         result = jinest.resolve(
@@ -770,6 +899,32 @@ class JinestInlineSyntaxTests(unittest.TestCase):
         with self.assertRaisesRegex(jinest.JinestError, "Duplicate dynamic mapping key"):
             jinest.resolve({"key": 1, "=$'key'": 2}, emit_messages=False)
 
+    def test_declaration_logical_name_collisions_are_rejected(self) -> None:
+        cases = [
+            {"f": {"<(x)=": {"value$": "x"}}, "f$": "42"},
+            {"name": "f", "=$name": 1, "f(x)=": {"value$": "x"}},
+            {"name": "f", "=$name": 1, "f[x=[1]]=": []},
+            {"f": {"<[x=[1]]=": []}, "f$": "42"},
+            {"f": {"<(x)=": {"value$": "x"}}, ".f": 1},
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    jinest.JinestError,
+                    r"Duplicate (?:logical name|dynamic mapping key)",
+                ):
+                    jinest.resolve(source, emit_messages=False)
+
+        resolver = jinest.Resolver(
+            {"nested": cases[0]},
+            emit_messages=False,
+        )
+        for attempt in range(2):
+            with self.subTest(cache_retry=attempt):
+                with self.assertRaises(jinest.JinestError) as caught:
+                    resolver.resolve()
+                self.assertEqual(caught.exception.path, "root.nested")
+
     def test_self_dollar_and_inline_layers_are_equivalent(self) -> None:
         result = jinest.resolve(
             {
@@ -796,7 +951,10 @@ class JinestInlineSyntaxTests(unittest.TestCase):
         )
         self.assertEqual(result, {"x": 2, "pipeline": 3, "nested": 3})
         with self.assertRaisesRegex(jinest.JinestError, "requires a string body"):
-            jinest.resolve({"x": 2, "bad$": {"<$": "x + 1"}}, emit_messages=False)
+            jinest.resolve(
+                {"x": 2, "bad$": {"<$": "{'nested': x}"}},
+                emit_messages=False,
+            )
 
     def test_lazy_array_layers_compose_instead_of_override(self) -> None:
         result = jinest.resolve(
@@ -982,6 +1140,26 @@ class JinestComposeTests(unittest.TestCase):
             ],
         )
 
+    def test_compose_axes_follow_jinja_iteration_protocol(self) -> None:
+        result = jinest.resolve(
+            {
+                "from_iterator[value=iterator]=": ["=$value"],
+                "from_mapping[key=mapping]=": ["=$key"],
+            },
+            globals={
+                "iterator": iter(("first", "second")),
+                "mapping": {"left": 1, "right": 2},
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "from_iterator": ["first", "second"],
+                "from_mapping": ["left", "right"],
+            },
+        )
+
     def test_compose_errors(self) -> None:
         with self.assertRaisesRegex(jinest.JinestError, "must resolve to an iterable"):
             jinest.resolve({"bad[value=42]=": []}, emit_messages=False)
@@ -996,6 +1174,8 @@ class JinestComposeTests(unittest.TestCase):
             jinest.Resolver({"bad[value=[1]]@": []})
         with self.assertRaisesRegex(jinest.JinestError, "must use name=source syntax"):
             jinest.Resolver({"bad[value]=": []})
+        with self.assertRaisesRegex(jinest.JinestError, "Type annotations are unsupported"):
+            jinest.Resolver({"bad[value: int=[1]]=": []})
 
 
 class JinestLayerTests(unittest.TestCase):
@@ -1140,14 +1320,14 @@ class JinestArrayTests(unittest.TestCase):
                     "1",
                     "true",
                     5,
-                    None,
+                    "none",
                     "path",
                 ],
                 "text_array@": [
                     "{{ var1 }}",
                     "v={{ root.var2 }}",
-                    1,
-                    True,
+                    "{{ 1 }}",
+                    "{{ true }}",
                     "{{ path }}",
                 ],
             }
@@ -1158,7 +1338,7 @@ class JinestArrayTests(unittest.TestCase):
         )
         self.assertEqual(
             result["text_array"],
-            ["7", "v=9", 1, True, "global_root.text_array[4]"],
+            ["7", "v=9", "1", "True", "global_root.text_array[4]"],
         )
 
     def test_array_is_lazy_per_item(self) -> None:
@@ -1241,6 +1421,50 @@ class JinestFormatAndImportTests(unittest.TestCase):
             output_format="json",
         )
         self.assertEqual(root_bytes, '"\\u0000\\u00FF\\u0041"')
+
+    def test_yaml_serializes_time_and_bytearray(self) -> None:
+        rendered = jinest._serialize(
+            {"clock": time(12, 30, 45), "buffer": bytearray(b"\x00A")},
+            "yaml",
+        )
+        self.assertEqual(
+            yaml.safe_load(rendered),
+            {"clock": "12:30:45", "buffer": b"\x00A"},
+        )
+
+    def test_invalid_yaml_is_a_jinest_error(self) -> None:
+        with self.assertRaisesRegex(jinest.JinestError, "Invalid YAML input"):
+            jinest._parse_text("broken: [", "yaml")
+
+    def test_json_mapping_key_normalization_is_lossless(self) -> None:
+        rendered = jinest._serialize(
+            {date(2026, 8, 2): 1, b"A": 2},
+            "json",
+        )
+        self.assertEqual(
+            json.loads(rendered),
+            {"2026-08-02": 1, "A": 2},
+        )
+
+        collisions = [
+            {date(2026, 8, 2): 1, "2026-08-02": 2},
+            {b"A": 1, "A": 2},
+            {1: 1, "1": 2},
+            {None: 1, "null": 2},
+        ]
+        for value in collisions:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    jinest.JinestError,
+                    "Duplicate JSON object key after normalization",
+                ):
+                    jinest._serialize(value, "json")
+
+        with self.assertRaisesRegex(
+            jinest.JinestError,
+            "JSON object keys must normalize to a scalar",
+        ):
+            jinest._serialize({(1, 2): 3}, "json")
 
     def test_yaml_json_import_globals_aliases_and_filters(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1637,8 +1861,8 @@ class JinestScriptTests(unittest.TestCase):
                 "values^": [
                     "% return x + 1\n",
                     "% set y = x * 2\n% return y\n",
-                    3,
-                    None,
+                    "% return 3\n",
+                    "% return none\n",
                 ],
             }
         )

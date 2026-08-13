@@ -24,8 +24,8 @@ status^: |
   % endif
   % return {"state": "disabled", "endpoint": none}
 
-# Local alternatives use: literal > ^ > $ > @.
-# The deliberately broken lower-priority alternatives are never evaluated.
+# Local alternatives use: literal > ^ > $ > @. Every suppressed declaration
+# emits a warning, but the deliberately broken alternatives are never evaluated.
 priority: literal-wins
 priority^: "% return missing.script.value"
 priority$: missing.native.value
@@ -43,10 +43,19 @@ script_priority^: |
 .release_id@: "{{ project | lower }}-{{ internal_port }}"
 
 # If both forms exist, templates use .internal_port (8081), while the ordinary
-# internal_port is retained only for the final dump.
+# internal_port is retained only for the final dump. This ambiguity emits a
+# hint, separately from the suppression warnings above.
 internal_port: published-but-not-used-for-computation
 effective_port$: "internal_port + 1"
 release_endpoint@: "https://example.test/{{ release_id }}"
 
 # An ordinary YAML null remains a native None/null.
 optional: null
+
+# A trailing backtick disables all Jinest parsing for that key and is removed.
+# It can preserve a mode-looking suffix or make a leading dot visible.
+literal_mode_key$`: this is not an expression
+.visible_dot`: this is not a hidden field
+
+# Two final backticks encode one literal final backtick.
+literal_backtick``: preserved

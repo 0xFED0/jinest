@@ -1,3 +1,4 @@
 # A valid document does not have to be a mapping or list.
-# Jinest returns JSON-compatible scalar roots unchanged.
+# Jinest returns this JSON-valid scalar unchanged. Native YAML date/datetime
+# and bytes roots are accepted too; example 09 shows their output formats.
 42

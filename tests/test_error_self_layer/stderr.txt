@@ -1,1 +1,1 @@
-jinest: Nested $ layer for 'bad$' requires a string body, got int
+jinest: Nested $ layer for 'bad$' requires a string body or numeric/boolean scalar, got dict

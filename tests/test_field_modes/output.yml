@@ -1,5 +1,7 @@
 project: Jinest
 port: 8080
+numeric_passthrough: 42
+boolean_passthrough: true
 label: Jinest listens on 8080
 next_port: 8081
 settings:

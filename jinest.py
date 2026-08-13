@@ -42,8 +42,9 @@ Syntax
 * ``Resolver.messages`` collects ``warning`` and ``hint`` diagnostics; use
   ``emit_messages=False`` or ``treat_warnings_as_errors=True`` to control them.
 
-Requires: jinja2 >= 3.1
-Optional: PyYAML >= 6.0 for YAML support.
+Requires: Jinja2 >= 3.1.
+When this module is copied and used directly, PyYAML is optional and needed
+only for YAML input/output. The published wheel installs PyYAML by default.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from itertools import product
 from dataclasses import dataclass
 from datetime import date, time
@@ -87,7 +88,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.14.0"
+__version__ = "0.14.1"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -309,6 +310,21 @@ _FUNCTION_DECLARATION_MODES = {**_FUNCTION_MODES, "=": "structural"}
 _FUNCTION_MODE_MARKERS = {value: key for key, value in _FUNCTION_MODES.items()}
 
 
+def _valid_evaluator_body(value: Any, mode: str) -> bool:
+    """Whether a scalar can serve directly as one evaluator body."""
+    if isinstance(value, str):
+        return True
+    return mode in {"native", "script"} and isinstance(value, (bool, int, float))
+
+
+def _evaluator_body_requirement(mode: str) -> str:
+    return (
+        "a string body"
+        if mode == "text"
+        else "a string body or numeric/boolean scalar"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _MappingKeyEntry:
     """One source mapping key after raw/dynamic-key normalization."""
@@ -461,13 +477,19 @@ def _parse_function_declaration(key: Any, template: Any = _MISSING) -> _Function
         parameters.append(_FunctionParameter(argument.arg, default))
 
     mode = _FUNCTION_DECLARATION_MODES[marker]
-    if template is not _MISSING and mode == "structural" and not (
-        isinstance(template, (Mapping, Sequence))
-        and not isinstance(template, (str, bytes, bytearray))
-    ):
-        raise JinestError(
-            f"Structural function {key!r} must have a mapping or array body"
-        )
+    if template is not _MISSING:
+        if mode == "structural" and not (
+            isinstance(template, (Mapping, Sequence))
+            and not isinstance(template, (str, bytes, bytearray))
+        ):
+            raise JinestError(
+                f"Structural function {key!r} must have a mapping or array body"
+            )
+        if mode != "structural" and not _valid_evaluator_body(template, mode):
+            raise JinestError(
+                f"Function {key!r} requires {_evaluator_body_requirement(mode)}, "
+                f"got {type(template).__name__}"
+            )
 
     return _FunctionSpec(
         name=name,
@@ -517,6 +539,10 @@ def _parse_compose_declaration(
         raise JinestError(
             f"Unsupported axes in compose declaration {key!r}: "
             "*args, **kwargs, positional-only, and keyword-only axes are unsupported"
+        )
+    if any(argument.annotation is not None for argument in arguments.args):
+        raise JinestError(
+            f"Type annotations are unsupported in compose declaration {key!r}"
         )
     if len(arguments.defaults) != len(arguments.args):
         raise JinestError(
@@ -1124,7 +1150,7 @@ class _SequenceProxy(_ContainerProxy, Sequence):
                         effective_key=effective_key,
                         keymode=outer_keymode,
                     )
-                elif isinstance(item, str):
+                else:
                     value = owner._render(
                         self,
                         item,
@@ -1211,7 +1237,17 @@ class Resolver:
         self._user_globals = dict(globals or {})
         self._user_filters = dict(filters or {})
         self._original = data
-        self.data = data if in_place else copy.deepcopy(data)
+        if in_place:
+            self.data = data
+        else:
+            try:
+                self.data = copy.deepcopy(data)
+            except Exception:
+                # Resolution never mutates its source tree. Falling back to the
+                # original preserves strict=False semantics for unsupported
+                # objects whose custom deepcopy implementation fails; the
+                # scalar boundary below will still convert/reject them.
+                self.data = data
         self._schema_cache: dict[int, _MapSchema] = {}
         self._import_cache: dict[tuple[Path, str], Resolver] = {}
         self._source_view_cache: dict[
@@ -1766,7 +1802,23 @@ class Resolver:
             f"Unsupported scalar value of type {type(value).__name__}"
         )
 
-    # ------------------------------------------------------------------
+    def _clone_mapping_key(self, key: Any, *, active: set[int]) -> Any:
+        """Clone one generated mapping key without non-strict data loss."""
+        cloned = self._clone_unresolved(key, active=active)
+        # ``strict=False`` deliberately turns unsupported *values* into None,
+        # but doing that to keys can silently overwrite a different entry.
+        if cloned is None and key is not None:
+            raise JinestError(
+                f"Unsupported mapping key of type {type(key).__name__}"
+            )
+        try:
+            hash(cloned)
+        except TypeError as exc:
+            raise JinestError(
+                f"Unsupported mapping key of type {type(key).__name__}"
+            ) from exc
+        return cloned
+
     # Mapping schema and lookup
     # ------------------------------------------------------------------
 
@@ -1888,14 +1940,137 @@ class Resolver:
                         f"{type(key).__name__}, expected a string"
                     )
                 add(_MappingKeyEntry(source_key, key, dynamic=True))
-        except Exception:
+
+            # Do not publish a completed index until every runtime logical-name
+            # invariant has passed.
+            self._validate_mapping_entry_claims(source, entries)
+        except Exception as exc:
             indexes.pop(cache_key, None)
+            self._annotate_error(
+                exc,
+                path=_format_path_segments(
+                    "root",
+                    object.__getattribute__(bind, "_jinest_path"),
+                ),
+                file=(
+                    str(source.resolver.source_path)
+                    if source.resolver.source_path
+                    else None
+                ),
+            )
             raise
 
         entries.sort(key=lambda entry: source_positions[entry.source_key])
         result = tuple(entries)
         indexes[cache_key] = result
         return result
+
+    def _mapping_entry_claim(
+        self,
+        source: _Source,
+        entry: _MappingKeyEntry,
+    ) -> tuple[tuple[str, Any], bool, str] | None:
+        """Return ``(namespace/name, alternatives_allowed, kind)`` for an entry."""
+        source_key = entry.source_key
+        value = source.raw[source_key]
+
+        if entry.compose:
+            return ("public", entry.key), False, "compose"
+
+        if not entry.raw and not entry.dynamic:
+            if self._merge_key(source_key) is not None:
+                return None
+            function = _parse_function_declaration(source_key)
+            if function is not None:
+                return ("public", function.name), False, "function"
+            template_info = self._template_key(source_key)
+            logical = template_info[0] if template_info else entry.key
+            hidden = isinstance(logical, str) and logical.startswith(".")
+            if hidden:
+                logical = logical[1:]
+            namespace = "hidden" if hidden else "public"
+        else:
+            # Raw and dynamic results are final literal keys.  In particular,
+            # a leading dot must not move them into the hidden namespace.
+            logical = entry.key
+            namespace = "public"
+            template_info = None
+
+        concrete = entry.raw or entry.dynamic or template_info is None
+        self_spec = _parse_self_declaration(value) if concrete else None
+        if self_spec is not None:
+            if self_spec.mode == "structural":
+                return (namespace, logical), False, "self function"
+            if self_spec.mode == "compose_structural":
+                return (namespace, logical), False, "self compose"
+
+        alternatives_allowed = not entry.raw and not entry.dynamic
+        return (namespace, logical), alternatives_allowed, "field"
+
+    def _validate_mapping_entry_claims(
+        self,
+        source: _Source,
+        entries: Sequence[_MappingKeyEntry],
+    ) -> None:
+        """Reject runtime key collisions, including destination-bound keys."""
+        claimed: dict[
+            tuple[str, Any], tuple[_MappingKeyEntry, bool, str]
+        ] = {}
+        special_kinds = {"function", "compose", "self function", "self compose"}
+
+        def collision_error(
+            name: tuple[str, Any],
+            previous: tuple[_MappingKeyEntry, bool, str],
+            entry: _MappingKeyEntry,
+            kind: str,
+        ) -> JinestError:
+            namespace, logical = name
+            display = f".{logical}" if namespace == "hidden" else logical
+            previous_entry, _, previous_kind = previous
+            collision = (
+                "dynamic mapping key"
+                if entry.dynamic or previous_entry.dynamic
+                else "logical name"
+            )
+            return JinestError(
+                f"Duplicate {collision} {display!r} from "
+                f"{previous_entry.source_key!r} ({previous_kind}) and "
+                f"{entry.source_key!r} ({kind})"
+            )
+
+        for entry in entries:
+            claim = self._mapping_entry_claim(source, entry)
+            if claim is None:
+                continue
+            name, alternatives_allowed, kind = claim
+            namespace, logical = name
+
+            # A public helper/compose cannot coexist with a hidden field of the
+            # same logical name: hidden lookup would make the declaration
+            # unreachable. Hidden self declarations may intentionally shadow a
+            # public output field, following normal hidden-field semantics.
+            cross_name = (
+                ("hidden", logical) if namespace == "public" else ("public", logical)
+            )
+            cross = claimed.get(cross_name)
+            if (
+                cross is not None
+                and (
+                    (namespace == "public" and kind in special_kinds)
+                    or (namespace == "hidden" and cross[2] in special_kinds)
+                )
+            ):
+                raise collision_error(name, cross, entry, kind)
+
+            previous = claimed.get(name)
+            if previous is None:
+                claimed[name] = (entry, alternatives_allowed, kind)
+                continue
+            if alternatives_allowed and previous[1]:
+                # Ordinary name/name^/name$/name@ alternatives intentionally
+                # coexist and are handled by local declaration priority.
+                continue
+            raise collision_error(name, previous, entry, kind)
 
     def _apply_render_layer(
         self,
@@ -1911,11 +2086,12 @@ class Resolver:
         keymode: str | None,
     ) -> Any:
         """Apply an outer mode to a result produced by an inner layer."""
-        if not isinstance(value, str):
+        if not _valid_evaluator_body(value, mode):
             marker = _FUNCTION_MODE_MARKERS[mode]
             path = context_path or object.__getattribute__(scope, "_jinest_path")
             raise JinestTemplateError(
-                f"Nested {marker} layer for {source_key!r} requires a string body, "
+                f"Nested {marker} layer for {source_key!r} requires "
+                f"{_evaluator_body_requirement(mode)}, "
                 f"got {type(value).__name__}",
                 path=_format_path_segments("global_root", path),
                 file=str(origin_source.resolver.source_path)
@@ -2063,6 +2239,17 @@ class Resolver:
             if key.endswith(("^", "$", "@")):
                 mode = key[-1]
                 base = key[:-1]
+            if mode == "":
+                self_spec = _parse_self_declaration(raw[key])
+                if self_spec is not None and self_spec.mode in {
+                    "structural",
+                    "compose_structural",
+                }:
+                    # These are declarations, not ordinary concrete fields, so
+                    # field-mode priority does not apply to them. Suffixed
+                    # alternatives are deliberately not parsed here because a
+                    # higher-priority field may suppress them.
+                    continue
             hidden = base.startswith(".")
             logical = base[1:] if hidden else base
             if not isinstance(logical, str):
@@ -2432,18 +2619,14 @@ class Resolver:
                 keyname=logical_key,
                 effective_key=spec.source_key,
                 keymode="=" if spec.mode == "structural" else "@",
+                prepare_native=False,
             )
-            if not isinstance(value, Iterable):
-                raise JinestError(
-                    f"Compose axis {axis.name!r} in {spec.source_key!r} "
-                    f"must resolve to an iterable, got {type(value).__name__}"
-                )
             try:
                 axis_values.append(list(value))
             except TypeError as exc:
                 raise JinestError(
                     f"Compose axis {axis.name!r} in {spec.source_key!r} "
-                    "must resolve to an iterable"
+                    f"must resolve to an iterable, got {type(value).__name__}"
                 ) from exc
 
         inherited_locals = object.__getattribute__(bind, "_jinest_local_vars")
@@ -3057,6 +3240,15 @@ class Resolver:
         display_declaration = _format_path_segments("root", declaration_path)
         display_call = _format_path_segments("global_root", call_path)
         call_chain = " -> ".join(self._function_stack + [spec.name])
+        if spec.mode == "structural" and self._is_recursive_structural_call(
+            call_scope,
+            source,
+            declaration_path,
+        ):
+            raise JinestFunctionError(
+                f"Recursive structural function {spec.name!r} is not supported "
+                f"at {display_call}"
+            )
         if self._function_depth >= self.function_max_depth:
             raise JinestFunctionError(
                 f"Jinest function recursion limit exceeded ({self.function_max_depth}) "
@@ -3176,6 +3368,28 @@ class Resolver:
             self._function_depth -= 1
 
     @staticmethod
+    def _is_recursive_structural_call(
+        scope: _ContainerProxy,
+        source: _Source,
+        declaration_path: tuple[Any, ...],
+    ) -> bool:
+        """Whether a structural call targets an active structural ancestor."""
+        current: _ContainerProxy | None = scope
+        while isinstance(current, _ContainerProxy):
+            if (
+                object.__getattribute__(current, "_jinest_function_origin_source")
+                is source
+                and object.__getattribute__(
+                    current, "_jinest_function_body_source_path"
+                )
+                == declaration_path
+            ):
+                return True
+            current = object.__getattribute__(current, "_jinest_parent")
+        return False
+
+
+    @staticmethod
     def _normalize_multiline_returns(template: str) -> str:
         """Join line-statement ``return`` expressions spanning bracketed lines."""
         lines = template.splitlines(keepends=True)
@@ -3232,6 +3446,7 @@ class Resolver:
         effective_key: Any | None = None,
         keymode: str | None = None,
         local_vars: Mapping[str, Any] | None = None,
+        prepare_native: bool = True,
     ) -> Any:
         if mode not in {"text", "native", "script"}:
             raise ValueError(f"Unsupported render mode: {mode!r}")
@@ -3255,8 +3470,20 @@ class Resolver:
         if context_path is None:
             context_path = scope_path
 
+        display_path = _format_path_segments("root", source_path)
+        if not _valid_evaluator_body(template, mode):
+            marker = _FUNCTION_MODE_MARKERS[mode]
+            raise JinestTemplateError(
+                f"{marker} evaluator {display_path} requires "
+                f"{_evaluator_body_requirement(mode)}, "
+                f"got {type(template).__name__}",
+                path=display_path,
+                file=str(origin_source.resolver.source_path)
+                if origin_source.resolver.source_path
+                else None,
+            )
         if not isinstance(template, str):
-            return str(template) if mode == "text" else self._prepare_native(template)
+            return self._prepare_native(template)
 
         path_kind = object.__getattribute__(context_scope, "_jinest_path_kind")
         path_root = (
@@ -3302,8 +3529,6 @@ class Resolver:
             if mode == "script"
             else context_origin_source.resolver.environment
         )
-        display_path = _format_path_segments("root", source_path)
-
         try:
             if mode == "native":
                 if "{{" in template or "{%" in template or "{#" in template:
@@ -3316,7 +3541,13 @@ class Resolver:
                     undefined_to_none=False,
                 )
                 result = expression(**context)
-                return self._prepare_native(result)
+                if prepare_native:
+                    return self._prepare_native(result)
+                if isinstance(result, Undefined):
+                    if not self.strict:
+                        return None
+                    result._fail_with_undefined_error()
+                return result
 
             if mode == "script":
                 compiled = environment.from_string(
@@ -3387,11 +3618,15 @@ class Resolver:
                 raise JinestError("Cyclic mapping in native expression result")
             active.add(value_id)
             try:
-                return {
-                    self._clone_unresolved(k, active=active):
-                    self._clone_unresolved(v, active=active)
-                    for k, v in value.items()
-                }
+                result: dict[Any, Any] = {}
+                for key, item in value.items():
+                    cloned_key = self._clone_mapping_key(key, active=active)
+                    if cloned_key in result:
+                        raise JinestError(
+                            f"Duplicate mapping key after cloning: {cloned_key!r}"
+                        )
+                    result[cloned_key] = self._clone_unresolved(item, active=active)
+                return result
             finally:
                 active.remove(value_id)
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
@@ -3519,14 +3754,29 @@ class Resolver:
                     # Raw and dynamic keys produce a literal final key; their
                     # result is never fed back into Jinest's key grammar.
                     logical = source_key
-                self_wrapper = _parse_self_declaration(
-                    source.raw[entry.source_key]
-                ) if isinstance(source.raw, Mapping) else None
+                concrete = (
+                    entry.raw
+                    or entry.dynamic
+                    or (
+                        not entry.compose
+                        and self._template_key(entry.source_key) is None
+                    )
+                )
+                self_wrapper = (
+                    _parse_self_declaration(source.raw[entry.source_key])
+                    if concrete and isinstance(source.raw, Mapping)
+                    else None
+                )
                 if self_wrapper is not None and self_wrapper.mode == "structural":
                     continue
                 if logical in seen:
                     continue
-                if isinstance(logical, str) and logical.startswith("."):
+                if (
+                    not entry.raw
+                    and not entry.dynamic
+                    and isinstance(logical, str)
+                    and logical.startswith(".")
+                ):
                     continue
                 if logical not in seen:
                     seen.add(logical)
@@ -3676,7 +3926,12 @@ def _parse_text(text: str, format: str) -> Any:
     if format == "json":
         return json.loads(text)
     if format in {"yaml", "yml"}:
-        return _import_yaml_module().safe_load(text)
+        yaml = _import_yaml_module()
+        try:
+            return yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            detail = getattr(exc, "problem", None) or str(exc)
+            raise JinestError(f"Invalid YAML input: {detail}") from exc
     raise ValueError(f"Unsupported input format: {format!r}")
 
 
@@ -3691,11 +3946,55 @@ def _serialize(value: Any, format: str) -> str:
         )
     if format in {"yaml", "yml"}:
         return _import_yaml_module().safe_dump(
-            value,
+            _normalize_yaml_value(value, active=set()),
             allow_unicode=True,
             sort_keys=False,
         )
     raise ValueError(f"Unsupported output format: {format!r}")
+
+
+def _normalize_yaml_value(value: Any, *, active: set[int]) -> Any:
+    """Convert accepted extended scalars to values representable by SafeDumper."""
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, time):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        value_id = id(value)
+        if value_id in active:
+            raise JinestError("Cyclic mapping cannot be serialized as YAML")
+        active.add(value_id)
+        try:
+            result: dict[Any, Any] = {}
+            for key, item in value.items():
+                normalized_key = _normalize_yaml_value(key, active=active)
+                try:
+                    duplicate = normalized_key in result
+                except TypeError as exc:
+                    raise JinestError(
+                        "YAML mapping keys must be hashable after normalization"
+                    ) from exc
+                if duplicate:
+                    raise JinestError(
+                        "Duplicate YAML mapping key after normalization: "
+                        f"{normalized_key!r}"
+                    )
+                result[normalized_key] = _normalize_yaml_value(item, active=active)
+            return result
+        finally:
+            active.remove(value_id)
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        value_id = id(value)
+        if value_id in active:
+            raise JinestError("Cyclic sequence cannot be serialized as YAML")
+        active.add(value_id)
+        try:
+            return [_normalize_yaml_value(item, active=active) for item in value]
+        finally:
+            active.remove(value_id)
+    return value
 
 
 def _normalize_json_value(value: Any, *, active: set[int]) -> Any:
@@ -3717,11 +4016,34 @@ def _normalize_json_value(value: Any, *, active: set[int]) -> Any:
             raise JinestError("Cyclic mapping cannot be serialized as JSON")
         active.add(value_id)
         try:
-            return {
-                _normalize_json_value(key, active=active):
-                _normalize_json_value(item, active=active)
-                for key, item in value.items()
-            }
+            result: dict[Any, Any] = {}
+            json_keys: set[str] = set()
+            for key, item in value.items():
+                normalized_key = _normalize_json_value(key, active=active)
+                if normalized_key is None:
+                    json_key = "null"
+                elif isinstance(normalized_key, bool):
+                    json_key = "true" if normalized_key else "false"
+                elif isinstance(normalized_key, str):
+                    json_key = str(normalized_key)
+                elif isinstance(normalized_key, (int, float)):
+                    json_key = str(normalized_key)
+                else:
+                    raise JinestError(
+                        "JSON object keys must normalize to a scalar, got "
+                        f"{type(normalized_key).__name__} from {key!r}"
+                    )
+                if json_key in json_keys:
+                    raise JinestError(
+                        "Duplicate JSON object key after normalization: "
+                        f"{json_key!r}"
+                    )
+                json_keys.add(json_key)
+                result[normalized_key] = _normalize_json_value(
+                    item,
+                    active=active,
+                )
+            return result
         finally:
             active.remove(value_id)
 
@@ -3849,8 +4171,14 @@ def _self_test() -> None:
         "C": {"<<$": "root.B"},
         "var1": 7,
         "var2": 9,
-        "native_array$": ["var1", "root.var2", "1", "true", 5, None, "path"],
-        "text_array@": ["{{ var1 }}", "v={{ root.var2 }}", 1, True, "{{ path }}"],
+        "native_array$": ["var1", "root.var2", "1", "true", 5, "none", "path"],
+        "text_array@": [
+            "{{ var1 }}",
+            "v={{ root.var2 }}",
+            "{{ 1 }}",
+            "{{ true }}",
+            "{{ path }}",
+        ],
         "ready_array$": "['var1', 'root.var2']",
         "path_list": [
             {"obj": {"where$": "path"}},
@@ -3993,7 +4321,7 @@ def _main() -> None:
             treat_warnings_as_errors=args.treat_warnings_as_errors,
             debug=args.debug,
         )
-    except (JinestError, OSError, ValueError) as exc:
+    except Exception as exc:
         if args.debug and isinstance(exc, JinestError) and getattr(
             exc, "_jinest_debug_emitted", False
         ):

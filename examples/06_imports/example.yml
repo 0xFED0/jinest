@@ -1,5 +1,6 @@
 # Run from the repository root:
 #   python jinest.py examples/06_imports/example.yml --output-format yaml
+#   python examples/06_imports/run.py  # same resolution with import_roots
 #
 # Imports are resolved relative to the file that declares them. Imported trees
 # keep independent source roots while their returned nodes rebind to destinations.

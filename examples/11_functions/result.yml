@@ -9,6 +9,23 @@ script_result: 10
 structured_result:
   value: hello
   type: generated
+# A list structural body materializes like any other returned node.
+list_structural_result:
+- left
+- right
+# Both attachments have their own destination paths and nested caches.
+rebound_nodes:
+  x:
+    value: 10
+    where: global_root.rebound_nodes.x
+    nested:
+      where: global_root.rebound_nodes.x.nested
+  y:
+    value: 10
+    where: global_root.rebound_nodes.y
+    nested:
+      where: global_root.rebound_nodes.y.nested
+  temporary_where: global_root.rebound_nodes
 deployments:
   host: api.example.test
   primary:

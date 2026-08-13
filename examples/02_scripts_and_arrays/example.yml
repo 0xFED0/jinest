@@ -5,7 +5,7 @@
 
 base: 4
 
-# Each string item is an independent native expression. Non-strings stay literal.
+# Each string item is an independent native expression; numbers and booleans pass through.
 native_values$:
   - base + 1
   - root.base * 2
@@ -14,25 +14,32 @@ native_values$:
   - path
   - 99
 
-# Each string item is a complete text template.
+# Every item must be a string because @ always renders a text template.
 text_values@:
   - "base={{ base }}"
   - "root={{ root.base }}"
   - "item path={{ path }}"
-  - 99
+  - "99"
 
-# Each string item is a multiline script; literal items are untouched.
+# Script strings execute independently; numeric/boolean items pass through.
 script_values^:
   - |
       % return base + 10
   - |
       % set doubled = base * 2
       % return {"doubled": doubled}
-  - 99
+  - "% return 99"
 
-# A list returned by one expression is already computed and is not executed again.
-# (`$` expressions reject template delimiters, even inside string literals.)
+# The expression itself runs once. Its returned list then becomes an ordinary
+# Jinest subtree: plain strings stay data, while explicit inline directives
+# would still be recognized. (`$` rejects template delimiters in its source.)
 computed_list$: "['base + 1', 'root.base']"
+
+# Returned mappings are parsed the same way. A raw generated key stays literal,
+# a mode key is evaluated, and a leading backtick escapes an inline directive.
+generated_tree$: >-
+  {'literal$`': 'not evaluated', 'computed$': 'global_root.base + 6',
+   'escaped_inline': '`=$base'}
 
 # `return` exits immediately, including from nested loops/conditionals.
 first_large^: |

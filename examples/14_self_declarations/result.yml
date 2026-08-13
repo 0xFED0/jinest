@@ -18,6 +18,8 @@ items:
 # The dynamic function declaration is omitted; only its result remains.
 function_name: make
 function_result: 7
+function_object:
+  value: 8
 
 # Self-compose emits one item per source value.
 compose_name: expanded

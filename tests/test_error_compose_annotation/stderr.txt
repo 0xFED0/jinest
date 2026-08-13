@@ -1,0 +1,1 @@
+jinest: Type annotations are unsupported in compose declaration 'bad[value: int=[1]]='

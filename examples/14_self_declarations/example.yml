@@ -36,6 +36,7 @@ function_name: make
   <(x)=:
     value$: x
 function_result$: make(7).value
+function_object$: make(8)
 
 # Self compose uses the normal Cartesian-product and rebinding machinery.
 compose_name: expanded

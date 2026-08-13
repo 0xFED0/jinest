@@ -8,3 +8,7 @@ decorated: <5>
 missing_native: null
 missing_script: null
 missing_text: beforeafter
+
+# Only materialized fields appear; the suppressed and hidden declarations do not.
+selected: literal-wins
+lookup_value: public-for-output

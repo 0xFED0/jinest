@@ -27,3 +27,8 @@ internal_port: published-but-not-used-for-computation
 effective_port: 8082
 release_endpoint: https://example.test/jinest-8081
 optional: null
+
+# Raw keys retain Jinest-looking characters literally.
+literal_mode_key$: this is not an expression
+.visible_dot: this is not a hidden field
+literal_backtick`: preserved

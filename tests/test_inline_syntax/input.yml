@@ -3,6 +3,10 @@ literal$`: native-looking literal key
 literal@`: text-looking literal key
 literal^`: script-looking literal key
 final``: one literal final backtick
+# Raw/dynamic leading dots are literal output keys, not hidden fields.
+.raw`: visible raw dot
+"=$'.dynamic'": visible dynamic dot
+.hidden: this helper is hidden
 
 value: 4
 native: "=$value * 2"

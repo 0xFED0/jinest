@@ -44,24 +44,27 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.14.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.14.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
 - [Highlights](#highlights)
 - [Installation](#installation)
+- [Mental model](#mental-model)
 - [Syntax](#syntax)
-- [Raw and inline syntax](#raw-and-inline-syntax)
-- [Self-declaration wrappers](#self-declaration-wrappers)
-- [Hidden fields](#hidden-fields)
-- [Diagnostics: warnings and hints](#diagnostics-warnings-and-hints)
 - [Native expressions: `$`](#native-expressions-)
 - [Text templates: `@`](#text-templates-)
 - [Multiline scripts: `^`](#multiline-scripts-)
+- [Evaluation layers, raw keys, and inline syntax](#evaluation-layers-raw-keys-and-inline-syntax)
+- [Evaluation context](#evaluation-context)
+- [Hidden fields](#hidden-fields)
+- [Diagnostics: warnings and hints](#diagnostics-warnings-and-hints)
 - [Template functions](#template-functions)
 - [Compose declarations](#compose-declarations)
+- [Self-declaration wrappers](#self-declaration-wrappers)
 - [Lazy layers](#lazy-layers)
-- [Evaluation context](#evaluation-context)
+- [Lazy arrays](#lazy-arrays)
+- [Cycles](#cycles)
 - [Node metadata](#node-metadata)
 - [PathRef](#pathref)
 - [Path functions](#path-functions)
@@ -74,12 +77,12 @@ app:
   - [`get(path, default=none, anchor=context)`](#getpath-defaultnone-anchorcontext)
   - [Node indexing](#node-indexing)
   - [Source helpers](#source-helpers)
-- [Lazy arrays](#lazy-arrays)
 - [Imports](#imports)
 - [Python API](#python-api)
   - [Eager convenience](#eager-convenience)
   - [Lazy access](#lazy-access)
-  - [Files](#files)
+  - [Files and text](#files-and-text)
+  - [Resolver options](#resolver-options)
 - [CLI](#cli)
 - [Testing](#testing)
 - [Examples](#examples)
@@ -88,32 +91,29 @@ app:
 
 ## Highlights
 
-- Lazy field resolution and dependency tracking.
-- Native Jinja expressions with `$`.
-- Full text templates with `@`.
-- Multiline Jinja scripts with `^`, `%` line statements, and native `return`.
-- Lazy safe template functions with positional, named, and default arguments.
+- Lazy, memoized field resolution with deterministic materialization.
+- Native expressions (`$`), text templates (`@`), and scripts (`^`).
+- Inside-out evaluator pipelines through field, inline, and self syntax.
+- Safe template functions and Cartesian structural/text composition.
 - Lazy default and override layers without eager dictionary merging.
-- Destination-aware reusable prototypes.
+- Destination-aware reusable nodes with isolated binding caches.
+- Hidden intermediate fields and source-aware diagnostics.
 - Independent source roots for imported YAML and JSON trees.
 - Structured `PathRef` objects and explicit navigation helpers.
-- Source and destination metadata on every mapping/list node.
-- Cycle handling consistent across fields, layers, and imports.
 
 ## Installation
 
-Jinest currently ships as one Python file. Copy `jinest.py` into your project, then install Jinja:
+Jinest is distributed as a single Python module and as a wheel. Python 3.10 is
+the minimum supported version; development and compatibility testing primarily
+target Python 3.11 and newer.
 
-**Python compatibility:** Python 3.10 is the minimum supported version.
-Development and compatibility testing primarily target Python 3.11 and newer.
-
-Install the package with its standard Jinja2 and PyYAML dependencies:
+The packaged distribution deliberately installs both Jinja2 and PyYAML:
 
 ```bash
 python -m pip install jinest
 ```
 
-For a local checkout, build a wheel and install it:
+For a local checkout:
 
 ```bash
 python -m pip install build
@@ -121,152 +121,78 @@ python -m build --wheel
 python -m pip install dist/jinest-*-py3-none-any.whl
 ```
 
-The installed wheel exposes the `jinest` CLI:
+The wheel exposes the `jinest` CLI:
 
 ```bash
 jinest config.yaml
 ```
 
+When copying `jinest.py` directly, Jinja2 is required for evaluation. PyYAML
+remains optional: it is imported only for YAML input or output, so Python-object
+and JSON workflows work without it.
+
+## Mental model
+
+Jinest treats a tree as a graph of lazily bound mapping/list nodes. A field is
+resolved on first access and memoized within that binding. `resolve()` walks
+the public graph and materializes ordinary Python values.
+
+The following mappings and lists are Jinest code:
+
+- containers in the source document;
+- containers returned by `$` expressions or `^` scripts;
+- structural-function and structural-compose bodies;
+- an existing lazy node returned from another source or binding.
+
+Thus a generated `{"value$": "1 + 1"}` becomes `{"value": 2}`. Escape a
+generated key with a trailing backtick when it must remain literal:
+``{"value$`": "1 + 1"}`` produces the literal key `value$`. Generated inline
+strings use the same leading-backtick escape as source strings.
+
+Returning an existing lazy node creates a fresh destination binding with fresh
+field, child, key-index, and layer caches. Its declaration source, `origin`,
+`root`, and function/compose locals are preserved. The same node can therefore
+be attached repeatedly with independent destination `context` and `path`.
+
+Function declarations and hidden helpers participate in lookup but are omitted
+from materialized output. Compose declarations emit only their composed value.
+
 ## Syntax
+
+Marker position is part of the grammar: a key suffix declares a field or
+structural construct; a scalar prefix declares an inline evaluator.
 
 | Form | Meaning |
 |---|---|
-| `name@` | Full Jinja text template; result is a string |
-| `name$` | One Jinja expression; result preserves its native type |
-| `name^` | Multiline Jinja script; `return` produces a native value |
-| `name[axis=source, ...]=` | Cartesian structural compose: flatten list bodies or merge mapping bodies |
-| `name[axis=source, ...]@` | Cartesian text compose: concatenate one rendered string per combination |
-| `=$expr`, `=@text`, `=^script` | Inline native expression, text template, or script in a scalar value or a dynamic mapping key |
-| `key\`` | Raw key: remove the final backtick and disable all Jinest key parsing |
-| `.name`, `.name$`, `.name@`, `.name^` | Hidden field; use it in Jinja as `name`, but omit it from final output |
-| `<<$`, `<<N$` | Native-expression default layer |
-| `<<^`, `<<N^` | Script default layer |
-| `<<!$`, `<<N!$` | Native-expression override layer |
-| `<<!^`, `<<N!^` | Script override layer |
+| `name$`, `name@`, `name^` | Native, text, or script field |
+| `name(args)$`, `name(args)@`, `name(args)^` | Scalar template function |
+| `name(args)=` | Structural function |
+| `name[axis=source, ...]=` | Structural Cartesian compose |
+| `name[axis=source, ...]@` | Text Cartesian compose |
+| `=$expr`, `=@text`, `=^script` | Inline evaluator in a scalar value or mapping key |
+| `<$`, `<(args)=`, `<[axis=source]=` | Declaration applied to the current slot |
+| `key\`` | Raw key: remove one final backtick and disable key parsing |
+| `.name`, `.name$`, `.name@`, `.name^` | Hidden field |
+| `<<$`, `<<N$`, `<<^`, `<<N^` | Default layer |
+| `<<!$`, `<<N!$`, `<<!^`, `<<N!^` | Override layer |
 
-Local field priority is:
+Local field priority inside one mapping is:
 
 ```text
 name > name^ > name$ > name@
 ```
 
-Ignored lower-priority alternatives are not parsed or evaluated.
+Lower-priority alternatives are neither parsed nor evaluated. Functions,
+compose declarations, dynamic/raw final keys, and self structural declarations
+share the logical-key namespace and reject ambiguous duplicates.
 
-## Raw and inline syntax
-
-A mapping key ending in a backtick is literal: the marker is removed and no
-Jinest key syntax is recognized. This is useful for keys that naturally end in
-`$`, `@`, or `^`. Two final backticks leave one literal backtick in the result.
-
-```yaml
-"price$`": literal key named "price$"
-"title@`": literal key named "title@"
-"final``": literal key named "final`"
-```
-
-Inline directives make only that scalar lazy, without changing the mapping
-key. `$` returns a native value, `@` returns text, and `^` executes a script.
-A leading backtick escapes a directive and is removed.
-
-```yaml
-value: 4
-native: "=$value * 2"
-label: "=@value={{ value }}"
-script: "=^% return value * 3"
-literal: "`=$value"       # becomes the literal string "=$value"
-items: ["=$value + 1", "=@item={{ value }}"]
-```
-
-An inline directive in a mapping key creates a dynamic key. It is evaluated
-once when that mapping is indexed, must return a string, and is then treated
-as a literal final key (its result is not parsed again as Jinest syntax).
-Duplicate final keys raise `JinestError`.
-
-```yaml
-name: generated$
-"=$name": "=$value + 1"  # final key is literally `generated$`
-```
-
-Mode fields and legacy mode-typed arrays such as `value$` or `items$` remain
-supported. Inline directives are inner layers and the field/array suffix is an
-outer layer, so both are evaluated in order. The inner result must be a string
-when it is passed to an outer renderer; this makes `value$: '=$chain'` a genuine
-two-stage `$` pipeline. Escaped inline literals remain literal values.
-
-## Self-declaration wrappers
-
-A mapping containing exactly one special `<...` key can apply that declaration
-to its own value slot. The marker is never materialized:
-
-```yaml
-value:
-  <$: "base + 1"
-record:
-  <(x)=:
-    value$: x
-items:
-  <[item=values]=:
-    - =@{{ item }}
-```
-
-`<$` is equivalent to a `$` field layer and may be nested for pipelines.
-`<(args)=` and `<[axis=source]=` reuse structural-function and compose
-validation, argument locals, rebinding, and lazy caches. A wrapper is only
-recognized for an exactly-one-key mapping; ordinary mappings with additional
-keys remain ordinary data.
-
-## Hidden fields
-
-Prefix a field name with `.` to create an intermediate value. It is available
-inside templates without the prefix and is never emitted in the resolved JSON
-or YAML. When both `.name` and `name` are declared, templates resolve `name`
-from `.name`; the public `name` remains independent and is used only in the
-final dump. The same rule applies to `$`, `@`, and `^` field modes.
-
-```yaml
-price: 100
-.tax$: "price * 0.2"       # available as `tax` in templates
-shown_tax: standard rate     # a normal output field
-total$: "price + tax"
-```
-
-The result contains `price`, `shown_tax`, and `total: 120.0`, but no `.tax`.
-
-## Diagnostics: warnings and hints
-
-During schema discovery Jinest collects non-fatal diagnostics in
-`Resolver.messages`. Each item is an immutable `JinestMessage` with `level`
-(`"warning"` or `"hint"`), `msg`, `path`, and `file` fields. By default diagnostics are printed
-to stderr after a successful `resolve()`; they never change the resolved data.
-
-A literal field suppresses lower-priority declarations with the same logical
-name. For example, `name` wins over `name^`, `name$`, and `name@`, so each
-suppressed declaration gets a warning. If both `key` and `.key` exist, Jinest
-adds a hint because the hidden value has priority in template calculations
-while the public value remains in the final dump.
-
-```python
-from jinest import Resolver
-
-resolver = Resolver(
-    {"name": "used", "name$": "ignored", ".key": "temporary", "key": "shown"}
-)
-result = resolver.resolve()       # diagnostics go to stderr
-for message in resolver.messages:
-    print(message.level, message.msg)
-```
-
-Use `emit_messages=False` when the caller wants to process the list itself.
-Set `debug=True` to append the source location of each diagnostic or error to
-stderr as `at {path}` and `in {file}` lines. The same location is available on
-`JinestMessage.path`/`.file` and on Jinest exceptions.
-Set `treat_warnings_as_errors=True` to raise `JinestWarningError` if any
-warning was collected (hints do not trigger this policy). The CLI equivalents
-are `--no-messages` (`-silent`) and `--treat-warnings-as-errors` (`-Werror`).
+YAML quoting still applies. Quote keys and inline strings containing `:`, `#`,
+braces, or leading marker characters when YAML could interpret them first.
 
 ## Native expressions: `$`
 
-A `$` field contains exactly one Jinja expression, without `{{ ... }}`:
+A `$` evaluator normally receives one Jinja expression as a string, without
+`{{ ... }}`. Its result preserves native type:
 
 ```yaml
 values:
@@ -274,194 +200,151 @@ values:
   y: 3
   sum$: "x + y"
   enabled$: "sum > 4"
-  object$: "{'x': x, 'y': y}"
+  generated$: "{'answer$': '40 + 2'}"
 ```
+
+The generated mapping is a Jinest subtree, so `answer$` becomes `answer: 42`.
+
+For convenience, a finite number or boolean body passes through unchanged:
+
+```yaml
+attempts$: 3
+enabled$: true
+```
+
+Mappings, `null`, dates, bytes, and other non-string bodies are invalid. A
+direct list has the legacy mode-array semantics described below. Return a
+structure or another scalar from a string expression.
 
 ## Text templates: `@`
 
-An `@` field is a complete Jinja template:
+An `@` evaluator always receives a string containing a complete Jinja template,
+and its result is always text:
 
 ```yaml
 release:
   product: Jinest
-  version: 0.7.0
+  version: 0.14.1
   label@: "{{ product }} v{{ version }}"
 ```
 
+`@` does not accept numeric or boolean passthrough bodies. Write `"42"` or
+`"{{ 42 }}"` when text is intended.
+
 ## Multiline scripts: `^`
 
-A `^` field uses Jinja line statements prefixed with `%` and may return any native value:
+A `^` evaluator normally receives a string containing Jinja line statements
+prefixed with `%`. `return` produces a native value:
 
 ```yaml
 result^: |
-  % set sum = x + y
-  % set doubled = sum * 2
-
+  % set doubled = (x + y) * 2
   % if doubled > 10
-    % return {
-      "value": doubled,
-      "large": true
-    }
+    % return {"value": doubled, "large": true}
   % endif
-
-  % return {
-    "value": doubled,
-    "large": false
-  }
+  % return {"value": doubled, "large": false}
 ```
 
 Rules:
 
 - `return expression` immediately terminates the script.
-- `return` without an expression returns `null`.
-- Reaching the end without `return` also returns `null`.
+- `return` without an expression, or reaching the end, returns `null`.
 - `return` works inside `if`, `for`, and nested Jinja blocks.
-- Standard `{% ... %}` syntax remains accepted, but `%` line statements are the intended notation.
+- Standard `{% ... %}` blocks remain accepted.
+- Returned mappings/lists become Jinest subtrees.
+- Numeric and boolean bodies pass through; other non-string bodies are invalid.
 
-## Template functions
+A direct list uses legacy mode-array semantics rather than being one script
+body.
 
-Mappings may declare lazy safe functions with an explicit mode suffix:
+## Evaluation layers, raw keys, and inline syntax
 
-```yaml
-square(x)$: x * x
-quote(value, mark='"')@: "{{ mark }}{{ value }}{{ mark }}"
-clamp(value, minimum, maximum)^: |
-  % if value < minimum
-  %   return minimum
-  % endif
-  % return value
-```
-
-Functions support positional arguments, named arguments, and defaults. Defaults
-are evaluated at call time with the normal Jinest evaluator:
+These forms declare one native evaluation layer:
 
 ```yaml
-defaults:
-  factor: 10
-scale(value, factor=global_root.defaults.factor)$: value * factor
-result$: scale(5)
+suffix$: "base + 1"
+inline: "=$base + 1"
+wrapped:
+  <$: "base + 1"
 ```
 
-Function declarations are lazy runtime helpers and are omitted from the final
-mapping. A namespace containing only functions remains as an empty mapping.
-Function bodies use the destination binding's normal `context`, `path`, and
-`global_root`, while `origin` and `root` refer to the declaration source.
-Functions are safe
-Jinja callables; arbitrary Python attributes and APIs remain unavailable.
-
-Structural functions use a final `=` and have a mapping or array body. Each
-call creates a fresh lazy binding of that body, so its caches and parameters
-are isolated from other calls. The body is rebound at its destination, so
-`context` and `path` follow that binding while `origin` and `root` still point
-to the declaration.
+Inline directives are scalar prefixes. A leading backtick escapes one:
 
 ```yaml
-record(x, key, value)=:
-  value$: x
-  =$key: =$value
-pair(a, b)=: ["=$a", "=$b"]
-
-result: "=$record(2, 'answer', 42)"
-values: "=$pair('left', 'right')"
+native: "=$base * 2"
+label: "=@base={{ base }}"
+script: "=^% return base * 3"
+literal: "`=$base"       # literal string "=$base"
 ```
 
-Structural functions also support positional arguments, named arguments, and
-defaults. Their bodies must be mappings or arrays; scalar bodies and
-unsuffixed structural-looking declarations such as `name(args): {}` are
-errors. `$`, `@`, `^`, and `=` are the supported function declaration modes;
-`*args`/`**kwargs` are not supported.
-
-## Compose declarations
-
-Compose declarations expand one structural or text body across a Cartesian
-product. Every `axis=source` is a native Jinest expression that must resolve to
-an iterable. Axes follow declaration order: the first is outermost and the
-last is innermost. Axis names are local variables in each body instance.
-Compose declarations are not helpers and only their final `name` is emitted.
+Layers compose inside-out. A field/array mode is an implicit outer layer;
+inline and nested `<$` forms are inner layers:
 
 ```yaml
-versions: ["3.10", "3.11"]
-dirs: [bin, lib]
-prefix: run
-
-items[v=versions, d=dirs]=:
-  - '=@{{ prefix }}/{{ d }}/py{{ v }}'
-  - '=$prefix ~ ":" ~ d ~ ":" ~ v'
-
-summary[v=versions]@: "py{{ v }};"
+pipeline$:
+  <$: '"base + 1"'
 ```
 
-The list body emits two flattened items per combination; `items` is ordered as
-`3.10/bin`, `3.10/lib`, `3.11/bin`, `3.11/lib`. A mapping body contributes its
-keys for each combination, supports dynamic keys, and rejects duplicate final
-keys. Every generated container is rebound at its final destination, so paths,
-contexts, and caches remain independent.
+Every layer validates the previous result. `@` requires a string;
+`$`/`^` accept a string or numeric/boolean passthrough. A mapping/list between
+evaluator stages is an error.
 
-## Lazy layers
-
-Mappings may inherit lazy default and override layers:
+A key ending in a backtick is raw. One marker is removed and the remainder is
+never reinterpreted:
 
 ```yaml
-defaults:
-  host: localhost
-  port: 8000
-
-overrides:
-  port: 443
-  secure: true
-
-service:
-  <<^: |
-    % return root.defaults
-
-  port: 8080
-
-  <<!^: |
-    % if force_secure
-      % return root.overrides
-    % endif
-    % return null
+"price$`": literal key named "price$"
+"final``": literal key named "final`"
+".visible`": literal visible key named ".visible"
 ```
 
-Precedence is:
+An inline directive in a mapping key creates a dynamic key. It is evaluated
+once when that destination mapping is first indexed, must return a string, and
+then becomes a literal final key:
 
-```text
-defaults → local fields → overrides
+```yaml
+name: generated$
+"=$name": "=$base + 1"       # literal final key "generated$"
+"=$'.visible'": shown        # visible final key ".visible"
 ```
 
-Lookup runs in reverse:
-
-```text
-last override → first override → local → last default → first default
-```
-
-Default and override numbering are independent. `$` and `^` affect only how a layer source is computed, not its precedence.
-
-A `null` merge result is an empty layer. Any other result must be a mapping.
+A raw/dynamic leading dot is not hidden. Duplicate final or logical keys raise
+`JinestError`.
 
 ## Evaluation context
 
-Every template or expression receives:
+Every evaluator receives:
 
 | Name | Meaning |
 |---|---|
-| `context` | Destination mapping/list currently being evaluated |
+| `context` | Destination mapping/list scope currently evaluating the value |
 | `_` | Parent of `context` |
-| `path` | Destination `PathRef` for the current context or array item |
-| `origin` | Source mapping/list where the winning field or layer was declared |
-| `root` | Root of the source tree that owns `origin` |
-| `global_root` | Top-level root of the original `Resolver` |
-| `keyname` | Logical output key of the field currently being evaluated |
-| `effective_key` | Exact source key that declared the field, including `.`, `$`, `@`, or `^` |
-| `keymode` | Field-mode marker: `$`, `@`, or `^`; `none` when there is no marker |
-| `keypath` | Path to the current field; equivalent to `path[keyname]` |
+| `path` | Destination `PathRef` for that scope, or for the current array item |
+| `origin` | Source mapping/list containing the winning declaration |
+| `root` | Root of the source tree owning `origin` |
+| `global_root` | Top-level destination root of the original `Resolver` |
+| `keyname` | Logical output key; hidden prefixes and field suffixes are removed |
+| `effective_key` | Exact source key introducing the active declaration |
+| `keymode` | Active marker: `$`, `@`, `^`, `=`, or `none` |
+| `keypath` | Exact alias for `path[keyname]`, or `none` without a `keyname` |
 
-This split allows imported prototypes to use their own absolute source references while adapting relative references to the destination:
+Each evaluator in a multi-stage pipeline sees its own `keymode`. Structural
+functions/compose use `=` and text compose uses `@`. During dynamic-key
+evaluation, `keyname` and `keypath` are `none` because the final key does not
+yet exist.
+
+`keypath` is deliberately a syntactic alias. For an item of `items$`, `path`
+already includes the array index, so the alias is `path["items"]`; it need not
+equal the enclosing declaration path.
+
+Function parameters and compose-axis locals have priority over context fields.
+
+Imported prototypes keep source-absolute references while adapting destination
+references:
 
 ```yaml
 # library.yaml
 constant: 10
-
 prototype:
   absolute$: root.constant
   relative$: _.parent_value
@@ -472,7 +355,6 @@ prototype:
 ```yaml
 # main.yaml
 parent_value: 5
-
 instance:
   <<$: import("library.yaml").prototype
 ```
@@ -486,10 +368,286 @@ root         = root of library.yaml
 global_root  = root of main.yaml
 ```
 
-For a declaration `value$`, its expression sees `keyname == "value"`,
-`effective_key == "value$"`, and `keymode == "$"`. A hidden declaration such
-as `.value@` reports `keyname == "value"` while preserving
-`effective_key == ".value@"`.
+For `value$`, metadata is `keyname == "value"`,
+`effective_key == "value$"`, and `keymode == "$"`. Hidden `.value@` keeps
+`keyname == "value"` and `effective_key == ".value@"`.
+
+## Hidden fields
+
+Prefix a statically declared field with `.` to create an intermediate value. It
+is available to evaluators without the prefix and omitted from materialized
+JSON/YAML:
+
+```yaml
+price: 100
+.tax$: "price * 0.2"
+tax: public text
+total$: "price + tax"
+```
+
+When both `.name` and `name` exist, ordinary Jinest lookup of `name` resolves
+the hidden declaration. The public declaration remains independent and is used
+for final materialization; it is not reachable through normal lookup while the
+hidden declaration is in scope.
+
+Hidden behavior applies to static concrete, `$`, `@`, and `^` fields. A raw key
+such as ``".name`"``, or a dynamic key whose result is `.name`, is a visible
+literal final key and is never converted into a hidden field.
+
+## Diagnostics: warnings and hints
+
+During schema discovery Jinest collects non-fatal diagnostics in
+`Resolver.messages`. Every immutable `JinestMessage` has `level` (`"warning"`
+or `"hint"`), `msg`, `path`, and `file`.
+
+A concrete unsuffixed field suppresses lower-priority field modes with the same
+logical name; every suppressed declaration gets a warning. If both `key` and
+`.key` exist, Jinest adds a hint because hidden lookup differs from final
+materialization.
+
+By default messages are printed to stderr after successful resolution:
+
+```text
+jinest: warning: ...
+  at root.path
+  in /project/config.yml
+```
+
+The `at`/`in` lines are included only with `debug=True`. Locations remain
+available programmatically regardless of that flag.
+
+Use `emit_messages=False` to process the list without stderr output.
+`treat_warnings_as_errors=True` raises `JinestWarningError` when a warning
+exists; hints do not trigger it. CLI equivalents are `--no-messages`
+(`-silent`), `--treat-warnings-as-errors` (`-Werror`), and `--debug`.
+
+## Template functions
+
+Mappings declare functions with an evaluator or structural suffix:
+
+```yaml
+square(x)$: "x * x"
+quote(value, mark='"')@: "{{ mark }}{{ value }}{{ mark }}"
+clamp(value, minimum, maximum)^: |
+  % if value < minimum
+    % return minimum
+  % endif
+  % return value
+```
+
+Scalar function bodies follow ordinary evaluator type rules: `@` requires a
+string; `$`/`^` require a string or numeric/boolean passthrough. Functions
+support positional, named, and default arguments. `*args`, `**kwargs`,
+positional-only, keyword-only, and annotated parameters are rejected.
+
+Defaults are native expressions evaluated at call time. Earlier parameters are
+visible to later defaults, and parameters take priority over context fields:
+
+```yaml
+defaults:
+  factor: 10
+scale(value, factor=global_root.defaults.factor)$: "value * factor"
+result$: "scale(5)"
+```
+
+Function declarations are lazy helpers and omitted from output. A mapping
+containing only functions materializes as an empty mapping. Scalar functions
+use call-site `context`, `path`, and `global_root`; `origin` and `root` refer
+to the declaration source.
+
+Structural functions end in `=` and require a mapping or list body:
+
+```yaml
+record(x, key, value)=:
+  value$: x
+  =$key: =$value
+
+pair(a, b)=:
+  - =$a
+  - =$b
+
+result: "=$record(2, 'answer', 42)"
+values: "=$pair('left', 'right')"
+```
+
+Each call creates an isolated parameter frame and temporary lazy node. Every
+destination attachment creates a fresh ordinary binding and fresh caches.
+Destination `context`/`path` are derived normally; source metadata and function
+locals are preserved. Reusing one returned node at multiple destinations
+therefore produces independent paths.
+
+Scalar structural bodies and unsuffixed structural-looking declarations such
+as `name(args): {}` are errors. Functions, fields, compose declarations, and
+dynamic/self declarations cannot claim the same logical name.
+`function_max_depth` limits recursive scalar (`$`, `@`, `^`) function calls.
+Structural functions are deliberately non-recursive: a direct or indirect
+recursive structural call raises `JinestFunctionError`.
+
+## Compose declarations
+
+Compose expands a structural or text body over a Cartesian product:
+
+```yaml
+versions: ["3.10", "3.11"]
+dirs: [bin, lib]
+prefix: run
+
+items[v=versions, d=dirs]=:
+  - "=@{{ prefix }}/{{ d }}/py{{ v }}"
+  - "=$prefix ~ ':' ~ d ~ ':' ~ v"
+
+summary[v=versions]@: "py{{ v }};"
+```
+
+Every `axis=source` is an independent native expression evaluated before the
+product. Axis sources cannot reference earlier axes. Each source must be
+iterable; lists/tuples are conventional, strings iterate characters, and
+mappings iterate keys.
+
+Axes preserve declaration order: the first is outermost and the last
+innermost. Axis locals take priority over context fields. An empty axis emits
+an empty list/mapping for structural compose and an empty string for text
+compose.
+
+For each combination:
+
+- a list body contributes all items with one-level flattening;
+- a mapping body contributes all generated entries;
+- a text body is rendered once and concatenated in product order.
+
+Mapping bodies support dynamic keys and reject duplicate final keys. Every
+generated structural node is freshly rebound at its emitted destination.
+Compose declarations are not callable helpers; only their final logical name
+is emitted.
+
+## Self-declaration wrappers
+
+A mapping containing exactly one supported `<...` key applies that declaration
+to its own value slot. The wrapper key is never materialized:
+
+```yaml
+value:
+  <$: "base + 1"
+
+record:
+  <(x)=:
+    value$: x
+
+items:
+  <[item=values]=:
+    - "=@{{ item }}"
+```
+
+Supported forms are:
+
+- `<$`: one native evaluator layer;
+- `<(args)=`: structural function at the current slot;
+- `<[axis=source]=`: structural compose at the current slot.
+
+`<@` and `<^` are not currently implemented. `<$` follows the same scalar
+validation as `$` and may be nested for inside-out pipelines. Structural self
+bodies follow normal function/compose validation and rebinding.
+
+A wrapper is recognized only when its mapping has exactly one supported key.
+With any additional key, the mapping is ordinary Jinest data. Self declarations
+also work under raw or dynamic destination keys.
+
+## Lazy layers
+
+Mappings may inherit lazy default and override layers:
+
+```yaml
+defaults:
+  host: localhost
+  port: 8000
+overrides:
+  port: 443
+
+service:
+  <<$: root.defaults
+  port: 8080
+  <<!^: |
+    % if force_secure
+      % return root.overrides
+    % endif
+    % return null
+```
+
+Materialization order is:
+
+```text
+defaults -> local fields -> overrides
+```
+
+Lookup runs from highest to lowest precedence:
+
+```text
+last override -> first override -> local -> last default -> first default
+```
+
+`$` and `^` select only how the layer source is computed. Their body
+validation follows ordinary evaluator rules; the result must be a mapping or
+`null`. `null` means an empty layer.
+
+Numbered keys use `N` as order; omitted `N` is `0`. Default and override
+families are sorted independently. Larger `N` has higher lookup priority; at
+equal `N`, the later source declaration wins.
+
+## Lazy arrays
+
+Lists are lazy nodes and indices participate in destination paths.
+
+A list directly under `$`, `@`, or `^` is the legacy mode-typed array form:
+the list is a container and every item is one body of that mode.
+
+```yaml
+native_values$:
+  - "x + 1"
+  - 123
+  - true
+
+text_values@:
+  - "Value: {{ x }}"
+  - "42"
+
+script_values^:
+  - "% return x * 2"
+  - 123
+  - false
+```
+
+For `$`/`^`, items must be strings, numbers, or booleans. For `@`, every item
+must be a string. `null`, mappings, and nested lists are invalid mode bodies.
+
+Inline/self syntax inside a mode-typed array is an inner layer and the array
+mode is outer. An escaped inline string remains literal and bypasses the outer
+mode.
+
+A list returned by an expression/script is a generated Jinest subtree, not a
+second legacy mode-typed body. Ordinary returned strings are not implicitly
+evaluated again, but explicit `=<mode>` strings and Jinest mapping keys inside
+that returned container are parsed normally. Escape them when they are literal.
+
+Example path:
+
+```text
+global_root.items[5].object
+```
+
+## Cycles
+
+Jinest distinguishes evaluation cycles from physically cyclic Python data:
+
+- a field expression/script cycle resolves the recursive field to `null`;
+- a recursively requested merge layer is temporarily an empty mapping;
+- an import already active in the current ancestry resolves to `null`;
+- recursive scalar functions beyond `function_max_depth` raise `JinestFunctionError`;
+- direct and indirect recursive structural-function calls raise `JinestFunctionError`;
+- a physically cyclic mapping/list reaching cloning or materialization raises `JinestError`.
+
+Field/layer/import cycle behavior is independent of `strict`. Non-strict mode
+controls unsupported scalars and undefined template values, not physical
+container cycles.
 
 ## Node metadata
 
@@ -632,41 +790,9 @@ source_file(node)
 
 These correspond to `node.root` and `node.file`.
 
-## Lazy arrays
-
-Lists are lazy containers. Direct lists under suffixes resolve each string item independently:
-
-```yaml
-native_values$:
-  - x + 1
-  - root.constant
-  - 123
-
-text_values@:
-  - "Value: {{ x }}"
-  - "Path: {{ path }}"
-  - 123
-
-script_values^:
-  - |
-      % set value = x * 2
-      % return value
-  - |
-      % return path
-  - 123
-```
-
-Non-string items remain literal. A list returned by a string expression or script is treated as already computed and is not executed a second time.
-
-Array indices participate in paths:
-
-```text
-global_root.items[5].object
-```
-
 ## Imports
 
-The following are available as globals and filters:
+These names are globals and filters:
 
 ```jinja
 import_yaml("file.yaml")
@@ -674,13 +800,12 @@ import("file.yaml")
 import_json("file.json")
 ```
 
-Relative paths are resolved from the file containing the import. Imported trees remain lazy and retain their own `root`, `source_path`, and `file` metadata.
+For file-backed resolution, relative imports start beside the importing file.
+In-memory resolution uses `base_dir`, or the current working directory when it
+is omitted. Imported trees remain lazy and keep their own `root`,
+`source_path`, and `file` metadata.
 
-To restrict imports to one or more project directories, pass `import_roots` to
-`Resolver`, `resolve`, `resolve_text`, or `resolve_file`. Paths are resolved
-before the check, so `..` and symlinks cannot escape an allowed root. `None`
-(the default) permits imports anywhere accessible to the process; `[]` denies
-all imports.
+`import_roots` restricts resolved filesystem roots:
 
 ```python
 result = resolve_file(
@@ -689,7 +814,12 @@ result = resolve_file(
 )
 ```
 
-An import already active in the current import ancestry resolves to `null`, matching ordinary field-cycle semantics.
+Paths are resolved before enforcement, so `..` and symlinks cannot escape an
+allowed root. `None` permits any path readable by the process; `[]` denies all
+imports. There is currently no CLI `import_roots` option.
+
+An import already active in the current ancestry resolves to `null`. YAML
+imports require PyYAML; JSON imports do not.
 
 ## Python API
 
@@ -700,17 +830,17 @@ from jinest import Resolver, resolve, resolve_file, resolve_text
 ### Eager convenience
 
 ```python
-result = resolve({
-    "x": 2,
-    "y$": "x + 1",
-})
+result = resolve({"x": 2, "y$": "x + 1"})
 ```
 
-Scalar roots such as `null`, booleans, numbers, and strings are returned unchanged.
-Python `date`, `datetime`, `time`, `bytes`, and `bytearray` values are also accepted.
-Unsupported scalar types raise `JinestError`; with `strict=False` they resolve to
-`None`. Missing native expressions and script returns likewise become `None` in
-non-strict mode, while missing text values render as an empty string.
+Scalar roots (`None`, booleans, finite numbers, strings) are returned unchanged.
+Python `date`, `datetime`, `time`, `bytes`, and `bytearray` are also accepted.
+Unsupported scalars raise `JinestError`; with `strict=False` they become
+`None`.
+
+Undefined native/script expressions become `None` in non-strict mode, while
+undefined text becomes an empty string. A script without `return` produces
+`None` in both modes.
 
 ### Lazy access
 
@@ -722,37 +852,73 @@ resolver = Resolver({
 
 assert resolver.root.answer == 42
 assert str(resolver.root.path) == "global_root"
-
 result = resolver.resolve()
 ```
 
-### Files
+Fields evaluate once per binding. A failed evaluation clears its partial
+value/child/key cache, so later access retries instead of observing incomplete
+state.
+
+### Files and text
 
 ```python
-text = resolve_file(
+rendered = resolve_text(
+    '{"x": 2, "y$": "x + 1"}',
+    format="json",
+    output_format="json",
+)
+
+rendered = resolve_file(
     "config.yaml",
     output="resolved.json",
     output_format="json",
 )
 ```
 
-When serializing JSON, date/time values use ISO 8601 strings. Every byte in a
-`bytes` or `bytearray` value is emitted as one pure Unicode escape (`\uHHHH`).
+JSON serialization converts date/time values to ISO 8601 strings. Every byte
+uses one pure Unicode escape (`\uHHHH`). Mapping keys are normalized by the
+same rules; unsupported keys or collisions after conversion raise
+`JinestError`.
+
+### Resolver options
+
+Convenience functions forward resolver options where applicable.
+
+| Option | Meaning |
+|---|---|
+| `strict=True` | Raise for undefined/unsupported values; non-strict uses `None` or empty text |
+| `in_place=False` | Write a mutable materialized root back into the original mapping/list |
+| `sandboxed=True` | Use Jinja sandboxed environments |
+| `globals`, `filters` | Add trusted application values/callables |
+| `source_path` | Source filename for metadata and relative imports |
+| `base_dir` | Import base when no source file determines it |
+| `import_roots` | Allowed resolved import directories; `None` allows all, `[]` denies all |
+| `function_max_depth=100` | Recursive scalar-function limit |
+| `emit_messages=True` | Print collected diagnostics |
+| `treat_warnings_as_errors=False` | Raise after resolution when warnings exist |
+| `debug=False` | Add `at`/`in` lines to stderr diagnostics |
+
+`Resolver.messages` remains available regardless of `emit_messages`.
 
 ## CLI
 
+The installed command and direct module invocation are equivalent:
+
 ```bash
+jinest config.yaml
 python jinest.py config.yaml
-python jinest.py config.yaml -o resolved.yaml
-python jinest.py config.yaml --output-format json
-python jinest.py config.yaml --debug
-python jinest.py --self-test
+jinest config.yaml -o resolved.yaml
+jinest config.yaml --output-format json
+jinest config.yaml --debug
+jinest config.yaml --no-messages
+jinest config.yaml --treat-warnings-as-errors
+jinest --self-test
 ```
 
-Disable the Jinja sandbox only for fully trusted input:
+Disable the sandbox only for fully trusted templates:
 
 ```bash
-python jinest.py config.yaml --unsafe
+jinest config.yaml --unsafe
 ```
 
 ## Testing
@@ -784,9 +950,9 @@ JINEST_MODULE=/path/to/jinest.py python jinest.test.py
 ## Examples
 
 The [`examples/`](examples/) directory contains runnable, commented examples
-covering field modes, scripts, arrays, layers, prototypes, paths, imports,
-cycles, functions, composition, Python API extensions, extended scalar values,
-and scalar roots.
+for field modes, evaluator pipelines, scripts, arrays, layers, prototypes,
+paths, imports, cycles, functions, composition, self declarations, Python API
+extensions, and extended scalar values.
 
 Validate every documented result with:
 
@@ -794,14 +960,22 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The test suite contains 94 regression tests covering expressions, templates, scripts, functions, diagnostics, layer precedence, prototypes, arrays, imports, cycles, metadata, path parsing, navigation, and YAML syntax.
+The suite contains 98 Python regression tests and 28 implementation-neutral
+portable CLI fixtures.
 
 ## Security
 
-Jinest uses a sandboxed Jinja environment by default. The sandbox reduces exposure but is not a complete security boundary for hostile templates. Imported files also grant filesystem reads available to the running process. Use an OS-level sandbox and restrict accessible directories for adversarial inputs.
+Jinest uses sandboxed Jinja environments by default, but the Jinja sandbox is
+not a complete security boundary for hostile templates.
 
-When using the Python API, `import_roots` can additionally restrict imports to
-specific project directories.
+Imports grant filesystem reads unless `import_roots` restricts them.
+User-provided `globals` and `filters` are trusted application capabilities and
+can expand what templates observe or invoke. Generated mappings/lists are
+parsed as Jinest subtrees, so untrusted generated keys and inline strings are
+code unless escaped.
+
+Use OS-level isolation and minimal filesystem permissions for adversarial
+input. `--unsafe` is only for fully trusted templates.
 
 ## License
 

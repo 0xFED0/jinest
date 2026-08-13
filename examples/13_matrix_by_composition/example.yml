@@ -1,6 +1,10 @@
 # The same matrix as 12_matrix_by_code, expressed with compose declarations.
 # Compose axes form a Cartesian product in declaration order.
 versions: ['3.10', '3.11', '3.12', '3.13', '3.14']
+
+# Text compose renders once per axis value and concatenates in source order.
+version_labels[v=versions]@: "[{{ v }}]"
+
 modules:
   tojson: ["file1.yml", "-o", "file1.json"]
   check: ["file1.yml", "file2.yml", "file3.yml"]
@@ -21,7 +25,7 @@ servers[vi=version_indexes]=:
       - '=$8080+vi'
 
 # Modules are the outer axis and versions the inner axis, matching the
-# ordering of the original nested loops. The dynamic mapping key names runs.
+# original nested-loop ordering. Dynamic keys generate the entries in runs.
 runs[m=module_names, v=versions]=:
   =$m ~ "__python" ~ v:
     binary$: "'python' ~ v"

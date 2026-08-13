@@ -53,3 +53,12 @@ calc:
     keymode: $
     keypath: global_root.calc.field_key_context
   field_key_context_text: field_key_context_text|field_key_context_text@|@|global_root.calc.field_key_context_text
+  layered_key_context:
+    inner_mode: '@'
+    outer_mode: '$'
+  array_key_context:
+    - path: global_root.calc.array_key_context[0]
+      keyname: array_key_context
+      keypath: global_root.calc.array_key_context[0].array_key_context
+      keymode: '$'
+  dynamic_unset: created after dynamic-key evaluation

@@ -33,6 +33,18 @@ service_config(name, port, key='label')=:
   # Dynamic keys and inline directives work inside a structural body as well.
   =$key: "=@{{ name | upper }}"
 
+# Structural functions may return lists as well as mappings.
+pair(left, right)=:
+  - '=$left'
+  - '=$right'
+
+# This body exposes destination paths so independent rebinding is visible.
+destination_node(value)=:
+  value$: value
+  where@: "{{ context.path }}"
+  nested:
+    where@: "{{ context.path }}"
+
 strings:
   upper(value)$: value | upper
   quote(value)@: "<{{ value }}>"
@@ -50,6 +62,14 @@ native_result$: square(5)
 text_result@: "{{ quote(square(5)) }}"
 script_result$: clamp(15, 0, 10)
 structured_result$: make_result("hello")
+list_structural_result$: pair("left", "right")
+
+# Accessing the temporary binding before return must not freeze it. Attaching
+# the same node twice creates independent bindings and fresh nested caches.
+rebound_nodes^: |
+  % set shared = global_root.destination_node(10)
+  % set temporary_where = shared.where
+  % return {"x": shared, "y": shared, "temporary_where": temporary_where}
 
 # The returned mapping is evaluated lazily at this destination. Its path is
 # `global_root.deployments.primary`, and its dynamic label is materialized here.

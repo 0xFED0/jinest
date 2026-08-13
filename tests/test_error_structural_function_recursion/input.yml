@@ -1,0 +1,3 @@
+node(n)=:
+  child: "=$global_root.node(n - 1)"
+result: "=$global_root.node(1)"

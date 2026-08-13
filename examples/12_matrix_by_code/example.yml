@@ -9,6 +9,10 @@ server(ver,i)=:
 
 versions: ['3.10', '3.11', '3.12', '3.13', '3.14']
 
+# A regular text template equivalent to the text compose in example 13.
+version_labels@: >-
+  {% for v in versions %}[{{ v }}]{% endfor %}
+
 servers^: |
   % set r = []
   % for v in versions

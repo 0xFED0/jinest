@@ -68,10 +68,24 @@ calc:
   source_root_path@: "{{ root_of(origin).path }}"
   source_file_known$: source_file(origin) is not none
 
-  # Field declaration metadata is also available while evaluating expressions.
-  # keyname is logical, effective_key preserves the exact YAML key, keymode
-  # is the current field marker, and keypath points to this field.
+  # Declaration metadata is also available while evaluating expressions.
+  # keyname is logical, effective_key preserves the exact YAML key, keymode is
+  # the active evaluator/declaration marker, and keypath is path[keyname].
   field_key_context$: >-
     {'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode,
      'keypath': keypath}
   field_key_context_text@: "{{ keyname }}|{{ effective_key }}|{{ keymode }}|{{ keypath }}"
+
+  # Each stage sees its own mode. The inner @ writes its mode into the source
+  # string; the outer $ evaluates that string and observes its own $ mode.
+  layered_key_context$: '=@{"inner_mode": "{{ keymode }}", "outer_mode": keymode}'
+
+  # For a legacy mode-typed array item, path is the item destination while
+  # keypath remains the syntactic alias path[keyname].
+  array_key_context$:
+    - >-
+      {'path': path, 'keyname': keyname, 'keypath': keypath, 'keymode': keymode}
+
+  # A dynamic key has no final logical name/path while its expression runs.
+  =$"dynamic_" ~ ("unset" if keyname is none and keypath is none else "set"):
+    created after dynamic-key evaluation

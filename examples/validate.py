@@ -40,7 +40,7 @@ def main() -> int:
             name = example.parent.name
             output = temporary / f"{name}.yml"
 
-            if name == "08_python_api":
+            if name in {"06_imports", "08_python_api"}:
                 process = run([sys.executable, str(example.parent / "run.py")])
                 if process.returncode == 0:
                     output.write_text(process.stdout, encoding="utf-8")

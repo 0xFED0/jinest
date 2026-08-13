@@ -29,4 +29,13 @@ nodes:
   nested:
     value: 3.11
     path: global_root.nodes[1].nested
+mapping:
+  first: 1
+  second: 2
+mapping_keys:
+- first
+- second
+characters:
+- a
+- b
 

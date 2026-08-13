@@ -19,3 +19,12 @@ nodes[v=versions]=:
     nested:
       value$: v
       path$: path
+
+# Mapping and strings use ordinary Jinja for-in iteration semantics.
+mapping:
+  first: 1
+  second: 2
+mapping_keys[key=mapping]=:
+  - "=$key"
+characters[character="ab"]=:
+  - "=$character"

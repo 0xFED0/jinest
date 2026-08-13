@@ -2,6 +2,8 @@ literal$: native-looking literal key
 literal@: text-looking literal key
 literal^: script-looking literal key
 final`: one literal final backtick
+.raw: visible raw dot
+.dynamic: visible dynamic dot
 value: 4
 native: 8
 text: value=4

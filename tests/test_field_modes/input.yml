@@ -1,6 +1,8 @@
 # Four field modes and their local precedence.
 project: Jinest
 port: 8080
+numeric_passthrough$: 42
+boolean_passthrough^: true
 label@: "{{ project }} listens on {{ port }}"
 next_port$: "port + 1"
 settings^: |
