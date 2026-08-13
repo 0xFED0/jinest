@@ -88,7 +88,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.14.1"
+__version__ = "0.14.2"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
