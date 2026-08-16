@@ -151,8 +151,11 @@ jobs:
             echo "Installed jinest module was not found at $module." >&2
             exit 1
           fi
-          if [[ "$module" == "$GITHUB_WORKSPACE/"* ]]; then
-            echo "Resolved Jinest from the repository instead of the installed wheel: $module" >&2
+
+          venv_root="$(realpath "$GITHUB_WORKSPACE/.wheel-venv")"
+          module="$(realpath "$module")"
+          if [[ "$module" != "$venv_root/"* ]]; then
+            echo "Resolved Jinest outside the installed wheel environment: $module" >&2
             exit 1
           fi
 
