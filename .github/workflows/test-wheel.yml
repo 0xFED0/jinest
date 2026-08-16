@@ -1,0 +1,174 @@
+name: Test wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit to build and test when run_id is empty
+        required: false
+        default: main
+        type: string
+      run_id:
+        description: Existing Actions run ID containing one Jinest wheel artifact
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch, tag, or commit matching the wheel
+        required: false
+        type: string
+      run_id:
+        description: Existing Actions run ID containing one Jinest wheel artifact
+        required: false
+        type: string
+      artifact_name:
+        description: Existing wheel artifact in the current workflow run
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  resolve_existing:
+    name: Resolve existing artifact
+    if: ${{ inputs.run_id != '' }}
+    runs-on: ubuntu-latest
+    outputs:
+      head_sha: ${{ steps.artifact.outputs.head_sha }}
+      artifact_name: ${{ steps.artifact.outputs.artifact_name }}
+
+    steps:
+      - name: Find wheel artifact
+        id: artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          if [[ ! "$RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "run_id must be a numeric GitHub Actions run ID." >&2
+            exit 1
+          fi
+
+          head_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq '.head_sha')"
+          if [[ -z "$head_sha" || "$head_sha" == "null" ]]; then
+            echo "Could not resolve commit SHA for run $RUN_ID." >&2
+            exit 1
+          fi
+
+          mapfile -t artifacts < <(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.expired == false) | .name' |
+              grep -E '^jinest-.*\.whl$' || true
+          )
+          if (( ${#artifacts[@]} != 1 )); then
+            printf 'Expected exactly one non-expired Jinest wheel artifact in run %s, found: %s\n' \
+              "$RUN_ID" "${artifacts[*]:-none}" >&2
+            exit 1
+          fi
+
+          printf 'head_sha=%s\n' "$head_sha" >> "$GITHUB_OUTPUT"
+          printf 'artifact_name=%s\n' "${artifacts[0]}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build wheel
+    if: ${{ inputs.run_id == '' && inputs.artifact_name == '' }}
+    uses: ./.github/workflows/build-wheel.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+
+  test:
+    name: Python ${{ matrix.python-version }}
+    needs: [resolve_existing, build]
+    if: >-
+      ${{
+        always() &&
+        (
+          inputs.artifact_name != '' ||
+          needs.resolve_existing.result == 'success' ||
+          needs.build.result == 'success'
+        )
+      }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.run_id != '' && needs.resolve_existing.outputs.head_sha || inputs.ref || github.sha }}
+
+      - name: Download wheel from existing run
+        if: ${{ inputs.run_id != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.resolve_existing.outputs.artifact_name }}
+          path: dist
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: Download wheel from current run
+        if: ${{ inputs.run_id == '' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact_name || needs.build.outputs.artifact_name }}
+          path: dist
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install wheel into isolated environment
+        run: |
+          shopt -s nullglob
+          wheels=(dist/jinest-*.whl)
+          if (( ${#wheels[@]} != 1 )); then
+            printf 'Expected one downloaded Jinest wheel, found: %s\n' "${wheels[*]:-none}" >&2
+            exit 1
+          fi
+
+          python -m venv .wheel-venv
+          .wheel-venv/bin/python -m pip install --upgrade pip
+          .wheel-venv/bin/python -m pip install --no-cache-dir "${wheels[0]}"
+
+      - name: Locate installed Jinest module
+        id: installed
+        run: |
+          temp_dir="$(mktemp -d)"
+          module="$(
+            cd "$temp_dir"
+            "$GITHUB_WORKSPACE/.wheel-venv/bin/python" -I -c 'import jinest; print(jinest.__file__)'
+          )"
+          rm -rf "$temp_dir"
+
+          if [[ ! -f "$module" ]]; then
+            echo "Installed jinest module was not found at $module." >&2
+            exit 1
+          fi
+          if [[ "$module" == "$GITHUB_WORKSPACE/"* ]]; then
+            echo "Resolved Jinest from the repository instead of the installed wheel: $module" >&2
+            exit 1
+          fi
+
+          printf 'module=%s\n' "$module" >> "$GITHUB_OUTPUT"
+
+      - name: Run regression tests against installed wheel
+        env:
+          JINEST_MODULE: ${{ steps.installed.outputs.module }}
+        run: .wheel-venv/bin/python jinest.test.py
+
+      - name: Run regression tests with assertions disabled
+        env:
+          JINEST_MODULE: ${{ steps.installed.outputs.module }}
+        run: .wheel-venv/bin/python -O jinest.test.py
+
+      - name: Run portable CLI fixtures against installed command
+        env:
+          JINEST_CMD: ${{ github.workspace }}/.wheel-venv/bin/jinest
+        run: bash run_tests.sh
