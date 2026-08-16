@@ -297,12 +297,34 @@ class _SelfSpec:
 
 
 @dataclass(slots=True)
-class _MapSchema:
+class CompiledMapping:
+    """Syntax-only representation of one raw mapping source."""
+
     raw: Mapping[Any, Any]
     defaults: tuple[_LayerSpec, ...]
     overrides: tuple[_LayerSpec, ...]
     functions: tuple[_FunctionSpec, ...]
     composes: tuple[_ComposeSpec, ...]
+
+
+class SyntaxCompiler:
+    """Compile raw mappings once; destination-dependent keys stay unresolved."""
+
+    def __init__(self, resolver: "Resolver") -> None:
+        self._resolver = resolver
+        self._cache: dict[int, CompiledMapping] = {}
+
+    def compile(self, raw: Mapping[Any, Any]) -> CompiledMapping:
+        raw_id = id(raw)
+        cached = self._cache.get(raw_id)
+        if cached is not None and cached.raw is raw:
+            return cached
+        compiled = self._resolver._compile_mapping(raw)
+        self._cache[raw_id] = compiled
+        return compiled
+
+    def clear(self) -> None:
+        self._cache.clear()
 
 
 _FUNCTION_MODES = {"$": "native", "@": "text", "^": "script"}
@@ -1254,7 +1276,7 @@ class Resolver:
                 # objects whose custom deepcopy implementation fails; the
                 # scalar boundary below will still convert/reject them.
                 self.data = data
-        self._schema_cache: dict[int, _MapSchema] = {}
+        self._syntax = SyntaxCompiler(self)
         self._import_cache: dict[tuple[Path, str], Resolver] = {}
         self._source_view_cache: dict[_DocumentNodeId, _ContainerProxy] = {}
         self.source_path = Path(source_path).expanduser().resolve() if source_path else None
@@ -1550,7 +1572,7 @@ class Resolver:
             else:
                 self.data = result
 
-            self._schema_cache.clear()
+            self._syntax.clear()
             self._source_view_cache.clear()
             self._reset_root_views()
             return self.data
@@ -2264,11 +2286,10 @@ class Resolver:
                 raw=raw,
             )
 
-    def _schema(self, raw: Mapping[Any, Any]) -> _MapSchema:
-        raw_id = id(raw)
-        cached = self._schema_cache.get(raw_id)
-        if cached is not None and cached.raw is raw:
-            return cached
+    def _schema(self, raw: Mapping[Any, Any]) -> CompiledMapping:
+        return self._syntax.compile(raw)
+
+    def _compile_mapping(self, raw: Mapping[Any, Any]) -> CompiledMapping:
 
         defaults: list[_LayerSpec] = []
         overrides: list[_LayerSpec] = []
@@ -2348,10 +2369,9 @@ class Resolver:
 
         defaults.sort(key=lambda item: (item.order, item.position))
         overrides.sort(key=lambda item: (item.order, item.position))
-        schema = _MapSchema(
+        schema = CompiledMapping(
             raw, tuple(defaults), tuple(overrides), tuple(functions), tuple(composes)
         )
-        self._schema_cache[raw_id] = schema
         self._record_schema_messages(raw)
         return schema
 
