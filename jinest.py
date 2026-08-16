@@ -1251,8 +1251,92 @@ class _SequenceProxy(_ContainerProxy, Sequence):
         return len(source.raw)
 
 
+@dataclass(frozen=True, slots=True)
+class ResolverConfig:
+    """Validated immutable Resolver options shared by imported documents."""
+
+    in_place: bool
+    strict: bool
+    sandboxed: bool
+    globals: Mapping[str, Any]
+    filters: Mapping[str, Any]
+    source_path: Path | None
+    base_dir: Path
+    import_roots: tuple[Path, ...] | None
+    function_max_depth: int
+    emit_messages: bool
+    treat_warnings_as_errors: bool
+    debug: bool
+
+
+@dataclass(slots=True)
+class DiagnosticSink:
+    """Shared ordered diagnostics for one global resolution tree."""
+
+    messages: list[JinestMessage] = field(default_factory=list)
+    keys: set[tuple[Any, ...]] = field(default_factory=set)
+    emitted_count: int = 0
+
+    def add(self, message: JinestMessage, key: tuple[Any, ...]) -> bool:
+        if key in self.keys:
+            return False
+        self.keys.add(key)
+        self.messages.append(message)
+        return True
+
+
+@dataclass(slots=True)
+class DocumentStore:
+    """Import-document cache scoped to one resolver and its import chain."""
+
+    cache: dict[tuple[Path, str], "Resolver"] = field(default_factory=dict)
+
+    def get(self, path: Path, format: str) -> "Resolver | None":
+        return self.cache.get((path, format))
+
+    def put(self, path: Path, format: str, resolver: "Resolver") -> None:
+        self.cache[(path, format)] = resolver
+
+
+@dataclass(slots=True)
+class Materializer:
+    """Plain-value materialization boundary for one Resolver."""
+
+    resolver: "Resolver"
+
+    def materialize(self, value: Any) -> Any:
+        return self.resolver._to_plain(value, active=set())
+
+
+@dataclass(slots=True)
+class JinjaBridge:
+    """Jinja environments and compiled-artifact cache for one Resolver."""
+
+    environment: Any
+    script_environment: Any
+    compilation_cache: dict[tuple[_DeclarationId, EvaluatorKind, str], Any] = field(
+        default_factory=dict
+    )
+
+
+class SerializationCodecs:
+    """Input/output codec boundary used by the public helper functions."""
+
+    @staticmethod
+    def parse(text: str, format: str) -> Any:
+        return _parse_text(text, format)
+
+    @staticmethod
+    def serialize(value: Any, format: str) -> str:
+        return _serialize(value, format)
+
+
 class Resolver:
-    """Resolve a structured Python tree containing lazy Jinja fields."""
+    """Resolve a structured Python tree containing lazy Jinja fields.
+
+    Instances are stateful and not reentrant or thread-safe. Use one Resolver
+    per concurrent resolution; immutable ResolverConfig values may be reused.
+    """
 
     def __init__(
         self,
@@ -1294,13 +1378,12 @@ class Resolver:
         # source occurrence. Source/binding semantics never consult this map.
         self._physical_source_fallbacks: dict[int, _Source] = {}
         if self._global_owner is self:
-            self.messages: list[JinestMessage] = []
-            self._message_keys: set[tuple[str, str]] = set()
-            self._emitted_message_count = 0
+            self._diagnostics = DiagnosticSink()
         else:
-            self.messages = self._global_owner.messages
-            self._message_keys = self._global_owner._message_keys
+            self._diagnostics = self._global_owner._diagnostics
             self._physical_source_fallbacks = self._global_owner._physical_source_fallbacks
+        self.messages = self._diagnostics.messages
+        self._message_keys = self._diagnostics.keys
         self._function_depth = 0
         self._function_stack: list[str] = []
         self._user_globals = dict(globals or {})
@@ -1319,10 +1402,9 @@ class Resolver:
                 self.data = data
         self._syntax = SyntaxCompiler(self)
         self._evaluators = EvaluatorRegistry()
-        self._jinja_compilation_cache: dict[
-            tuple[_DeclarationId, EvaluatorKind, str], Any
-        ] = {}
-        self._import_cache: dict[tuple[Path, str], Resolver] = {}
+        self._documents = DocumentStore()
+        self._import_cache = self._documents.cache
+        self._materializer = Materializer(self)
         self._source_view_cache: dict[_DocumentNodeId, _ContainerProxy] = {}
         self.source_path = Path(source_path).expanduser().resolve() if source_path else None
         if base_dir is not None:
@@ -1343,6 +1425,12 @@ class Resolver:
                     raise ValueError(f"Import root is not a directory: {root}")
             self.import_roots = roots
 
+        self.config = ResolverConfig(
+            in_place, strict, sandboxed, self._user_globals, self._user_filters,
+            self.source_path, self.base_dir, self.import_roots, function_max_depth,
+            emit_messages, treat_warnings_as_errors, debug,
+        )
+
         if _import_chain is not None:
             self._import_chain = _import_chain
         elif self.source_path is not None:
@@ -1360,6 +1448,8 @@ class Resolver:
         )
         self.environment.context_class = _JinestContext
         self.script_environment.context_class = _JinestContext
+        self._jinja = JinjaBridge(self.environment, self.script_environment)
+        self._jinja_compilation_cache = self._jinja.compilation_cache
 
         import_yaml_fn = lambda path: self._import_tree(path, "yaml")
         import_json_fn = lambda path: self._import_tree(path, "json")
@@ -1493,11 +1583,10 @@ class Resolver:
         if level not in {"warning", "hint"}:
             raise ValueError(f"Unsupported message level: {level!r}")
         key = dedupe_key or (level, msg)
-        if key in self._message_keys:
-            return
         message_path, message_file = self._source_location(source, raw, path)
-        self._message_keys.add(key)
-        self.messages.append(JinestMessage(level, msg, message_path, message_file))
+        self._diagnostics.add(
+            JinestMessage(level, msg, message_path, message_file), key
+        )
 
     def _debug_lines(self, *, path: str | None, file: str | None) -> list[str]:
         if not self.debug:
@@ -1532,14 +1621,14 @@ class Resolver:
         """Print newly collected diagnostics, if stderr output is enabled."""
         owner = self._global_owner
         if not owner.emit_messages:
-            owner._emitted_message_count = len(owner.messages)
+            owner._diagnostics.emitted_count = len(owner.messages)
             return
-        pending = owner.messages[owner._emitted_message_count:]
+        pending = owner.messages[owner._diagnostics.emitted_count:]
         for message in pending:
             print(f"jinest: {message.level}: {message.msg}", file=sys.stderr)
             for line in owner._debug_lines(path=message.path, file=message.file):
                 print(line, file=sys.stderr)
-        owner._emitted_message_count = len(owner.messages)
+        owner._diagnostics.emitted_count = len(owner.messages)
 
     def _finalize_messages(self) -> None:
         """Apply warning policy and emit diagnostics after successful resolution."""
@@ -1593,7 +1682,7 @@ class Resolver:
     def resolve(self) -> Any:
         """Fully materialize the lazy tree into ordinary Python values."""
         try:
-            result = self._to_plain(self.root, active=set())
+            result = self._materializer.materialize(self.root)
         except Exception as exc:
             # Diagnostics discovered before a rendering error are still useful
             # to API callers and CLI users.
@@ -3759,8 +3848,7 @@ class Resolver:
         if path in self._import_chain:
             return None
 
-        cache_key = (path, format)
-        cached = self._import_cache.get(cache_key)
+        cached = self._documents.get(path, format)
         if cached is not None:
             return cached.root
 
@@ -3793,7 +3881,7 @@ class Resolver:
             _import_chain=self._import_chain + (path,),
             _global_owner=self._global_owner,
         )
-        self._import_cache[cache_key] = child
+        self._documents.put(path, format, child)
         return child.root
 
     # ------------------------------------------------------------------
@@ -3978,15 +4066,10 @@ def resolve_text(
     source_format = format.lower()
     target_format = (output_format or source_format).lower()
 
-    if source_format == "json":
-        data = json.loads(text)
-    elif source_format in {"yaml", "yml"}:
-        data = _import_yaml_module().safe_load(text)
-    else:
-        raise ValueError(f"Unsupported input format: {format!r}")
+    data = SerializationCodecs.parse(text, source_format)
 
     result = Resolver(data, **resolver_options).resolve()
-    return _serialize(result, target_format)
+    return SerializationCodecs.serialize(result, target_format)
 
 
 def resolve_file(
@@ -3999,13 +4082,13 @@ def resolve_file(
     """Resolve a .json/.yaml/.yml file and optionally write the result."""
     input_path = Path(path).expanduser().resolve()
     source_format = _format_from_path(input_path)
-    data = _parse_text(input_path.read_text(encoding="utf-8"), source_format)
+    data = SerializationCodecs.parse(input_path.read_text(encoding="utf-8"), source_format)
 
     # The source path is essential for relative imports.
     resolver_options.setdefault("source_path", input_path)
     result = Resolver(data, **resolver_options).resolve()
     target_format = (output_format or source_format).lower()
-    rendered = _serialize(result, target_format)
+    rendered = SerializationCodecs.serialize(result, target_format)
 
     if output is not None:
         Path(output).write_text(
