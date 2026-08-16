@@ -1,0 +1,110 @@
+name: Publish PyPI release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: GitHub release tag to publish to PyPI
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish release wheel to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/jinest
+
+    steps:
+      - name: Download wheel from GitHub release
+        id: wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          if [[ "$(jq -r '.draft' <<< "$release_json")" == "true" ]]; then
+            echo "Release $TAG is still a draft." >&2
+            exit 1
+          fi
+
+          mkdir -p dist
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'jinest-*.whl' \
+            --dir dist
+
+          shopt -s nullglob
+          wheels=(dist/jinest-*.whl)
+          if (( ${#wheels[@]} != 1 )); then
+            printf 'Expected exactly one Jinest wheel in release %s, found: %s\n' \
+              "$TAG" "${wheels[*]:-none}" >&2
+            exit 1
+          fi
+
+          printf 'path=%s\n' "${wheels[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Verify wheel metadata matches release tag
+        env:
+          TAG: ${{ inputs.release_tag }}
+          WHEEL: ${{ steps.wheel.outputs.path }}
+        run: |
+          python - <<'PY'
+          import os
+          from email.parser import Parser
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          tag = os.environ["TAG"]
+          expected_version = tag[1:] if tag.startswith("v") else tag
+          wheel = Path(os.environ["WHEEL"])
+
+          with ZipFile(wheel) as archive:
+              metadata_files = [
+                  name
+                  for name in archive.namelist()
+                  if name.endswith(".dist-info/METADATA")
+              ]
+              if len(metadata_files) != 1:
+                  raise SystemExit(
+                      f"Expected one METADATA file in {wheel.name}, "
+                      f"found {len(metadata_files)}"
+                  )
+              metadata = Parser().parsestr(
+                  archive.read(metadata_files[0]).decode("utf-8")
+              )
+
+          if metadata.get("Name", "").lower() != "jinest":
+              raise SystemExit(
+                  f"Wheel project name is {metadata.get('Name')!r}, expected 'jinest'"
+              )
+          if metadata.get("Version") != expected_version:
+              raise SystemExit(
+                  f"Wheel version {metadata.get('Version')!r} does not match "
+                  f"release tag {tag!r}"
+              )
+
+          print(f"Verified {wheel.name}: jinest {expected_version}")
+          PY
+
+      - name: Publish wheel to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

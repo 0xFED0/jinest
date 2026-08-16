@@ -32,53 +32,34 @@ jobs:
         id: revision
         run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-  build_wheel:
+  test:
+    name: Test source
     needs: resolve_ref
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: ${{ needs.resolve_ref.outputs.sha }}
+
+  build_wheel:
+    name: Build wheel
+    needs: [resolve_ref, test]
     uses: ./.github/workflows/build-wheel.yml
     with:
       ref: ${{ needs.resolve_ref.outputs.sha }}
 
-  test:
+  test_wheel:
+    name: Test wheel
     needs: [resolve_ref, build_wheel]
-    name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
-
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.resolve_ref.outputs.sha }}
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: requirements.txt
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-
-      - name: Run Python regression tests
-        run: python jinest.test.py
-
-      - name: Run Python regression tests with assertions disabled
-        run: python -O jinest.test.py
-
-      - name: Run portable CLI fixtures
-        run: bash run_tests.sh
-
-      - name: Validate documented examples
-        run: python examples/validate.py
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/test-wheel.yml
+    with:
+      ref: ${{ needs.resolve_ref.outputs.sha }}
+      artifact_name: ${{ needs.build_wheel.outputs.artifact_name }}
 
   release:
     name: Create GitHub release
-    needs: [resolve_ref, build_wheel, test]
+    needs: [resolve_ref, build_wheel, test_wheel]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -180,7 +161,7 @@ jobs:
             git push origin "refs/tags/$TAG"
           fi
 
-      - name: Download built wheel
+      - name: Download tested wheel
         uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build_wheel.outputs.artifact_name }}
