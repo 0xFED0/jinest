@@ -1,0 +1,10 @@
+prototype:
+  origin_path: root.prototype
+  destination_path: global_root.prototype
+left:
+  origin_path: root.prototype
+  destination_path: global_root.left
+right:
+  origin_path: root.prototype
+  destination_path: global_root.right
+

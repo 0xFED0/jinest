@@ -2169,5 +2169,159 @@ class JinestScriptEdgeTests(unittest.TestCase):
         self.assertEqual(json.loads(rendered)["target"], {"x": 1, "y": 2})
 
 
+class JinestBindingAndCycleContractTests(unittest.TestCase):
+    """Public contracts for binding identity and finite cycle handling."""
+
+    def test_one_physical_mapping_has_a_source_view_per_source_path(self) -> None:
+        shared = {"origin_path$": "origin.path", "destination_path$": "path"}
+
+        result = jinest.resolve({"left": shared, "right": shared}, emit_messages=False)
+
+        self.assertEqual(
+            result,
+            {
+                "left": {
+                    "origin_path": "root.left",
+                    "destination_path": "global_root.left",
+                },
+                "right": {
+                    "origin_path": "root.right",
+                    "destination_path": "global_root.right",
+                },
+            },
+        )
+
+    def test_source_identity_and_destination_binding_are_distinct(self) -> None:
+        result = jinest.resolve(
+            {
+                "prototype": {
+                    "origin_path$": "origin.path",
+                    "destination_path$": "path",
+                },
+                "target$": "root.prototype",
+            },
+            emit_messages=False,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "prototype": {
+                    "origin_path": "root.prototype",
+                    "destination_path": "global_root.prototype",
+                },
+                "target": {
+                    "origin_path": "root.prototype",
+                    "destination_path": "global_root.target",
+                },
+            },
+        )
+
+    def test_repeated_attachment_has_independent_binding_caches(self) -> None:
+        calls: list[None] = []
+
+        def tick() -> int:
+            calls.append(None)
+            return len(calls)
+
+        result = jinest.resolve(
+            {
+                ".prototype": {"path$": "path", "sequence$": "tick()"},
+                "left$": "root.prototype",
+                "right$": "root.prototype",
+            },
+            globals={"tick": tick},
+            emit_messages=False,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "left": {"path": "global_root.left", "sequence": 1},
+                "right": {"path": "global_root.right", "sequence": 2},
+            },
+        )
+        self.assertEqual(len(calls), 2)
+
+    def test_physical_python_container_cycle_is_an_error(self) -> None:
+        source: dict[str, Any] = {}
+        source["self"] = source
+
+        with self.assertRaisesRegex(jinest.JinestError, "Cyclic container reference"):
+            jinest.resolve(source, emit_messages=False)
+
+    def test_field_and_merge_cycle_contracts(self) -> None:
+        self.assertEqual(
+            jinest.resolve({"a$": "b", "b$": "a"}, emit_messages=False),
+            {"a": None, "b": None},
+        )
+        self.assertEqual(
+            jinest.resolve(
+                {"target": {"<<$": "root.target", "retained": True}},
+                emit_messages=False,
+            ),
+            {"target": {"retained": True}},
+        )
+
+    def test_import_cycle_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            (folder / "a.json").write_text(
+                '{"other$": "import(\'b.json\')"}', encoding="utf-8"
+            )
+            (folder / "b.json").write_text(
+                '{"back$": "import(\'a.json\')"}', encoding="utf-8"
+            )
+
+            rendered = jinest.resolve_file(
+                folder / "a.json", output_format="json", emit_messages=False
+            )
+
+        self.assertEqual(json.loads(rendered), {"other": {"back": None}})
+
+    def test_scalar_function_recursion_obeys_the_depth_limit(self) -> None:
+        resolver = jinest.Resolver(
+            {"loop()$": "loop()", "result$": "loop()"},
+            function_max_depth=4,
+            emit_messages=False,
+        )
+
+        with self.assertRaisesRegex(jinest.JinestFunctionError, "recursion limit"):
+            resolver.resolve()
+
+    def test_recursive_rebinding_through_an_ancestor_fails_finitely(self) -> None:
+        with self.assertRaisesRegex(jinest.JinestError, "Cyclic container reference"):
+            jinest.resolve({"node": {"again$": "context"}}, emit_messages=False)
+
+    @unittest.skipIf(sys.flags.optimize, "the optimized child process is tested once")
+    def test_public_resolution_works_under_python_optimized_mode(self) -> None:
+        script = "\n".join(
+            [
+                "import importlib.util",
+                "import sys",
+                f"module_path = {str(JINEST_MODULE_PATH)!r}",
+                "spec = importlib.util.spec_from_file_location('jinest_optimized_smoke', module_path)",
+                "module = importlib.util.module_from_spec(spec)",
+                "sys.modules[spec.name] = module",
+                "spec.loader.exec_module(module)",
+                "assert module.resolve({'value$': '40 + 2'}, emit_messages=False) == {'value': 42}",
+            ]
+        )
+        completed = subprocess.run(
+            [sys.executable, "-O", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_runtime_jinja_meets_the_minimum_requirement(self) -> None:
+        import jinja2
+
+        version = tuple(int(part) for part in jinja2.__version__.split(".")[:2])
+        self.assertGreaterEqual(version, (3, 1))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

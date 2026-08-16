@@ -1,0 +1,3 @@
+# Rebinding an ancestor cannot produce a finite materialized tree.
+node:
+  again$: context

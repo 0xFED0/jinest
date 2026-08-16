@@ -1,0 +1,7 @@
+# One declaration keeps its source location while each attachment gets a new
+# destination binding and destination path.
+prototype:
+  origin_path$: origin.path
+  destination_path$: path
+left$: root.prototype
+right$: root.prototype

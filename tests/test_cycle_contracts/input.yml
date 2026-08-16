@@ -1,0 +1,8 @@
+# The established neutral values for active field, layer, and import cycles.
+fields:
+  a$: b
+  b$: a
+layer:
+  <<$: root.layer
+  retained: true
+imported$: import('import-a.yml')
