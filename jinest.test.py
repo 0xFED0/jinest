@@ -85,7 +85,7 @@ class JinestTestSuiteContractTests(unittest.TestCase):
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.14.3")
+        self.assertEqual(jinest.__version__, "0.14.4")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -1386,6 +1386,177 @@ class JinestComposeTests(unittest.TestCase):
                 "from_mapping": ["left", "right"],
             },
         )
+
+    def test_compose_iteration_metadata(self) -> None:
+        result = jinest.resolve(
+            {
+                "versions": ["a", "b"],
+                "dirs": ["x", "y"],
+                "items[v=versions, d=dirs]=": [
+                    {
+                        "value@": "{{ v }}/{{ d }}",
+                        "axis_index$": "axis.v.index",
+                        "axis_index0$": "axis.d.index0",
+                        "axis_length$": "axis.v.length",
+                        "axis_first$": "axis.d.first",
+                        "axis_last$": "axis.v.last",
+                        "product_index$": "axes.index",
+                        "product_index0$": "axes.index0",
+                        "product_length$": "axes.length",
+                        "product_first$": "axes.first",
+                        "product_last$": "axes.last",
+                        "nested": {
+                            "position@": "{{ axis.v.index }}/{{ axes.index }}"
+                        },
+                    }
+                ],
+                "by_key[v=versions, d=dirs]=": {
+                    "=$v ~ '-' ~ d": "=$axes.index ~ ':' ~ axis.v.index"
+                },
+                "text[v=versions, d=dirs]@": (
+                    "{{ v }}{{ d }}:"
+                    "{{ axis.v.index }}/{{ axis.d.index }}:"
+                    "{{ axes.index }}/{{ axes.index0 }};"
+                ),
+                "empty": [],
+                "empty_items[v=empty]=": ["=$axes.length"],
+                "empty_text[v=empty]@": "{{ axes.length }}",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result["items"],
+            [
+                {
+                    "value": "a/x",
+                    "axis_index": 1,
+                    "axis_index0": 0,
+                    "axis_length": 2,
+                    "axis_first": True,
+                    "axis_last": False,
+                    "product_index": 1,
+                    "product_index0": 0,
+                    "product_length": 4,
+                    "product_first": True,
+                    "product_last": False,
+                    "nested": {"position": "1/1"},
+                },
+                {
+                    "value": "a/y",
+                    "axis_index": 1,
+                    "axis_index0": 1,
+                    "axis_length": 2,
+                    "axis_first": False,
+                    "axis_last": False,
+                    "product_index": 2,
+                    "product_index0": 1,
+                    "product_length": 4,
+                    "product_first": False,
+                    "product_last": False,
+                    "nested": {"position": "1/2"},
+                },
+                {
+                    "value": "b/x",
+                    "axis_index": 2,
+                    "axis_index0": 0,
+                    "axis_length": 2,
+                    "axis_first": True,
+                    "axis_last": True,
+                    "product_index": 3,
+                    "product_index0": 2,
+                    "product_length": 4,
+                    "product_first": False,
+                    "product_last": False,
+                    "nested": {"position": "2/3"},
+                },
+                {
+                    "value": "b/y",
+                    "axis_index": 2,
+                    "axis_index0": 1,
+                    "axis_length": 2,
+                    "axis_first": False,
+                    "axis_last": True,
+                    "product_index": 4,
+                    "product_index0": 3,
+                    "product_length": 4,
+                    "product_first": False,
+                    "product_last": True,
+                    "nested": {"position": "2/4"},
+                },
+            ],
+        )
+        self.assertEqual(
+            result["by_key"],
+            {"a-x": "1:1", "a-y": "2:1", "b-x": "3:2", "b-y": "4:2"},
+        )
+        self.assertEqual(
+            result["text"],
+            "ax:1/1:1/0;ay:1/2:2/1;bx:2/1:3/2;by:2/2:4/3;",
+        )
+        self.assertEqual(result["empty_items"], [])
+        self.assertEqual(result["empty_text"], "")
+
+    def test_compose_axis_names_can_be_index_and_length(self) -> None:
+        result = jinest.resolve(
+            {
+                "indexes": [10, 20],
+                "lengths": ["short", "long"],
+                "items[index=indexes, length=lengths]=": [
+                    {
+                        "value$": "index",
+                        "local_index$": "axis.index.index",
+                        "local_index0$": "axis.index.index0",
+                        "local_length$": "axis.length.length",
+                        "global_index$": "axes.index",
+                        "global_index0$": "axes.index0",
+                    }
+                ],
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result["items"],
+            [
+                {
+                    "value": 10,
+                    "local_index": 1,
+                    "local_index0": 0,
+                    "local_length": 2,
+                    "global_index": 1,
+                    "global_index0": 0,
+                },
+                {
+                    "value": 10,
+                    "local_index": 1,
+                    "local_index0": 0,
+                    "local_length": 2,
+                    "global_index": 2,
+                    "global_index0": 1,
+                },
+                {
+                    "value": 20,
+                    "local_index": 2,
+                    "local_index0": 1,
+                    "local_length": 2,
+                    "global_index": 3,
+                    "global_index0": 2,
+                },
+                {
+                    "value": 20,
+                    "local_index": 2,
+                    "local_index0": 1,
+                    "local_length": 2,
+                    "global_index": 4,
+                    "global_index0": 3,
+                },
+            ],
+        )
+
+    def test_compose_rejects_reserved_axis_names(self) -> None:
+        for name in ("axis", "axes"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(jinest.JinestError, "is reserved"):
+                    jinest.Resolver({f"bad[{name}=items]=": []})
 
     def test_compose_errors(self) -> None:
         with self.assertRaisesRegex(jinest.JinestError, "must resolve to an iterable"):

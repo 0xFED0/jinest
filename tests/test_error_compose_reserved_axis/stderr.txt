@@ -1,0 +1,1 @@
+jinest: Compose axis name 'axis' in 'bad[axis=items]=' is reserved; use another name (axis and axes are service locals)

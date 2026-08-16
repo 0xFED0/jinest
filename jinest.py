@@ -90,7 +90,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.14.3"
+__version__ = "0.14.4"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -310,6 +310,49 @@ class _ComposeSpec:
     template: Any
     mode: EvaluatorKind
     axes: tuple[_ComposeAxis, ...]
+
+
+def _compose_local_frame(
+    inherited_locals: Mapping[str, Any] | None,
+    spec: _ComposeSpec,
+    axis_values: Sequence[Sequence[Any]],
+    indexes: tuple[int, ...],
+    combination_index0: int,
+    combination_length: int,
+) -> dict[str, Any]:
+    """Build one compose frame, including immutable iteration metadata."""
+    frame = dict(inherited_locals or {})
+    values = tuple(
+        axis_values[axis_index][position]
+        for axis_index, position in enumerate(indexes)
+    )
+    frame.update(
+        {axis.name: value for axis, value in zip(spec.axes, values)}
+    )
+
+    axis_metadata: dict[str, Mapping[str, Any]] = {}
+    for axis, source_values, index in zip(spec.axes, axis_values, indexes):
+        length = len(source_values)
+        axis_metadata[axis.name] = MappingProxyType(
+            {
+                "index": index + 1,
+                "index0": index,
+                "length": length,
+                "first": index == 0,
+                "last": index == length - 1,
+            }
+        )
+    frame["axis"] = MappingProxyType(axis_metadata)
+    frame["axes"] = MappingProxyType(
+        {
+            "index": combination_index0 + 1,
+            "index0": combination_index0,
+            "length": combination_length,
+            "first": combination_index0 == 0,
+            "last": combination_index0 == combination_length - 1,
+        }
+    )
+    return frame
 
 
 @dataclass(frozen=True, slots=True)
@@ -635,6 +678,11 @@ def _parse_compose_declaration(
         )
     axes: list[_ComposeAxis] = []
     for argument, default_node in zip(arguments.args, arguments.defaults):
+        if argument.arg in {"axis", "axes"}:
+            raise JinestError(
+                f"Compose axis name {argument.arg!r} in {key!r} is reserved; "
+                "use another name (axis and axes are service locals)"
+            )
         axis_source = ast.get_source_segment(source, default_node)
         if axis_source is None:
             raise JinestError(
@@ -2943,12 +2991,22 @@ class Resolver:
         ) + (destination_key,)
         path_kind = object.__getattribute__(destination_parent, "_jinest_path_kind")
 
+        combination_length = 1
+        for values in axis_values:
+            combination_length *= len(values)
+
         if spec.mode == "text":
             parts: list[str] = []
-            for values in product(*axis_values):
-                frame = dict(inherited_locals or {})
-                frame.update(
-                    {axis.name: value for axis, value in zip(spec.axes, values)}
+            for combination_index0, indexes in enumerate(
+                product(*(range(len(values)) for values in axis_values))
+            ):
+                frame = _compose_local_frame(
+                    inherited_locals,
+                    spec,
+                    axis_values,
+                    indexes,
+                    combination_index0,
+                    combination_length,
                 )
                 parts.append(
                     self._render(
@@ -2974,9 +3032,17 @@ class Resolver:
             seen = set()
             structural_kind = "list"
 
-        for values in product(*axis_values):
-            frame = dict(inherited_locals or {})
-            frame.update({axis.name: value for axis, value in zip(spec.axes, values)})
+        for combination_index0, indexes in enumerate(
+            product(*(range(len(values)) for values in axis_values))
+        ):
+            frame = _compose_local_frame(
+                inherited_locals,
+                spec,
+                axis_values,
+                indexes,
+                combination_index0,
+                combination_length,
+            )
             body = self._wrap(
                 spec.template,
                 parent=destination_parent,

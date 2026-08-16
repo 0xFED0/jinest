@@ -1,0 +1,119 @@
+versions:
+- a
+- b
+dirs:
+- x
+- y
+indexes:
+- 10
+- 20
+lengths:
+- short
+- long
+empty: []
+items:
+- value: a/x
+  vi: 1
+  vi0: 0
+  vl: 2
+  vf: true
+  vlast: false
+  di: 1
+  di0: 0
+  dl: 2
+  df: true
+  dlast: false
+  i: 1
+  i0: 0
+  n: 4
+  f: true
+  l: false
+  nested:
+    position: 1/1/1
+- value: a/y
+  vi: 1
+  vi0: 0
+  vl: 2
+  vf: true
+  vlast: false
+  di: 2
+  di0: 1
+  dl: 2
+  df: false
+  dlast: true
+  i: 2
+  i0: 1
+  n: 4
+  f: false
+  l: false
+  nested:
+    position: 1/2/2
+- value: b/x
+  vi: 2
+  vi0: 1
+  vl: 2
+  vf: false
+  vlast: true
+  di: 1
+  di0: 0
+  dl: 2
+  df: true
+  dlast: false
+  i: 3
+  i0: 2
+  n: 4
+  f: false
+  l: false
+  nested:
+    position: 2/1/3
+- value: b/y
+  vi: 2
+  vi0: 1
+  vl: 2
+  vf: false
+  vlast: true
+  di: 2
+  di0: 1
+  dl: 2
+  df: false
+  dlast: true
+  i: 4
+  i0: 3
+  n: 4
+  f: false
+  l: true
+  nested:
+    position: 2/2/4
+by_key:
+  a-x: '1:1'
+  a-y: '2:1'
+  b-x: '3:2'
+  b-y: '4:2'
+by_name:
+- value: 10
+  local_index: 1
+  local_index0: 0
+  local_length: 2
+  global_index: 1
+  global_index0: 0
+- value: 10
+  local_index: 1
+  local_index0: 0
+  local_length: 2
+  global_index: 2
+  global_index0: 1
+- value: 20
+  local_index: 2
+  local_index0: 1
+  local_length: 2
+  global_index: 3
+  global_index0: 2
+- value: 20
+  local_index: 2
+  local_index0: 1
+  local_length: 2
+  global_index: 4
+  global_index0: 3
+text: a/x#1/1#1/0;a/y#1/2#2/1;b/x#2/1#3/2;b/y#2/2#4/3;
+empty_items: []
+empty_text: ''

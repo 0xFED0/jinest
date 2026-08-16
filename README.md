@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.14.3` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.14.4` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -225,7 +225,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.14.3
+  version: 0.14.4
   label@: "{{ product }} v{{ version }}"
 ```
 
@@ -520,6 +520,16 @@ Mapping bodies support dynamic keys and reject duplicate final keys. Every
 generated structural node is freshly rebound at its emitted destination.
 Compose declarations are not callable helpers; only their final logical name
 is emitted.
+
+Each compose body also receives read-only iteration metadata through the service
+locals `axis` and `axes`. `axis.<name>` describes one axis with `index`
+(1-based), `index0` (0-based), `length`, `first`, and `last`; `axes` exposes
+the same fields for the flattened Cartesian product. For example,
+`axis.v.index` is the current position in the `v` axis and `axes.index` is
+the overall combination number. These locals are inherited by nested body
+nodes, are not materialized as output fields, and the axis names `axis` and
+`axes` are reserved. Other names such as `index` and `length` remain valid
+axis names and can be accessed through `axis.index` and `axis.length`.
 
 ## Self-declaration wrappers
 
@@ -970,7 +980,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The suite contains 135 Python regression tests and 40 implementation-neutral
+The suite contains 138 Python regression tests and 42 implementation-neutral
 portable CLI fixtures.
 
 ## Security

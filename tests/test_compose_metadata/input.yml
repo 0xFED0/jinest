@@ -1,0 +1,44 @@
+# Compose metadata is available in every structural body binding.
+versions: [a, b]
+dirs: [x, y]
+indexes: [10, 20]
+lengths: [short, long]
+empty: []
+
+items[v=versions, d=dirs]=:
+  - value@: '{{v}}/{{d}}'
+    vi$: axis.v.index
+    vi0$: axis.v.index0
+    vl$: axis.v.length
+    vf$: axis.v.first
+    vlast$: axis.v.last
+    di$: axis.d.index
+    di0$: axis.d.index0
+    dl$: axis.d.length
+    df$: axis.d.first
+    dlast$: axis.d.last
+    i$: axes.index
+    i0$: axes.index0
+    n$: axes.length
+    f$: axes.first
+    l$: axes.last
+    nested:
+      position@: '{{axis.v.index}}/{{axis.d.index}}/{{axes.index}}'
+
+# Structural mapping bodies also receive the same metadata frame.
+by_key[v=versions, d=dirs]=:
+  "=$v ~ '-' ~ d": "=$axes.index ~ ':' ~ axis.v.index"
+
+# Axis names that look like metadata fields remain ordinary axis locals.
+by_name[index=indexes, length=lengths]=:
+  - value$: index
+    local_index$: axis.index.index
+    local_index0$: axis.index.index0
+    local_length$: axis.length.length
+    global_index$: axes.index
+    global_index0$: axes.index0
+
+text[v=versions, d=dirs]@: '{{v}}/{{d}}#{{axis.v.index}}/{{axis.d.index}}#{{axes.index}}/{{axes.index0}};'
+empty_items[v=empty]=:
+  - =$axes.length
+empty_text[v=empty]@: '{{axes.length}}/{{axes.first}}/{{axes.last}}'
