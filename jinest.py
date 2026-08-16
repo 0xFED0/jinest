@@ -60,7 +60,7 @@ import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from itertools import product
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, time
 from pathlib import Path
 from typing import Any, Iterator, MutableMapping, MutableSequence
@@ -184,6 +184,60 @@ class _Source:
     resolver: "Resolver"
     raw: Any
     source_path: tuple[Any, ...] = ()
+
+    @property
+    def identity(self) -> "_DocumentNodeId":
+        return _DocumentNodeId(id(self.resolver), self.source_path)
+
+
+@dataclass(frozen=True, slots=True)
+class _DocumentNodeId:
+    """Identity of one source-node occurrence, independent of raw aliases."""
+
+    resolver_id: int
+    source_path: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DeclarationId:
+    """Identity of one declaration in a source node."""
+
+    node: _DocumentNodeId
+    source_key: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _BindingId:
+    """Identity of one destination attachment."""
+
+    resolver_id: int
+    serial: int
+
+
+@dataclass(slots=True)
+class _EvaluationFrame:
+    local_vars: Mapping[str, Any] | None = None
+    function_scope: "_ContainerProxy | None" = None
+    function_origin_source: _Source | None = None
+    function_body_source_path: tuple[Any, ...] | None = None
+
+
+@dataclass(slots=True)
+class _BindingCache:
+    children: dict[Any, tuple[Any, Any]] = field(default_factory=dict)
+    resolved: dict[Any, Any] = field(default_factory=dict)
+    public_resolved: dict[Any, Any] = field(default_factory=dict)
+    layers: dict[_DeclarationId, _Source | None] = field(default_factory=dict)
+    key_indexes: dict[_DocumentNodeId, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _Binding:
+    """Destination state and mutable caches for one bound source node."""
+
+    identity: _BindingId
+    frame: _EvaluationFrame
+    cache: _BindingCache = field(default_factory=_BindingCache)
 
 
 @dataclass(frozen=True, slots=True)
@@ -824,9 +878,9 @@ class _ContainerProxy:
         "_jinest_children",
         "_jinest_local_vars",
         "_jinest_function_scope",
-        "_jinest_function_context_path",
         "_jinest_function_origin_source",
         "_jinest_function_body_source_path",
+        "_jinest_binding",
     )
 
     def __init__(
@@ -838,7 +892,6 @@ class _ContainerProxy:
         path_kind: str = "global",
         local_vars: Mapping[str, Any] | None = None,
         function_scope: "_ContainerProxy | None" = None,
-        function_context_path: tuple[Any, ...] | None = None,
         function_origin_source: _Source | None = None,
         function_body_source_path: tuple[Any, ...] | None = None,
     ) -> None:
@@ -852,11 +905,6 @@ class _ContainerProxy:
         object.__setattr__(self, "_jinest_function_scope", function_scope)
         object.__setattr__(
             self,
-            "_jinest_function_context_path",
-            function_context_path,
-        )
-        object.__setattr__(
-            self,
             "_jinest_function_origin_source",
             function_origin_source,
         )
@@ -865,6 +913,17 @@ class _ContainerProxy:
             "_jinest_function_body_source_path",
             function_body_source_path,
         )
+        frame = _EvaluationFrame(
+            local_vars,
+            function_scope,
+            function_origin_source,
+            function_body_source_path,
+        )
+        binding = owner._new_binding(frame)
+        object.__setattr__(self, "_jinest_binding", binding)
+        # Keep legacy proxy attributes as aliases while moving their ownership
+        # to BindingCache. This makes the migration behavior-preserving.
+        object.__setattr__(self, "_jinest_children", binding.cache.children)
 
     def __getattribute__(self, name: str) -> Any:
         if name == "_":
@@ -882,7 +941,7 @@ class _ContainerProxy:
                 owner,
                 root,
                 kind,
-                owner._function_context_path(self),
+                object.__getattribute__(self, "_jinest_path"),
             )
         if name == "source_path":
             source = object.__getattribute__(self, "_jinest_source")
@@ -934,7 +993,6 @@ class _MappingProxy(_ContainerProxy, Mapping):
         path_kind: str = "global",
         local_vars: Mapping[str, Any] | None = None,
         function_scope: "_ContainerProxy | None" = None,
-        function_context_path: tuple[Any, ...] | None = None,
         function_origin_source: _Source | None = None,
         function_body_source_path: tuple[Any, ...] | None = None,
     ) -> None:
@@ -946,14 +1004,14 @@ class _MappingProxy(_ContainerProxy, Mapping):
             path_kind,
             local_vars,
             function_scope,
-            function_context_path,
             function_origin_source,
             function_body_source_path,
         )
-        object.__setattr__(self, "_jinest_resolved", {})
-        object.__setattr__(self, "_jinest_public_resolved", {})
-        object.__setattr__(self, "_jinest_layer_cache", {})
-        object.__setattr__(self, "_jinest_key_indexes", {})
+        cache = object.__getattribute__(self, "_jinest_binding").cache
+        object.__setattr__(self, "_jinest_resolved", cache.resolved)
+        object.__setattr__(self, "_jinest_public_resolved", cache.public_resolved)
+        object.__setattr__(self, "_jinest_layer_cache", cache.layers)
+        object.__setattr__(self, "_jinest_key_indexes", cache.key_indexes)
 
     def __getattribute__(self, name: str) -> Any:
         if name == "_" or name in _NODE_META_NAMES:
@@ -1011,7 +1069,6 @@ class _SequenceProxy(_ContainerProxy, Sequence):
         path_kind: str = "global",
         local_vars: Mapping[str, Any] | None = None,
         function_scope: "_ContainerProxy | None" = None,
-        function_context_path: tuple[Any, ...] | None = None,
         function_origin_source: _Source | None = None,
         function_body_source_path: tuple[Any, ...] | None = None,
     ) -> None:
@@ -1023,7 +1080,6 @@ class _SequenceProxy(_ContainerProxy, Sequence):
             path_kind,
             local_vars,
             function_scope,
-            function_context_path,
             function_origin_source,
             function_body_source_path,
         )
@@ -1031,7 +1087,8 @@ class _SequenceProxy(_ContainerProxy, Sequence):
             raise ValueError(f"Unsupported sequence item mode: {item_mode!r}")
         object.__setattr__(self, "_jinest_item_mode", item_mode)
         object.__setattr__(self, "_jinest_key_context", key_context)
-        object.__setattr__(self, "_jinest_resolved", {})
+        cache = object.__getattribute__(self, "_jinest_binding").cache
+        object.__setattr__(self, "_jinest_resolved", cache.resolved)
 
     def _jinest_resolve_name(self, key: str) -> Any:
         # Unqualified variables in array items come from the nearest mapping.
@@ -1169,7 +1226,10 @@ class Resolver:
         self.treat_warnings_as_errors = treat_warnings_as_errors
         self.debug = debug
         self._global_owner = _global_owner or self
-        self._raw_sources: dict[int, _Source] = {}
+        self._binding_serial = 0
+        # Diagnostics that receive only a raw object use its first discovered
+        # source occurrence. Source/binding semantics never consult this map.
+        self._physical_source_fallbacks: dict[int, _Source] = {}
         if self._global_owner is self:
             self.messages: list[JinestMessage] = []
             self._message_keys: set[tuple[str, str]] = set()
@@ -1177,7 +1237,7 @@ class Resolver:
         else:
             self.messages = self._global_owner.messages
             self._message_keys = self._global_owner._message_keys
-            self._raw_sources = self._global_owner._raw_sources
+            self._physical_source_fallbacks = self._global_owner._physical_source_fallbacks
         self._function_depth = 0
         self._function_stack: list[str] = []
         self._user_globals = dict(globals or {})
@@ -1196,9 +1256,7 @@ class Resolver:
                 self.data = data
         self._schema_cache: dict[int, _MapSchema] = {}
         self._import_cache: dict[tuple[Path, str], Resolver] = {}
-        self._source_view_cache: dict[
-            tuple[int, tuple[Any, ...]], _ContainerProxy
-        ] = {}
+        self._source_view_cache: dict[_DocumentNodeId, _ContainerProxy] = {}
         self.source_path = Path(source_path).expanduser().resolve() if source_path else None
         if base_dir is not None:
             self.base_dir = Path(base_dir).expanduser().resolve()
@@ -1345,7 +1403,7 @@ class Resolver:
         path: tuple[Any, ...] | None = None,
     ) -> tuple[str | None, str | None]:
         if source is None and raw is not None:
-            source = self._raw_sources.get(id(raw))
+            source = self._physical_source_fallbacks.get(id(raw))
         if source is None:
             return None, None
         source_path = source.source_path if path is None else path
@@ -1455,7 +1513,7 @@ class Resolver:
                     path_kind="source",
                 )
             root_source = object.__getattribute__(self._source_root, "_jinest_source")
-            self._source_view_cache[(id(root_source.raw), ())] = self._source_root
+            self._source_view_cache[root_source.identity] = self._source_root
         else:
             # Scalars have no template scope or source-view metadata.
             self._source_root = self.root
@@ -1503,18 +1561,13 @@ class Resolver:
     # Binding and source ownership
     # ------------------------------------------------------------------
 
-    def _function_context_path(self, scope: _ContainerProxy) -> tuple[Any, ...]:
-        """Return the structural body path rebased onto its call-site path."""
-        base = object.__getattribute__(scope, "_jinest_function_context_path")
-        body_source_path = object.__getattribute__(
-            scope, "_jinest_function_body_source_path"
+    def _new_binding(self, frame: _EvaluationFrame) -> _Binding:
+        """Create destination-local state; no cache survives a rebind."""
+        self._binding_serial += 1
+        return _Binding(
+            _BindingId(id(self), self._binding_serial),
+            frame,
         )
-        source = object.__getattribute__(scope, "_jinest_source")
-        if base is not None and body_source_path is not None:
-            current = source.source_path
-            if current[: len(body_source_path)] == body_source_path:
-                return base + current[len(body_source_path):]
-        return object.__getattribute__(scope, "_jinest_path")
 
     def _wrap(
         self,
@@ -1529,7 +1582,6 @@ class Resolver:
         path_kind: str = "global",
         local_vars: Mapping[str, Any] | None = None,
         function_scope: _ContainerProxy | None = None,
-        function_context_path: tuple[Any, ...] | None = None,
         function_origin_source: _Source | None = None,
         function_body_source_path: tuple[Any, ...] | None = None,
     ) -> Any:
@@ -1539,10 +1591,6 @@ class Resolver:
                 local_vars = object.__getattribute__(value, "_jinest_local_vars")
             if function_scope is None:
                 function_scope = object.__getattribute__(value, "_jinest_function_scope")
-            if function_context_path is None:
-                function_context_path = object.__getattribute__(
-                    value, "_jinest_function_context_path"
-                )
             if function_origin_source is None:
                 function_origin_source = object.__getattribute__(
                     value, "_jinest_function_origin_source"
@@ -1558,7 +1606,7 @@ class Resolver:
         else:
             return self._copy_scalar(value)
 
-        self._raw_sources[id(source.raw)] = source
+        self._physical_source_fallbacks.setdefault(id(source.raw), source)
         if isinstance(source.raw, Mapping):
             return _MappingProxy(
                 self,
@@ -1568,7 +1616,6 @@ class Resolver:
                 path_kind,
                 local_vars,
                 function_scope,
-                function_context_path,
                 function_origin_source,
                 function_body_source_path,
             )
@@ -1592,7 +1639,6 @@ class Resolver:
                 path_kind=path_kind,
                 local_vars=local_vars,
                 function_scope=function_scope,
-                function_context_path=function_context_path,
                 function_origin_source=function_origin_source,
                 function_body_source_path=function_body_source_path,
             )
@@ -1610,7 +1656,6 @@ class Resolver:
         sequence_key_context: tuple[Any, Any, str | None] | None = None,
         local_vars: Mapping[str, Any] | None = None,
         function_scope: _ContainerProxy | None = None,
-        function_context_path: tuple[Any, ...] | None = None,
         function_origin_source: _Source | None = None,
         function_body_source_path: tuple[Any, ...] | None = None,
     ) -> Any:
@@ -1621,10 +1666,6 @@ class Resolver:
             local_vars = object.__getattribute__(parent, "_jinest_local_vars")
         if function_scope is None:
             function_scope = object.__getattribute__(parent, "_jinest_function_scope")
-        if function_context_path is None:
-            function_context_path = object.__getattribute__(
-                parent, "_jinest_function_context_path"
-            )
         if function_origin_source is None:
             function_origin_source = object.__getattribute__(
                 parent, "_jinest_function_origin_source"
@@ -1655,17 +1696,12 @@ class Resolver:
                         merged_locals.update(value_local_vars)
                         local_vars = merged_locals
                 function_scope = None
-                function_context_path = None
                 function_body_source_path = value_body_source_path
             else:
                 if local_vars is None:
                     local_vars = value_local_vars
                 if function_scope is None:
                     function_scope = object.__getattribute__(value, "_jinest_function_scope")
-            if function_context_path is None:
-                function_context_path = object.__getattribute__(
-                    value, "_jinest_function_context_path"
-                )
             if function_origin_source is None:
                 function_origin_source = object.__getattribute__(
                     value, "_jinest_function_origin_source"
@@ -1691,7 +1727,6 @@ class Resolver:
             sequence_key_context,
             id(local_vars) if local_vars is not None else None,
             id(function_scope) if function_scope is not None else None,
-            function_context_path,
             id(function_origin_source) if function_origin_source is not None else None,
             function_body_source_path,
         )
@@ -1712,7 +1747,6 @@ class Resolver:
             path_kind=path_kind,
             local_vars=local_vars,
             function_scope=function_scope,
-            function_context_path=function_context_path,
             function_origin_source=function_origin_source,
             function_body_source_path=function_body_source_path,
         )
@@ -1721,6 +1755,7 @@ class Resolver:
             # parent, never through the temporary proxy created at the call
             # site. The parameter frame remains on the structural node.
             object.__setattr__(proxy, "_jinest_function_scope", parent)
+            object.__getattribute__(proxy, "_jinest_binding").frame.function_scope = parent
         children[key] = (cache_token, proxy)
         return proxy
 
@@ -1797,7 +1832,7 @@ class Resolver:
     ) -> tuple[_MappingKeyEntry, ...]:
         """Build a destination-bound index of static, raw, and dynamic keys."""
         indexes = object.__getattribute__(bind, "_jinest_key_indexes")
-        cache_key = (id(source.resolver), id(source.raw), source.source_path)
+        cache_key = source.identity
         cached = indexes.get(cache_key, _MISSING)
         if cached is not _MISSING:
             # While dynamic keys are being evaluated, static keys are already
@@ -2751,7 +2786,7 @@ class Resolver:
         layer: _LayerSpec,
     ) -> _Source:
         cache = object.__getattribute__(bind, "_jinest_layer_cache")
-        cache_key = (id(owner_source.resolver), id(owner_source.raw), layer.source_key)
+        cache_key = _DeclarationId(owner_source.identity, layer.source_key)
         if cache_key in cache:
             cached = cache[cache_key]
             # A recursively requested layer is temporarily empty, mirroring
@@ -2822,7 +2857,7 @@ class Resolver:
         return value
 
     def _source_view(self, source: _Source) -> _ContainerProxy:
-        cache_key = (id(source.raw), source.source_path)
+        cache_key = source.identity
         cached = source.resolver._source_view_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -3278,7 +3313,6 @@ class Resolver:
                     path_kind=object.__getattribute__(call_scope, "_jinest_path_kind"),
                     local_vars=bound,
                     function_scope=call_scope,
-                    function_context_path=None,
                     function_origin_source=source,
                     function_body_source_path=declaration_path,
                 )
@@ -3400,7 +3434,7 @@ class Resolver:
         scope_path = object.__getattribute__(scope, "_jinest_path")
         context_scope = scope
         if context_path is None:
-            context_path = self._function_context_path(scope)
+            context_path = scope_path
         if local_vars is None:
             local_vars = object.__getattribute__(scope, "_jinest_local_vars")
         function_origin_source = object.__getattribute__(
