@@ -1,0 +1,16 @@
+first:
+  from_first: true
+  rank: first
+second:
+  from_second: true
+  rank: second
+single:
+  rank: single
+service:
+  from_first: true
+  rank: first
+  from_second: true
+  literal: mapping
+dependent:
+  base: 1
+  value: 1

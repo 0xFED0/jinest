@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.15.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.16.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -178,6 +178,8 @@ structural construct; a scalar prefix declares an inline evaluator.
 | `.name`, `.name$`, `.name@`, `.name^` | Hidden field |
 | `<<$`, `<<N$`, `<<^`, `<<N^` | Default layer |
 | `<<!$`, `<<N!$`, `<<!^`, `<<N!^` | Override layer |
+| `<<[]`, `<<N[]` | Multiple default layers from one list |
+| `<<![]`, `<<!N[]`, `<<N![]` | Multiple override layers from one list |
 
 Local field priority inside one mapping is:
 
@@ -227,7 +229,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.15.0
+  version: 0.16.0
   label@: "{{ product }} v{{ version }}"
 ```
 
@@ -623,6 +625,30 @@ last override -> first override -> local -> last default -> first default
 `$` and `^` select only how the layer source is computed. Their body
 validation follows ordinary evaluator rules; the result must be a mapping or
 `null`. `null` means an empty layer.
+
+### Multiple layer sources
+
+A `[]` suffix expands one merge declaration into multiple ordinary layers. Its
+value must resolve to a YAML/JSON list; each item is resolved independently
+using normal inline or self syntax and must produce a mapping. The declaration
+itself has no evaluator mode:
+
+```yaml
+service:
+  <<1[]:
+    - =$root.common
+    - =^% return root.platform_defaults
+    - timeout: 30
+  <<!1[]:
+    - =$root.force_overrides
+```
+
+When `service` first needs its layer stack, Jinest expands the list topology
+into flat, cached lazy layer specs. Each item itself is evaluated only when its
+layer is needed; fields inside its resulting mapping remain lazy as well. Item
+order is preserved. Existing numeric ordering and `!` override behavior are
+unchanged; at the same numeric order, an ordinary `<<N$`/`<<N^` layer has
+higher effective precedence than `<<N[]`.
 
 Numbered keys use `N` as order; omitted `N` is `0`. Default and override
 families are sorted independently. Larger `N` has higher lookup priority; at

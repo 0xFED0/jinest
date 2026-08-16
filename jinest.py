@@ -28,6 +28,7 @@ Syntax
 * Local priority is ``name`` > ``name^`` > ``name$`` > ``name@``.
 * ``<<$`` / ``<<N$`` and ``<<^`` / ``<<N^`` add lazy default layers.
 * ``<<!$`` / ``<<N!$`` and ``<<!^`` / ``<<N!^`` add lazy override layers.
+* ``<<[]`` / ``<<N[]`` and their ``!`` variants expand a list of lazy layers.
 * Lookup priority is last override, local, last default.
 * ``context`` is the destination node, ``origin`` is the source declaration
   node, ``root`` is the source tree root, and ``global_root`` is the top-level
@@ -67,7 +68,7 @@ from itertools import product
 from dataclasses import dataclass, field
 from datetime import date, time
 from pathlib import Path
-from typing import Any, Iterator, MutableMapping, MutableSequence
+from typing import Any, Iterator, MutableMapping, MutableSequence, NoReturn
 
 from jinja2 import ChainableUndefined, StrictUndefined, Undefined, nodes, pass_context
 from jinja2.exceptions import UndefinedError
@@ -92,7 +93,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -119,7 +120,11 @@ _RESERVED_NAMES = {
     "source_file",
 }
 _MERGE_RE = re.compile(
-    r"^<<(?P<order>\d*)(?P<override>!)?(?P<mode>[$^])$"
+    # Both historic ``<<N!$`` and the more readable ``<<!N[]`` spelling
+    # are accepted.  ``[]`` is source multiplicity, not an evaluator mode.
+    r"^<<(?:(?P<leading_override>!)?(?P<order>\d*)|"
+    r"(?P<legacy_order>\d+)(?P<legacy_override>!))"
+    r"(?P<mode>[$^]|\[\])$"
 )
 _MISSING = object()
 _EMPTY_MAPPING: Mapping[Any, Any] = {}
@@ -254,8 +259,11 @@ class _BindingCache:
     children: dict[Any, tuple[Any, Any]] = field(default_factory=dict)
     resolved: dict[Any, Any] = field(default_factory=dict)
     public_resolved: dict[Any, Any] = field(default_factory=dict)
-    layers: dict[_DeclarationId, _Source | None] = field(default_factory=dict)
-    key_indexes: dict[_SourceInstanceId, Any] = field(default_factory=dict)
+    layers: dict[Any, "_LayerValue | None"] = field(default_factory=dict)
+    normalized_layers: dict[tuple[_SourceInstanceId, int | None], "_LayerStack"] = field(
+        default_factory=dict
+    )
+    key_indexes: dict[Any, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -269,12 +277,31 @@ class _Binding:
 
 @dataclass(frozen=True, slots=True)
 class _LayerSpec:
-    source_key: str
+    source_key: Any
     template: Any
     order: int
     position: int
     override: bool
     mode: EvaluatorKind
+    multiple: bool = False
+    item_sequence: "_SequenceProxy | None" = None
+    item_index: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _LayerValue:
+    """A resolved layer source plus locals carried by structural results."""
+
+    source: _Source
+    local_vars: Mapping[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class _LayerStack:
+    """Partially visible destination-local layer topology during normalization."""
+
+    defaults: list[_LayerSpec] = field(default_factory=list)
+    overrides: list[_LayerSpec] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2209,10 +2236,12 @@ class Resolver:
         self,
         source: _Source,
         bind: _MappingProxy,
+        *,
+        local_vars: Mapping[str, Any] | None = None,
     ) -> tuple[_MappingKeyEntry, ...]:
         """Build a destination-bound index of static, raw, and dynamic keys."""
         indexes = object.__getattribute__(bind, "_jinest_key_indexes")
-        cache_key = source.instance_id
+        cache_key = (source.instance_id, id(local_vars) if local_vars is not None else None)
         cached = indexes.get(cache_key, _MISSING)
         if cached is not _MISSING:
             # While dynamic keys are being evaluated, static keys are already
@@ -2294,6 +2323,7 @@ class Resolver:
                     keyname=None,
                     effective_key=source_key,
                     keymode=marker,
+                    local_vars=local_vars,
                 )
                 if not isinstance(key, str):
                     raise JinestError(
@@ -2445,6 +2475,7 @@ class Resolver:
         keyname: Any | None,
         effective_key: Any | None,
         keymode: str | None,
+        local_vars: Mapping[str, Any] | None = None,
     ) -> Any:
         """Apply an outer mode to a result produced by an inner layer."""
         if not _valid_evaluator_body(value, mode):
@@ -2469,6 +2500,7 @@ class Resolver:
             keyname=keyname,
             effective_key=effective_key,
             keymode=keymode,
+            local_vars=local_vars,
         )
 
     def _array_transform_list(
@@ -2566,6 +2598,7 @@ class Resolver:
         context_path: tuple[Any, ...] | None = None,
         keyname: Any | None = None,
         effective_key: Any | None = None,
+        local_vars: Mapping[str, Any] | None = None,
     ) -> LayerResult:
         """Resolve an inner inline/self layer.
 
@@ -2587,6 +2620,7 @@ class Resolver:
                     context_path=context_path,
                     keyname=keyname,
                     effective_key=effective_key,
+                    local_vars=local_vars,
                 )
                 result = self._apply_render_layer(
                     scope,
@@ -2598,6 +2632,7 @@ class Resolver:
                     keyname=keyname,
                     effective_key=effective_key,
                     keymode="$",
+                    local_vars=local_vars,
                 )
                 return LayerResult(result, applied=True)
             if self_spec.mode == "structural":
@@ -2660,6 +2695,7 @@ class Resolver:
             keyname=keyname,
             effective_key=effective_key,
             keymode=_FUNCTION_MODE_MARKERS[mode],
+            local_vars=local_vars,
         )
         return LayerResult(result, applied=True)
 
@@ -2745,6 +2781,157 @@ class Resolver:
         self._record_schema_messages(source)
         return schema
 
+    @staticmethod
+    def _ordered_layers(layers: Sequence[_LayerSpec]) -> tuple[_LayerSpec, ...]:
+        """Order one layer family using the established reverse-lookup rules."""
+        return tuple(
+            sorted(
+                layers,
+                key=lambda item: (
+                    item.order,
+                    not item.multiple,
+                    item.position,
+                    -1 if item.item_index is None else item.item_index,
+                ),
+            )
+        )
+
+    def _layer_stack(
+        self,
+        source: _Source,
+        bind: _MappingProxy,
+        *,
+        local_vars: Mapping[str, Any] | None = None,
+    ) -> tuple[tuple[_LayerSpec, ...], tuple[_LayerSpec, ...]]:
+        """Return the destination-bound, flat merge topology for ``source``.
+
+        A ``<<[]`` declaration contributes one lazy normal layer spec per list
+        item.  The topology is available while it is still being built, so a
+        later source can use fields inherited from an earlier array layer.
+        """
+        schema = self._schema_for_source(source)
+        cache = object.__getattribute__(bind, "_jinest_binding").cache.normalized_layers
+        cache_key = (source.instance_id, id(local_vars) if local_vars is not None else None)
+        stack = cache.get(cache_key)
+        if stack is not None:
+            return (
+                self._ordered_layers(stack.defaults),
+                self._ordered_layers(stack.overrides),
+            )
+
+        stack = _LayerStack(
+            defaults=[layer for layer in schema.defaults if not layer.multiple],
+            overrides=[layer for layer in schema.overrides if not layer.multiple],
+        )
+        # Publish ordinary layers before resolving a list-producing expression:
+        # this mirrors normal lazy merge lookup during re-entrant evaluation.
+        cache[cache_key] = stack
+        try:
+            self._normalize_layer_specs(
+                bind, source, schema.defaults, stack.defaults, local_vars=local_vars
+            )
+            self._normalize_layer_specs(
+                bind, source, schema.overrides, stack.overrides, local_vars=local_vars
+            )
+        except Exception:
+            cache.pop(cache_key, None)
+            raise
+        return self._ordered_layers(stack.defaults), self._ordered_layers(stack.overrides)
+
+    def _normalize_layer_specs(
+        self,
+        bind: _MappingProxy,
+        source: _Source,
+        specs: Sequence[_LayerSpec],
+        destination: list[_LayerSpec],
+        *,
+        local_vars: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Append flat lazy item specs without evaluating their mappings."""
+        for spec in specs:
+            if not spec.multiple:
+                continue
+
+            declaration_path = object.__getattribute__(bind, "_jinest_path") + (
+                spec.source_key,
+            )
+            layer_result = self._resolve_layer_input(
+                bind,
+                spec.template,
+                origin_source=source,
+                source_key=spec.source_key,
+                context_path=declaration_path,
+                local_vars=local_vars,
+            )
+            value = layer_result.value
+            sequence: _SequenceProxy
+            if isinstance(value, _SequenceProxy):
+                raw = object.__getattribute__(value, "_jinest_source").raw
+                if not isinstance(raw, list):
+                    self._raise_merge_type_error(
+                        bind, spec.source_key, value, "a list", source=source
+                    )
+                sequence = value
+            elif isinstance(value, list):
+                sequence_value = self._bind_child(
+                    bind,
+                    spec.source_key,
+                    value,
+                    origin=source.resolver,
+                    source_path=source.source_path + (spec.source_key,),
+                    local_vars=local_vars,
+                )
+                if not isinstance(sequence_value, _SequenceProxy):  # defensive
+                    self._raise_merge_type_error(
+                        bind, spec.source_key, value, "a list", source=source
+                    )
+                sequence = sequence_value
+            else:
+                self._raise_merge_type_error(
+                    bind, spec.source_key, value, "a list", source=source
+                )
+
+            destination.extend(
+                _LayerSpec(
+                    source_key=(spec.source_key, index),
+                    template=None,
+                    order=spec.order,
+                    position=spec.position,
+                    override=spec.override,
+                    mode=EvaluatorKind.NATIVE,
+                    multiple=True,
+                    item_sequence=sequence,
+                    item_index=index,
+                )
+                for index in range(len(sequence))
+            )
+
+    def _raise_merge_type_error(
+        self,
+        bind: _MappingProxy,
+        declaration: Any,
+        value: Any,
+        expected: str,
+        *,
+        source: _Source | None = None,
+    ) -> NoReturn:
+        path = object.__getattribute__(bind, "_jinest_path")
+        if isinstance(declaration, tuple):
+            path += declaration
+        else:
+            path += (declaration,)
+        error_source = source or object.__getattribute__(bind, "_jinest_source")
+        raise JinestMergeError(
+            f"Merge {_format_path_segments('global_root', path)} produced "
+            f"{type(value).__name__}, expected {expected}",
+            path=_format_path_segments("root", path),
+            file=(
+                str(error_source.resolver.source_path)
+                if error_source.resolver.source_path
+                else None
+            ),
+        )
+
     def _compile_mapping(self, raw: Mapping[Any, Any]) -> CompiledMapping:
 
         defaults: list[_LayerSpec] = []
@@ -2778,19 +2965,24 @@ class Resolver:
             match = self._merge_key(key)
             if match is None:
                 continue
-            order_text = match.group("order")
+            order_text = match.group("order") or match.group("legacy_order")
             order = int(order_text) if order_text else 0
+            multiple = match.group("mode") == "[]"
             spec = _LayerSpec(
                 source_key=key,
                 template=template,
                 order=order,
                 position=position,
-                override=bool(match.group("override")),
+                override=bool(
+                    match.group("leading_override")
+                    or match.group("legacy_override")
+                ),
                 mode=(
                     EvaluatorKind.SCRIPT
                     if match.group("mode") == "^"
                     else EvaluatorKind.NATIVE
                 ),
+                multiple=multiple,
             )
             (overrides if spec.override else defaults).append(spec)
 
@@ -2827,8 +3019,11 @@ class Resolver:
                     f"conflicts with field declaration {conflict!r}"
                 )
 
-        defaults.sort(key=lambda item: (item.order, item.position))
-        overrides.sort(key=lambda item: (item.order, item.position))
+        # Lookup walks each family in reverse.  Place an array source before a
+        # single source at the same numeric order so the single declaration
+        # has the documented effective priority; array items retain list order.
+        defaults.sort(key=lambda item: (item.order, not item.multiple, item.position))
+        overrides.sort(key=lambda item: (item.order, not item.multiple, item.position))
         schema = CompiledMapping(
             raw, tuple(defaults), tuple(overrides), tuple(functions), tuple(composes)
         )
@@ -2841,6 +3036,7 @@ class Resolver:
         key: Any,
         *,
         hidden: bool,
+        local_vars: Mapping[str, Any] | None = None,
     ) -> _Candidate | None:
         """Return one local declaration from the hidden or public namespace."""
         source_key = f".{key}" if hidden and isinstance(key, str) else key
@@ -2852,7 +3048,7 @@ class Resolver:
                         compose.template,
                         f"compose_{compose.mode}",
                     )
-        entries = self._mapping_entries(source, bind)
+        entries = self._mapping_entries(source, bind, local_vars=local_vars)
         for concrete in entries:
             if concrete.key != source_key:
                 continue
@@ -2917,42 +3113,60 @@ class Resolver:
         bind: _MappingProxy,
         active: set[tuple[Any, ...]],
         hidden: bool | None,
+        local_vars: Mapping[str, Any] | None = None,
     ) -> bool:
         if hidden is None:
             if self._hidden_name(key) and self._contains(
-                source, key, bind=bind, active=active, hidden=True
+                source, key, bind=bind, active=active, hidden=True, local_vars=local_vars
             ):
                 return True
-            return self._contains(source, key, bind=bind, active=active, hidden=False)
+            return self._contains(
+                source, key, bind=bind, active=active, hidden=False, local_vars=local_vars
+            )
 
         token = (
             id(source.resolver),
             id(source.raw),
             self._hashable_key(key),
             hidden,
+            id(local_vars) if local_vars is not None else None,
         )
         if token in active:
             return False
         active.add(token)
         try:
-            schema = self._schema_for_source(source)
+            defaults, overrides = self._layer_stack(
+                source, bind, local_vars=local_vars
+            )
 
-            for layer in reversed(schema.overrides):
-                layer_source = self._evaluate_layer(bind, source, layer)
+            for layer in reversed(overrides):
+                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
                 if self._contains(
-                    layer_source, key, bind=bind, active=active, hidden=hidden
+                    layer_value.source,
+                    key,
+                    bind=bind,
+                    active=active,
+                    hidden=hidden,
+                    local_vars=layer_value.local_vars,
                 ):
                     return True
 
             if not hidden and self._local_function(source, key) is not None:
                 return True
-            if self._local_candidate(source, bind, key, hidden=hidden) is not None:
+            if self._local_candidate(
+                source, bind, key, hidden=hidden, local_vars=local_vars
+            ) is not None:
                 return True
 
-            for layer in reversed(schema.defaults):
-                layer_source = self._evaluate_layer(bind, source, layer)
+            for layer in reversed(defaults):
+                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
                 if self._contains(
-                    layer_source, key, bind=bind, active=active, hidden=hidden
+                    layer_value.source,
+                    key,
+                    bind=bind,
+                    active=active,
+                    hidden=hidden,
+                    local_vars=layer_value.local_vars,
                 ):
                     return True
             return False
@@ -3003,34 +3217,45 @@ class Resolver:
         bind: _MappingProxy,
         active: set[tuple[Any, ...]],
         hidden: bool | None,
+        local_vars: Mapping[str, Any] | None = None,
     ) -> Any:
         """Look up a key, preferring the hidden namespace when requested."""
         if hidden is None:
             if self._hidden_name(key):
                 value = self._lookup(
-                    source, key, bind=bind, active=active, hidden=True
+                    source, key, bind=bind, active=active, hidden=True, local_vars=local_vars
                 )
                 if value is not _MISSING:
                     return value
-            return self._lookup(source, key, bind=bind, active=active, hidden=False)
+            return self._lookup(
+                source, key, bind=bind, active=active, hidden=False, local_vars=local_vars
+            )
 
         token = (
             id(source.resolver),
             id(source.raw),
             self._hashable_key(key),
             hidden,
+            id(local_vars) if local_vars is not None else None,
         )
         if token in active:
             return _MISSING
         active.add(token)
         try:
-            schema = self._schema_for_source(source)
+            defaults, overrides = self._layer_stack(
+                source, bind, local_vars=local_vars
+            )
 
             # Reverse lookup of: defaults -> local -> overrides.
-            for layer in reversed(schema.overrides):
-                layer_source = self._evaluate_layer(bind, source, layer)
+            for layer in reversed(overrides):
+                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
                 value = self._lookup(
-                    layer_source, key, bind=bind, active=active, hidden=hidden
+                    layer_value.source,
+                    key,
+                    bind=bind,
+                    active=active,
+                    hidden=hidden,
+                    local_vars=layer_value.local_vars,
                 )
                 if value is not _MISSING:
                     return value
@@ -3040,14 +3265,23 @@ class Resolver:
                 if function is not None:
                     return self._function_value(source, function)
 
-            candidate = self._local_candidate(source, bind, key, hidden=hidden)
+            candidate = self._local_candidate(
+                source, bind, key, hidden=hidden, local_vars=local_vars
+            )
             if candidate is not None:
-                return self._resolve_candidate(candidate, source, bind, key)
+                return self._resolve_candidate(
+                    candidate, source, bind, key, local_vars=local_vars
+                )
 
-            for layer in reversed(schema.defaults):
-                layer_source = self._evaluate_layer(bind, source, layer)
+            for layer in reversed(defaults):
+                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
                 value = self._lookup(
-                    layer_source, key, bind=bind, active=active, hidden=hidden
+                    layer_value.source,
+                    key,
+                    bind=bind,
+                    active=active,
+                    hidden=hidden,
+                    local_vars=layer_value.local_vars,
                 )
                 if value is not _MISSING:
                     return value
@@ -3197,6 +3431,8 @@ class Resolver:
         source: _Source,
         bind: _MappingProxy,
         logical_key: Any,
+        *,
+        local_vars: Mapping[str, Any] | None = None,
     ) -> Any:
         if candidate.mode.startswith("compose_"):
             spec = _parse_compose_declaration(candidate.source_key, candidate.template)
@@ -3213,6 +3449,7 @@ class Resolver:
             context_path=object.__getattribute__(bind, "_jinest_path") + (logical_key,),
             keyname=logical_key,
             effective_key=candidate.source_key,
+            local_vars=local_vars,
         )
 
         if candidate.mode in _ARRAY_TRANSFORM_MODES.values():
@@ -3231,6 +3468,7 @@ class Resolver:
                     value,
                     origin=source.resolver,
                     source_path=candidate_source_path,
+                    local_vars=local_vars,
                 )
             return value
 
@@ -3243,6 +3481,7 @@ class Resolver:
                         layer_result.value,
                         origin=source.resolver,
                         source_path=candidate_source_path,
+                        local_vars=local_vars,
                     )
                 return layer_result.value
             return self._bind_child(
@@ -3251,6 +3490,7 @@ class Resolver:
                 candidate.template,
                 origin=source.resolver,
                 source_path=candidate_source_path,
+                local_vars=local_vars,
             )
 
         mode_marker = {"native": "$", "text": "@", "script": "^"}[candidate.mode]
@@ -3265,6 +3505,7 @@ class Resolver:
                 keyname=logical_key,
                 effective_key=candidate.source_key,
                 keymode=mode_marker,
+                local_vars=local_vars,
             )
         elif layer_result.escaped_literal:
             return layer_result.value
@@ -3279,6 +3520,7 @@ class Resolver:
                 source_path=candidate_source_path,
                 sequence_item_mode=candidate.mode,
                 sequence_key_context=(logical_key, candidate.source_key, mode_marker),
+                local_vars=local_vars,
             )
         else:
             value = self._render(
@@ -3290,6 +3532,7 @@ class Resolver:
                 keyname=logical_key,
                 effective_key=candidate.source_key,
                 keymode=mode_marker,
+                local_vars=local_vars,
             )
 
         if candidate.mode in {"native", "script"} or self._is_container(value):
@@ -3299,6 +3542,7 @@ class Resolver:
                 value,
                 origin=source.resolver,
                 source_path=candidate_source_path,
+                local_vars=local_vars,
             )
         return value
 
@@ -3307,50 +3551,67 @@ class Resolver:
         bind: _MappingProxy,
         owner_source: _Source,
         layer: _LayerSpec,
-    ) -> _Source:
+        *,
+        local_vars: Mapping[str, Any] | None = None,
+    ) -> _LayerValue:
         cache = object.__getattribute__(bind, "_jinest_layer_cache")
-        cache_key = _DeclarationId(owner_source.document_id, layer.source_key)
+        cache_key = (
+            _DeclarationId(owner_source.document_id, layer.source_key),
+            id(local_vars) if local_vars is not None else None,
+        )
         if cache_key in cache:
             cached = cache[cache_key]
             # A recursively requested layer is temporarily empty, mirroring
             # field cycles resolving to None.
             if cached is None:
-                return _Source(
-                    owner_source.resolver,
-                    _EMPTY_MAPPING,
-                    owner_source.source_path + (layer.source_key,),
+                return _LayerValue(
+                    _Source(
+                        owner_source.resolver,
+                        _EMPTY_MAPPING,
+                        owner_source.source_path + (layer.source_key,),
+                    )
                 )
             return cached
 
         cache[cache_key] = None
         try:
-            value = self._render(
-                bind,
-                layer.template,
-                mode=layer.mode,
-                origin_source=owner_source,
-                source_key=layer.source_key,
+            value = (
+                layer.item_sequence[layer.item_index]
+                if layer.item_sequence is not None and layer.item_index is not None
+                else self._render(
+                    bind,
+                    layer.template,
+                    mode=layer.mode,
+                    origin_source=owner_source,
+                    source_key=layer.source_key,
+                    local_vars=local_vars,
+                )
             )
 
             if value is None:
-                result = _Source(
-                    owner_source.resolver,
-                    _EMPTY_MAPPING,
-                    owner_source.source_path + (layer.source_key,),
+                result = _LayerValue(
+                    _Source(
+                        owner_source.resolver,
+                        _EMPTY_MAPPING,
+                        owner_source.source_path + (layer.source_key,),
+                    )
                 )
             elif isinstance(value, _MappingProxy):
-                result = object.__getattribute__(value, "_jinest_source")
+                result = _LayerValue(
+                    object.__getattribute__(value, "_jinest_source"),
+                    object.__getattribute__(value, "_jinest_binding").frame.local_vars,
+                )
             elif isinstance(value, Mapping):
-                result = _Source(
-                    owner_source.resolver,
-                    value,
-                    owner_source.source_path + (layer.source_key,),
+                result = _LayerValue(
+                    _Source(
+                        owner_source.resolver,
+                        value,
+                        owner_source.source_path + (layer.source_key,),
+                    )
                 )
             else:
-                path = object.__getattribute__(bind, "_jinest_path") + (layer.source_key,)
-                raise JinestMergeError(
-                    f"Merge {_format_path_segments('global_root', path)} produced "
-                    f"{type(value).__name__}, expected a mapping"
+                self._raise_merge_type_error(
+                    bind, layer.source_key, value, "a mapping", source=owner_source
                 )
         except Exception:
             cache.pop(cache_key, None)
@@ -4285,7 +4546,9 @@ class Resolver:
         source = object.__getattribute__(scope, "_jinest_source")
         result: list[Any] = []
         seen: set[Any] = set()
-        self._collect_keys(source, bind=scope, result=result, seen=seen, active=set())
+        self._collect_keys(
+            source, bind=scope, result=result, seen=seen, active=set(), local_vars=None
+        )
         return result
 
     def _collect_keys(
@@ -4295,25 +4558,34 @@ class Resolver:
         bind: _MappingProxy,
         result: list[Any],
         seen: set[Any],
-        active: set[tuple[int, int]],
+        active: set[tuple[int, int, int | None]],
+        local_vars: Mapping[str, Any] | None = None,
     ) -> None:
-        token = (id(source.resolver), id(source.raw))
+        token = (
+            id(source.resolver),
+            id(source.raw),
+            id(local_vars) if local_vars is not None else None,
+        )
         if token in active:
             return
         active.add(token)
         try:
-            schema = self._schema_for_source(source)
+            defaults, overrides = self._layer_stack(
+                source, bind, local_vars=local_vars
+            )
 
-            for layer in schema.defaults:
+            for layer in defaults:
+                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
                 self._collect_keys(
-                    self._evaluate_layer(bind, source, layer),
+                    layer_value.source,
                     bind=bind,
                     result=result,
                     seen=seen,
                     active=active,
+                    local_vars=layer_value.local_vars,
                 )
 
-            for entry in self._mapping_entries(source, bind):
+            for entry in self._mapping_entries(source, bind, local_vars=local_vars):
                 source_key = entry.key
                 if entry.compose:
                     logical = entry.key
@@ -4356,13 +4628,15 @@ class Resolver:
                     seen.add(logical)
                     result.append(logical)
 
-            for layer in schema.overrides:
+            for layer in overrides:
+                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
                 self._collect_keys(
-                    self._evaluate_layer(bind, source, layer),
+                    layer_value.source,
                     bind=bind,
                     result=result,
                     seen=seen,
                     active=active,
+                    local_vars=layer_value.local_vars,
                 )
         finally:
             active.remove(token)

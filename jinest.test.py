@@ -85,7 +85,7 @@ class JinestTestSuiteContractTests(unittest.TestCase):
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.15.0")
+        self.assertEqual(jinest.__version__, "0.16.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -1660,6 +1660,126 @@ class JinestLayerTests(unittest.TestCase):
     def test_recursive_merge_layer_behaves_as_empty(self) -> None:
         result = jinest.resolve({"A": {"<<$": "root.A", "x": 1}})
         self.assertEqual(result, {"A": {"x": 1}})
+
+    def test_multi_source_layers_expand_inline_items_and_orders(self) -> None:
+        result = jinest.resolve(
+            {
+                "first": {"from_first": True, "rank": "first"},
+                "second": {"from_second": True, "rank": "second"},
+                "single": {"rank": "single"},
+                "target": {
+                    "<<2[]": [
+                        "=$root.first",
+                        "=^% return root.second",
+                        {"literal": True},
+                    ],
+                    "<<2$": "root.single",
+                    "rank": "local",
+                    "<<!1[]": ["=$root.first"],
+                },
+            }
+        )
+        self.assertEqual(
+            result["target"],
+            {
+                "from_first": True,
+                "from_second": True,
+                "literal": True,
+                "rank": "first",
+            },
+        )
+
+    def test_multi_source_layer_all_declared_forms(self) -> None:
+        result = jinest.resolve(
+            {
+                "default": {"value": "default"},
+                "override": {"value": "override"},
+                "numbered": {"numbered": True},
+                "plain": {
+                    "<<[]": ["=$root.default"],
+                    "<<![]": ["=$root.override"],
+                },
+                "numbered_target": {"<<1[]": ["=$root.numbered"]},
+            }
+        )
+        self.assertEqual(result["plain"], {"value": "override"})
+        self.assertEqual(result["numbered_target"], {"numbered": True})
+
+    def test_multi_source_layer_single_has_priority_at_same_order(self) -> None:
+        result = jinest.resolve(
+            {
+                "array_layer": {"value": "array"},
+                "single_layer": {"value": "single"},
+                "target": {
+                    "<<7[]": ["=$root.array_layer"],
+                    "<<7$": "root.single_layer",
+                },
+            }
+        )
+        self.assertEqual(result["target"], {"value": "single"})
+
+    def test_multi_source_layer_items_are_lazy_and_can_depend_on_prior_layers(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "target": {
+                    # Binding this mapping must not evaluate list items.
+                    "<<[]": ["=$missing_layer", {"base": 1}],
+                },
+            }
+        )
+        # Merely binding the surrounding mapping does not evaluate an array
+        # item; item evaluation begins only when merge lookup needs it.
+        self.assertEqual(str(resolver.root["target"].path), "global_root.target")
+
+        result = jinest.resolve(
+            {
+                "target": {
+                    "<<[]": [{"base": 1}],
+                    # Normalization must expose the preceding array layer to
+                    # this override item, just like <<$ / <<!$.
+                    "<<![]": ["=${'value': base}"],
+                }
+            }
+        )
+        self.assertEqual(result["target"], {"base": 1, "value": 1})
+
+    def test_structural_function_layer_results_keep_argument_locals(self) -> None:
+        data = {
+            "make(x)=": {"value$": "x"},
+            "from_single": {"<<$": "root.make(3)"},
+            "from_script": {"<<^": "% return root.make(4)"},
+            "from_many": {"<<[]": ["=$root.make(5)"]},
+            "nested(x)=": {
+                "<<[]": [{"base$": "x"}],
+                "value$": "base",
+            },
+            "from_nested": {"<<[]": ["=$root.nested(6)"]},
+        }
+        result = jinest.resolve(data)
+        self.assertEqual(result["from_single"], {"value": 3})
+        self.assertEqual(result["from_script"], {"value": 4})
+        self.assertEqual(result["from_many"], {"value": 5})
+        self.assertEqual(result["from_nested"], {"base": 6, "value": 6})
+
+    def test_multi_source_layers_are_normalized_but_fields_stay_lazy(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "base": {"safe": 1, "broken$": "missing_name"},
+                "target": {"<<[]": ["=$root.base"]},
+            }
+        )
+        target = resolver.root["target"]
+        self.assertEqual(target["safe"], 1)
+        with self.assertRaises(jinest.JinestTemplateError):
+            _ = target["broken"]
+
+    def test_multi_source_layer_requires_list_of_mappings(self) -> None:
+        with self.assertRaisesRegex(jinest.JinestMergeError, "expected a list"):
+            jinest.resolve({"target": {"<<[]": {"x": 1}}})
+        with self.assertRaisesRegex(
+            jinest.JinestMergeError, r"target\['<<\[\]'\]\[0\].*expected a mapping"
+        ):
+            jinest.resolve({"target": {"<<[]": ["=$42"]}})
 
 
 class JinestPrototypeTests(unittest.TestCase):

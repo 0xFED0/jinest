@@ -1,0 +1,1 @@
+jinest: Merge global_root.target['<<[]'] produced dict, expected a list

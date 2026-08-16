@@ -1,0 +1,28 @@
+# `[]` expands one layer declaration into a flat ordered layer stack.
+first:
+  from_first: true
+  rank: first
+second:
+  from_second: true
+  rank: second
+single:
+  rank: single
+service:
+  # Each item uses normal inline/self resolution; mappings stay lazy afterward.
+  <<2[]:
+    - =$root.first
+    - =^% return root.second
+    - literal: mapping
+  # At equal order the ordinary declaration has effective priority.
+  <<2$: root.single
+  rank: local
+  # Leading `!` is accepted for numeric array override layers.
+  <<!1[]:
+    - =$root.first
+
+# An override item can use a field from an earlier array default layer.
+dependent:
+  <<[]:
+    - base: 1
+  <<![]:
+    - "=${'value': base}"
