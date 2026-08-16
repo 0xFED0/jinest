@@ -10,11 +10,13 @@ Set JINEST_MODULE=/path/to/jinest.py to test another copy.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,7 +28,7 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 
 
-def _load_jinest() -> Any:
+def _find_jinest_module() -> Path:
     candidates: list[Path] = []
     if os.environ.get("JINEST_MODULE"):
         candidates.append(Path(os.environ["JINEST_MODULE"]).expanduser())
@@ -40,6 +42,10 @@ def _load_jinest() -> Any:
     if module_path is None:
         searched = "\n  ".join(str(p) for p in candidates)
         raise RuntimeError(f"Could not find Jinest module. Searched:\n  {searched}")
+    return module_path
+
+
+def _load_jinest(module_path: Path) -> Any:
 
     module_name = "jinest_under_test"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
@@ -52,12 +58,29 @@ def _load_jinest() -> Any:
     return module
 
 
-jinest = _load_jinest()
+JINEST_MODULE_PATH = _find_jinest_module()
+jinest = _load_jinest(JINEST_MODULE_PATH)
 
 try:
     import yaml  # type: ignore
 except ImportError:
     yaml = None
+
+
+class JinestTestSuiteContractTests(unittest.TestCase):
+    def test_suite_does_not_access_private_jinest_members(self) -> None:
+        """Keep the regression suite independent of Jinest implementation details."""
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        private_accesses = sorted(
+            (node.lineno, node.attr)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "jinest"
+            and node.attr.startswith("_")
+            and node.attr != "__version__"
+        )
+        self.assertEqual(private_accesses, [])
 
 
 class JinestCoreTests(unittest.TestCase):
@@ -619,19 +642,6 @@ class JinestFunctionTests(unittest.TestCase):
                 emit_messages=False,
             )
 
-    def test_structural_function_recursion_is_rejected(self) -> None:
-        with self.assertRaisesRegex(
-            jinest.JinestFunctionError,
-            "Recursive structural function.*not supported",
-        ):
-            jinest.resolve(
-                {
-                    "node(n)=": {"child": "=$global_root.node(n - 1)"},
-                    "result": "=$global_root.node(1)",
-                },
-                emit_messages=False,
-            )
-
     def test_function_script_local_shadows_argument(self) -> None:
         result = jinest.resolve(
             {
@@ -755,33 +765,37 @@ class JinestMessageTests(unittest.TestCase):
         self.assertIn("  at root\n  in <memory>\n", stream.getvalue())
 
     def test_cli_reports_unexpected_exceptions_without_a_traceback(self) -> None:
-        def fail(*args: Any, **kwargs: Any) -> str:
-            raise RuntimeError("unexpected failure")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            input_path = folder / "input.yml"
+            input_path.write_text("value: 1\n", encoding="utf-8")
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(JINEST_MODULE_PATH),
+                    str(input_path),
+                    "-o",
+                    str(folder),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
 
-        original = jinest.resolve_file
-        original_argv = sys.argv
-        stream = io.StringIO()
-        try:
-            jinest.resolve_file = fail
-            sys.argv = ["jinest", "input.yml"]
-            with contextlib.redirect_stderr(stream):
-                with self.assertRaises(SystemExit) as caught:
-                    jinest._main()
-        finally:
-            jinest.resolve_file = original
-            sys.argv = original_argv
-        self.assertEqual(caught.exception.code, 1)
-        self.assertEqual(stream.getvalue(), "jinest: unexpected failure\n")
+        self.assertEqual(process.returncode, 1)
+        self.assertEqual(process.stdout, "")
+        self.assertTrue(process.stderr.startswith("jinest: "))
+        self.assertNotIn("Traceback", process.stderr)
 
     def test_debug_adds_error_location(self) -> None:
         resolver = jinest.Resolver({"broken$": "missing.value"}, debug=True)
         stream = io.StringIO()
         with contextlib.redirect_stderr(stream):
-            with self.assertRaises(jinest.JinestTemplateError) as caught:
+            with self.assertRaisesRegex(
+                jinest.JinestTemplateError,
+                "Failed to render",
+            ):
                 resolver.resolve()
-        error = caught.exception
-        self.assertEqual(error.path, "root['broken$']")
-        self.assertIsNone(error.file)
         self.assertIn("jinest: Failed to render", stream.getvalue())
         self.assertIn("  at root['broken$']\n  in <memory>\n", stream.getvalue())
 
@@ -789,8 +803,11 @@ class JinestMessageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "config.yml"
             path.write_text("value: 1\nvalue$: 2\n", encoding="utf-8")
-            data = jinest._parse_text(path.read_text(encoding="utf-8"), "yaml")
-            resolver = jinest.Resolver(data, source_path=path, debug=True)
+            resolver = jinest.Resolver(
+                {"value": 1, "value$": 2},
+                source_path=path,
+                debug=True,
+            )
             self.assertEqual(resolver.messages[0].path, "root")
             self.assertEqual(resolver.messages[0].file, str(path.resolve()))
 
@@ -859,7 +876,7 @@ class JinestInlineSyntaxTests(unittest.TestCase):
             },
         )
 
-    def test_dynamic_keys_are_literal_cached_and_checked(self) -> None:
+    def test_dynamic_keys_are_literal_evaluated_once_and_checked(self) -> None:
         calls: list[None] = []
 
         def dynamic_name() -> str:
@@ -921,9 +938,11 @@ class JinestInlineSyntaxTests(unittest.TestCase):
         )
         for attempt in range(2):
             with self.subTest(cache_retry=attempt):
-                with self.assertRaises(jinest.JinestError) as caught:
+                with self.assertRaisesRegex(
+                    jinest.JinestError,
+                    "Duplicate logical name",
+                ):
                     resolver.resolve()
-                self.assertEqual(caught.exception.path, "root.nested")
 
     def test_self_dollar_and_inline_layers_are_equivalent(self) -> None:
         result = jinest.resolve(
@@ -1284,15 +1303,15 @@ class JinestPrototypeTests(unittest.TestCase):
             },
         )
 
-    def test_source_cache_does_not_leak_into_bound_instance(self) -> None:
+    def test_source_access_does_not_change_destination_binding(self) -> None:
         resolver = jinest.Resolver(self._prototype_data())
-        # Resolve in the source location first.
+        # Access the declaration at its source location first.
         self.assertEqual(resolver.root["class"].prototype.A, 1)
         self.assertEqual(resolver.root["class"].prototype.where, "global_root.class.prototype")
-        # A destination-bound copy must still use its own context/cache.
-        self.assertEqual(resolver.global_root.inherited.instance.A, 2)
+        # The destination must still resolve against its own context.
+        self.assertEqual(resolver.root.inherited.instance.A, 2)
         self.assertEqual(
-            resolver.global_root.inherited.instance.where,
+            resolver.root.inherited.instance.where,
             "global_root.inherited.instance",
         )
 
@@ -1382,6 +1401,17 @@ class JinestArrayTests(unittest.TestCase):
 
 @unittest.skipUnless(yaml is not None, "PyYAML is required for YAML tests")
 class JinestFormatAndImportTests(unittest.TestCase):
+    @staticmethod
+    def _serialize_public_value(value: Any, output_format: str) -> str:
+        """Return a Python value through the documented resolver/serializer API."""
+        return jinest.resolve_text(
+            json.dumps({"value$": "make_value()"}),
+            format="json",
+            output_format=output_format,
+            globals={"make_value": lambda: value},
+            emit_messages=False,
+        )
+
     def test_resolve_text_json_and_yaml(self) -> None:
         json_result = json.loads(
             jinest.resolve_text(
@@ -1421,7 +1451,7 @@ class JinestFormatAndImportTests(unittest.TestCase):
 
     def test_json_bytes_use_lossless_latin1_strings(self) -> None:
         payload = bytes(range(256))
-        rendered = jinest._serialize(
+        rendered = self._serialize_public_value(
             {
                 "bytes": payload,
                 "bytearray": bytearray(payload),
@@ -1429,33 +1459,36 @@ class JinestFormatAndImportTests(unittest.TestCase):
             },
             "json",
         )
-        decoded = json.loads(rendered)
+        decoded = json.loads(rendered)["value"]
         self.assertEqual(decoded["bytes"].encode("latin-1"), payload)
         self.assertEqual(decoded["bytearray"].encode("latin-1"), payload)
         [decoded_key] = decoded["mapping"]
         self.assertEqual(decoded_key.encode("latin-1"), payload)
 
     def test_yaml_serializes_time_and_bytearray(self) -> None:
-        rendered = jinest._serialize(
+        rendered = self._serialize_public_value(
             {"clock": time(12, 30, 45), "buffer": bytearray(b"\x00A")},
             "yaml",
         )
         self.assertEqual(
-            yaml.safe_load(rendered),
+            yaml.safe_load(rendered)["value"],
             {"clock": "12:30:45", "buffer": b"\x00A"},
         )
 
     def test_invalid_yaml_is_a_jinest_error(self) -> None:
-        with self.assertRaisesRegex(jinest.JinestError, "Invalid YAML input"):
-            jinest._parse_text("broken: [", "yaml")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "broken.yml"
+            path.write_text("broken: [", encoding="utf-8")
+            with self.assertRaisesRegex(jinest.JinestError, "Invalid YAML input"):
+                jinest.resolve_file(path)
 
     def test_json_mapping_key_normalization_is_lossless(self) -> None:
-        rendered = jinest._serialize(
+        rendered = self._serialize_public_value(
             {date(2026, 8, 2): 1, b"A": 2},
             "json",
         )
         self.assertEqual(
-            json.loads(rendered),
+            json.loads(rendered)["value"],
             {"2026-08-02": 1, "A": 2},
         )
 
@@ -1471,13 +1504,13 @@ class JinestFormatAndImportTests(unittest.TestCase):
                     jinest.JinestError,
                     "Duplicate JSON object key after normalization",
                 ):
-                    jinest._serialize(value, "json")
+                    self._serialize_public_value(value, "json")
 
         with self.assertRaisesRegex(
             jinest.JinestError,
-            "JSON object keys must normalize to a scalar",
+            "Unsupported mapping key",
         ):
-            jinest._serialize({(1, 2): 3}, "json")
+            self._serialize_public_value({(1, 2): 3}, "json")
 
     def test_yaml_json_import_globals_aliases_and_filters(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

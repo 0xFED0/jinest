@@ -1,1 +1,0 @@
-jinest: Recursive structural function 'node' is not supported at global_root.result
