@@ -59,6 +59,7 @@ import re
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
+from enum import Enum
 from itertools import product
 from dataclasses import dataclass, field
 from datetime import date, time
@@ -247,7 +248,7 @@ class _LayerSpec:
     order: int
     position: int
     override: bool
-    mode: str
+    mode: EvaluatorKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +269,7 @@ class _FunctionSpec:
     name: str
     source_key: str
     template: Any
-    mode: str  # native, text, script, structural
+    mode: EvaluatorKind
     parameters: tuple[_FunctionParameter, ...]
 
 
@@ -283,7 +284,7 @@ class _ComposeSpec:
     name: str
     source_key: str
     template: Any
-    mode: str  # structural, text
+    mode: EvaluatorKind
     axes: tuple[_ComposeAxis, ...]
 
 
@@ -327,8 +328,46 @@ class SyntaxCompiler:
         self._cache.clear()
 
 
-_FUNCTION_MODES = {"$": "native", "@": "text", "^": "script"}
-_FUNCTION_DECLARATION_MODES = {**_FUNCTION_MODES, "=": "structural"}
+class EvaluatorKind(str, Enum):
+    """Typed evaluator kinds; str compatibility preserves existing internals."""
+
+    NATIVE = "native"
+    TEXT = "text"
+    SCRIPT = "script"
+    STRUCTURAL = "structural"
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationPlan:
+    """One evaluator application, regardless of field/inline/self syntax."""
+
+    kind: EvaluatorKind
+    template: Any
+    source_key: Any
+
+
+@dataclass(frozen=True, slots=True)
+class LayerResult:
+    """Value produced by an optional inner declaration layer."""
+
+    value: Any
+    applied: bool = False
+    escaped_literal: bool = False
+
+
+class EvaluatorRegistry:
+    """Single dispatch point for scalar evaluator execution."""
+
+    def apply(self, resolver: "Resolver", plan: EvaluationPlan, **kwargs: Any) -> Any:
+        return resolver._render_plan(plan, **kwargs)
+
+
+_FUNCTION_MODES = {
+    "$": EvaluatorKind.NATIVE,
+    "@": EvaluatorKind.TEXT,
+    "^": EvaluatorKind.SCRIPT,
+}
+_FUNCTION_DECLARATION_MODES = {**_FUNCTION_MODES, "=": EvaluatorKind.STRUCTURAL}
 _FUNCTION_MODE_MARKERS = {value: key for key, value in _FUNCTION_MODES.items()}
 
 
@@ -578,7 +617,7 @@ def _parse_compose_declaration(
                 f"Could not read source for compose axis {argument.arg!r} in {key!r}"
             )
         axes.append(_ComposeAxis(argument.arg, axis_source))
-    mode = "structural" if marker == "=" else "text"
+    mode = EvaluatorKind.STRUCTURAL if marker == "=" else EvaluatorKind.TEXT
     if template is not _MISSING:
         if mode == "structural" and not (
             isinstance(template, (Mapping, Sequence))
@@ -1153,7 +1192,7 @@ class _SequenceProxy(_ContainerProxy, Sequence):
             keyname = None if key_context is None else key_context[0]
             effective_key = None if key_context is None else key_context[1]
             outer_keymode = None if key_context is None else key_context[2]
-            value, layered, escaped = owner._resolve_layer_input(
+            layer_result = owner._resolve_layer_input(
                 self,
                 item,
                 origin_source=source,
@@ -1162,11 +1201,11 @@ class _SequenceProxy(_ContainerProxy, Sequence):
                 keyname=keyname,
                 effective_key=effective_key,
             )
-            if mode is not None and not escaped:
-                if layered:
+            if mode is not None and not layer_result.escaped_literal:
+                if layer_result.applied:
                     value = owner._apply_render_layer(
                         self,
-                        value,
+                        layer_result.value,
                         mode=mode,
                         origin_source=source,
                         source_key=normalized,
@@ -1187,8 +1226,10 @@ class _SequenceProxy(_ContainerProxy, Sequence):
                         effective_key=effective_key,
                         keymode=outer_keymode,
                     )
-            elif not layered and not escaped:
+            elif not layer_result.applied and not layer_result.escaped_literal:
                 value = item
+            else:
+                value = layer_result.value
             if owner._is_container(value):
                 value = owner._bind_child(
                     self,
@@ -1277,6 +1318,10 @@ class Resolver:
                 # scalar boundary below will still convert/reject them.
                 self.data = data
         self._syntax = SyntaxCompiler(self)
+        self._evaluators = EvaluatorRegistry()
+        self._jinja_compilation_cache: dict[
+            tuple[_DeclarationId, EvaluatorKind, str], Any
+        ] = {}
         self._import_cache: dict[tuple[Path, str], Resolver] = {}
         self._source_view_cache: dict[_DocumentNodeId, _ContainerProxy] = {}
         self.source_path = Path(source_path).expanduser().resolve() if source_path else None
@@ -1573,6 +1618,7 @@ class Resolver:
                 self.data = result
 
             self._syntax.clear()
+            self._jinja_compilation_cache.clear()
             self._source_view_cache.clear()
             self._reset_root_views()
             return self.data
@@ -2101,12 +2147,11 @@ class Resolver:
                 if origin_source.resolver.source_path
                 else None,
             )
-        return self._render(
-            scope,
-            value,
-            mode=mode,
+        return self._evaluators.apply(
+            self,
+            EvaluationPlan(EvaluatorKind(mode), value, source_key),
+            scope=scope,
             origin_source=origin_source,
-            source_key=source_key,
             source_path=origin_source.source_path + (source_key,),
             context_path=context_path,
             keyname=keyname,
@@ -2124,21 +2169,20 @@ class Resolver:
         context_path: tuple[Any, ...] | None = None,
         keyname: Any | None = None,
         effective_key: Any | None = None,
-    ) -> tuple[Any, bool, bool]:
+    ) -> LayerResult:
         """Resolve an inner inline/self layer.
 
-        The booleans indicate ``(was_layer, was_escaped_literal)``.  Keeping
-        this information lets a field/array suffix act as a true outer layer
+        A typed result lets a field/array suffix act as a true outer layer
         while preserving escaped inline literals.
         """
         escaped = _escaped_inline_literal(value)
         if escaped is not None:
-            return escaped, False, True
+            return LayerResult(escaped, escaped_literal=True)
 
         self_spec = _parse_self_declaration(value)
         if self_spec is not None:
             if self_spec.mode == "native":
-                inner, _, _ = self._resolve_layer_input(
+                inner = self._resolve_layer_input(
                     scope,
                     self_spec.payload,
                     origin_source=origin_source,
@@ -2149,7 +2193,7 @@ class Resolver:
                 )
                 result = self._apply_render_layer(
                     scope,
-                    inner,
+                    inner.value,
                     mode="native",
                     origin_source=origin_source,
                     source_key=self_spec.source_key,
@@ -2158,7 +2202,7 @@ class Resolver:
                     effective_key=effective_key,
                     keymode="$",
                 )
-                return result, True, False
+                return LayerResult(result, applied=True)
             if self_spec.mode == "structural":
                 function = self_spec.payload
                 assert isinstance(function, _FunctionSpec)
@@ -2169,7 +2213,7 @@ class Resolver:
                     mode="structural",
                     parameters=function.parameters,
                 )
-                return self._function_value(origin_source, spec), True, False
+                return LayerResult(self._function_value(origin_source, spec), applied=True)
             if self_spec.mode == "compose_structural":
                 compose = self_spec.payload
                 assert isinstance(compose, _ComposeSpec)
@@ -2193,33 +2237,32 @@ class Resolver:
                 destination_key = (
                     source_key if isinstance(scope, _SequenceProxy) else keyname
                 )
-                return self._resolve_compose(
+                return LayerResult(self._resolve_compose(
                     spec,
                     origin_source,
                     evaluation_scope,
                     keyname,
                     destination_parent=scope,
                     destination_key=destination_key,
-                ), True, False
+                ), applied=True)
             raise JinestError(f"Unsupported self declaration mode {self_spec.mode!r}")
 
         directive = _inline_directive(value)
         if directive is None:
-            return value, False, False
+            return LayerResult(value)
         mode, template = directive
-        result = self._render(
-            scope,
-            template,
-            mode=mode,
+        result = self._evaluators.apply(
+            self,
+            EvaluationPlan(EvaluatorKind(mode), template, source_key),
+            scope=scope,
             origin_source=origin_source,
-            source_key=source_key,
             source_path=origin_source.source_path + (source_key,),
             context_path=context_path,
             keyname=keyname,
             effective_key=effective_key,
             keymode=_FUNCTION_MODE_MARKERS[mode],
         )
-        return result, True, False
+        return LayerResult(result, applied=True)
 
     def _record_schema_messages(self, raw: Mapping[Any, Any]) -> None:
         """Report declarations that are present but cannot become effective."""
@@ -2330,7 +2373,11 @@ class Resolver:
                 order=order,
                 position=position,
                 override=bool(match.group("override")),
-                mode="script" if match.group("mode") == "^" else "native",
+                mode=(
+                    EvaluatorKind.SCRIPT
+                    if match.group("mode") == "^"
+                    else EvaluatorKind.NATIVE
+                ),
             )
             (overrides if spec.override else defaults).append(spec)
 
@@ -2721,7 +2768,7 @@ class Resolver:
             return self._resolve_compose(spec, source, bind, logical_key)
 
         candidate_source_path = source.source_path + (candidate.source_key,)
-        value, layered, escaped = self._resolve_layer_input(
+        layer_result = self._resolve_layer_input(
             bind,
             candidate.template,
             origin_source=source,
@@ -2732,16 +2779,16 @@ class Resolver:
         )
 
         if candidate.mode == "concrete":
-            if layered or escaped:
-                if self._is_container(value):
+            if layer_result.applied or layer_result.escaped_literal:
+                if self._is_container(layer_result.value):
                     return self._bind_child(
                         bind,
                         logical_key,
-                        value,
+                        layer_result.value,
                         origin=source.resolver,
                         source_path=candidate_source_path,
                     )
-                return value
+                return layer_result.value
             return self._bind_child(
                 bind,
                 logical_key,
@@ -2751,10 +2798,10 @@ class Resolver:
             )
 
         mode_marker = {"native": "$", "text": "@", "script": "^"}[candidate.mode]
-        if layered:
+        if layer_result.applied:
             value = self._apply_render_layer(
                 bind,
-                value,
+                layer_result.value,
                 mode=candidate.mode,
                 origin_source=source,
                 source_key=candidate.source_key,
@@ -2763,8 +2810,8 @@ class Resolver:
                 effective_key=candidate.source_key,
                 keymode=mode_marker,
             )
-        elif escaped:
-            return value
+        elif layer_result.escaped_literal:
+            return layer_result.value
         elif isinstance(candidate.template, Sequence) and not isinstance(
             candidate.template, (str, bytes, bytearray)
         ):
@@ -3432,6 +3479,35 @@ class Resolver:
             index += 1
         return "".join(lines)
 
+    def _compile_jinja(
+        self,
+        origin_source: _Source,
+        source_key: Any | None,
+        kind: EvaluatorKind,
+        template: str,
+        factory: Any,
+    ) -> Any:
+        """Cache compiled Jinja artifacts by declaration, kind, and source text."""
+        if source_key is None:
+            return factory()
+        key = (_DeclarationId(origin_source.identity, source_key), kind, template)
+        cache = origin_source.resolver._jinja_compilation_cache
+        compiled = cache.get(key, _MISSING)
+        if compiled is _MISSING:
+            compiled = factory()
+            cache[key] = compiled
+        return compiled
+
+    def _render_plan(self, plan: EvaluationPlan, **kwargs: Any) -> Any:
+        """Execute one typed plan through the legacy render primitive."""
+        return self._render(
+            kwargs.pop("scope"),
+            plan.template,
+            mode=plan.kind,
+            source_key=plan.source_key,
+            **kwargs,
+        )
+
     def _render(
         self,
         scope: _ContainerProxy,
@@ -3536,9 +3612,14 @@ class Resolver:
                         f"Native expression {display_path} must not use "
                         "Jinja template delimiters"
                     )
-                expression = environment.compile_expression(
+                expression = self._compile_jinja(
+                    origin_source,
+                    source_key,
+                    EvaluatorKind.NATIVE,
                     template,
-                    undefined_to_none=False,
+                    lambda: environment.compile_expression(
+                        template, undefined_to_none=False
+                    ),
                 )
                 result = expression(**context)
                 if prepare_native:
@@ -3550,8 +3631,14 @@ class Resolver:
                 return result
 
             if mode == "script":
-                compiled = environment.from_string(
-                    self._normalize_multiline_returns(template)
+                compiled = self._compile_jinja(
+                    origin_source,
+                    source_key,
+                    EvaluatorKind.SCRIPT,
+                    template,
+                    lambda: environment.from_string(
+                        self._normalize_multiline_returns(template)
+                    ),
                 )
                 try:
                     compiled.render(**context)
@@ -3559,7 +3646,13 @@ class Resolver:
                     return self._prepare_native(returned.value)
                 return None
 
-            compiled = environment.from_string(template)
+            compiled = self._compile_jinja(
+                origin_source,
+                source_key,
+                EvaluatorKind.TEXT,
+                template,
+                lambda: environment.from_string(template),
+            )
             # NativeEnvironment.render() applies literal_eval to a complete
             # textual result. Generate chunks directly so @ always remains text
             # (for example, a template producing ``"hello"`` keeps its quotes).
