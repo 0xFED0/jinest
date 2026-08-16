@@ -85,7 +85,7 @@ class JinestTestSuiteContractTests(unittest.TestCase):
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.14.2")
+        self.assertEqual(jinest.__version__, "0.14.3")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -133,6 +133,8 @@ class JinestCoreTests(unittest.TestCase):
                 strict=False,
                 emit_messages=False,
             )
+        with self.assertRaisesRegex(jinest.JinestError, "Unsupported mapping key"):
+            jinest.resolve({invalid_key: 1}, strict=False, emit_messages=False)
 
     def test_evaluator_body_types_are_strict(self) -> None:
         self.assertEqual(
@@ -408,6 +410,87 @@ class JinestCoreTests(unittest.TestCase):
         data["value$"] = "2"
 
         self.assertEqual(resolver.resolve(), {"value": 2})
+
+    def test_in_place_materialized_raw_keys_are_atomic_and_idempotent(self) -> None:
+        data = {
+            "literal$`": "not an expression",
+            "f()=`": "literal function-looking key",
+            "matrix[i=items]=`": "literal compose-looking key",
+        }
+        resolver = jinest.Resolver(data, in_place=True, emit_messages=False)
+        expected = {
+            "literal$": "not an expression",
+            "f()=": "literal function-looking key",
+            "matrix[i=items]=": "literal compose-looking key",
+        }
+
+        first = resolver.resolve()
+        self.assertIs(first, data)
+        self.assertEqual(first, expected)
+        self.assertEqual(list(resolver.root), list(expected))
+        self.assertIs(resolver.resolve(), data)
+        self.assertEqual(data, expected)
+
+    def test_in_place_custom_mapping_needs_no_deepcopy_or_equality(self) -> None:
+        class HostileMapping(dict[str, Any]):
+            def __deepcopy__(self, memo: dict[int, Any]) -> Any:
+                raise RuntimeError("deepcopy must not be called")
+
+            def __eq__(self, other: object) -> bool:
+                return True
+
+        data = HostileMapping({"value$": "1"})
+        resolver = jinest.Resolver(data, in_place=True, emit_messages=False)
+
+        self.assertIs(resolver.resolve(), data)
+        self.assertEqual(dict(data), {"value": 1})
+        data.clear()
+        data["value$"] = "2"
+
+        self.assertIs(resolver.resolve(), data)
+        self.assertEqual(dict(data), {"value": 2})
+
+    def test_failed_in_place_resolution_does_not_mutate_input(self) -> None:
+        data = {"kept": 1, "invalid$": "("}
+        resolver = jinest.Resolver(data, in_place=True, emit_messages=False)
+
+        with self.assertRaises(jinest.JinestTemplateError):
+            resolver.resolve()
+
+        self.assertEqual(data, {"kept": 1, "invalid$": "("})
+
+    def test_in_place_resolve_starts_a_fresh_import_and_diagnostic_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            imported = folder / "value.json"
+            imported.write_text('{"value": 1}', encoding="utf-8")
+            data = {
+                "imported$": "import_json('value.json')",
+                "name": 1,
+                "name$": "2",
+            }
+            resolver = jinest.Resolver(
+                data,
+                base_dir=folder,
+                in_place=True,
+                emit_messages=False,
+            )
+
+            self.assertEqual(
+                resolver.resolve(),
+                {"imported": {"value": 1}, "name": 1},
+            )
+            self.assertEqual(
+                [message.level for message in resolver.messages],
+                ["warning"],
+            )
+
+            imported.write_text('{"value": 2}', encoding="utf-8")
+            data.clear()
+            data["imported$"] = "import_json('value.json')"
+
+            self.assertEqual(resolver.resolve(), {"imported": {"value": 2}})
+            self.assertEqual(resolver.messages, [])
 
     def test_failed_field_layer_and_dynamic_key_accesses_retry_cleanly(self) -> None:
         """Each public lazy cache removes its temporary entry after an error."""
@@ -1647,6 +1730,23 @@ class JinestFormatAndImportTests(unittest.TestCase):
         ):
             self._serialize_public_value({(1, 2): 3}, "json")
 
+    def test_pathref_mapping_keys_materialize_to_strings(self) -> None:
+        result = jinest.resolve(
+            {"result^": "% return {path: 1}\n"},
+            emit_messages=False,
+        )
+        self.assertEqual(result, {"result": {"global_root": 1}})
+        self.assertEqual(json.loads(json.dumps(result)), result)
+
+        with self.assertRaisesRegex(
+            jinest.JinestError,
+            "Duplicate mapping key after materialization",
+        ):
+            jinest.resolve(
+                {"result^": "% return {path: 1, (path|string): 2}\n"},
+                emit_messages=False,
+            )
+
     def test_yaml_json_import_globals_aliases_and_filters(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             folder = Path(temp_dir)
@@ -1846,6 +1946,39 @@ container:
             )
             self.assertEqual(result, {"other": {"back": None}})
 
+    def test_import_cycle_uses_the_current_import_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            (folder / "a.json").write_text(
+                json.dumps({"c$": 'import_json("c.json")'}),
+                encoding="utf-8",
+            )
+            (folder / "x.json").write_text(
+                json.dumps({"c$": 'import_json("c.json")'}),
+                encoding="utf-8",
+            )
+            (folder / "c.json").write_text(
+                json.dumps({"a$": 'import_json("a.json")'}),
+                encoding="utf-8",
+            )
+
+            result = jinest.Resolver(
+                {
+                    "first$": "import_json('a.json')",
+                    "second$": "import_json('x.json')",
+                },
+                base_dir=folder,
+                emit_messages=False,
+            ).resolve()
+
+        self.assertEqual(
+            result,
+            {
+                "first": {"c": {"a": None}},
+                "second": {"c": {"a": {"c": None}}},
+            },
+        )
+
     def test_missing_import_is_wrapped(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             folder = Path(temp_dir)
@@ -1991,6 +2124,58 @@ class JinestPathAndMetadataTests(unittest.TestCase):
             self.assertEqual(result["root_file"], str(library.resolve()))
             self.assertEqual(result["origin_file"], str(library.resolve()))
             self.assertEqual(result["source_root_path"], "root")
+
+    def test_structural_function_preserves_returned_import_source_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            library_dir = folder / "lib"
+            library_dir.mkdir()
+            library = library_dir / "library.json"
+            library.write_text(
+                json.dumps(
+                    {
+                        "prototype": {
+                            "root_file$": "source_file(root)",
+                            "origin_path$": "origin.path",
+                            "source_path$": "context.source_path",
+                            "nested$": "import_json('nested.json')",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (library_dir / "nested.json").write_text(
+                '{"value": "library-relative"}', encoding="utf-8"
+            )
+            (folder / "nested.json").write_text(
+                '{"value": "wrong-main-relative"}', encoding="utf-8"
+            )
+
+            result = jinest.resolve(
+                {
+                    "make()=": {
+                        "node$": "import_json('lib/library.json').prototype"
+                    },
+                    "result$": "make()",
+                },
+                base_dir=folder,
+                source_path=folder / "main.json",
+                emit_messages=False,
+            )
+
+            self.assertEqual(
+                result,
+                {
+                    "result": {
+                        "node": {
+                            "root_file": str(library.resolve()),
+                            "origin_path": "root.prototype",
+                            "source_path": "root.prototype",
+                            "nested": {"value": "library-relative"},
+                        }
+                    }
+                },
+            )
 
     def test_at_can_return_nodes_and_scalar_fields(self) -> None:
         resolver = jinest.Resolver(
@@ -2494,6 +2679,70 @@ class JinestBindingAndCycleContractTests(unittest.TestCase):
             },
         )
 
+    def test_runtime_layer_mapping_does_not_reuse_a_cycle_sentinel(self) -> None:
+        self.assertEqual(
+            jinest.resolve(
+                {"target": {"<<$": "make()"}},
+                globals={"make": lambda: {"value": 43}},
+                emit_messages=False,
+            ),
+            {"target": {"value": 43}},
+        )
+
+    def test_nested_structural_function_calls_are_finite(self) -> None:
+        self.assertEqual(
+            jinest.resolve(
+                {
+                    "box(x)=": {"value$": "x"},
+                    "result$": "box(box(1))",
+                },
+                emit_messages=False,
+            ),
+            {"result": {"value": {"value": 1}}},
+        )
+
+    def test_schema_diagnostics_distinguish_shared_source_occurrences(self) -> None:
+        shared = {"value": 1, "value$": "2"}
+        resolver = jinest.Resolver(
+            {"left": shared, "right": shared}, emit_messages=False
+        )
+
+        resolver.resolve()
+
+        self.assertEqual(
+            [(message.level, message.path) for message in resolver.messages],
+            [("warning", "root.left"), ("warning", "root.right")],
+        )
+
+    def test_import_diamond_reuses_one_document_and_one_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            (folder / "common.json").write_text(
+                '{"value": 1, "value$": "2"}', encoding="utf-8"
+            )
+            (folder / "left.json").write_text(
+                '{"common$": "import_json(\'common.json\')"}', encoding="utf-8"
+            )
+            (folder / "right.json").write_text(
+                '{"common$": "import_json(\'common.json\')"}', encoding="utf-8"
+            )
+            resolver = jinest.Resolver(
+                {
+                    "left$": "import_json('left.json')",
+                    "right$": "import_json('right.json')",
+                },
+                base_dir=folder,
+                emit_messages=False,
+            )
+            self.assertEqual(
+                resolver.resolve(),
+                {"left": {"common": {"value": 1}}, "right": {"common": {"value": 1}}},
+            )
+
+        warnings = [message for message in resolver.messages if message.level == "warning"]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0].file, str(folder / "common.json"))
+
     def test_physical_python_container_cycle_is_an_error(self) -> None:
         source: dict[str, Any] = {}
         source["self"] = source
@@ -2555,7 +2804,8 @@ class JinestBindingAndCycleContractTests(unittest.TestCase):
                 "module = importlib.util.module_from_spec(spec)",
                 "sys.modules[spec.name] = module",
                 "spec.loader.exec_module(module)",
-                "assert module.resolve({'value$': '40 + 2'}, emit_messages=False) == {'value': 42}",
+                "result = module.resolve({'value$': '40 + 2'}, emit_messages=False)",
+                "if result != {'value': 42}: raise SystemExit(f'unexpected result: {result!r}')",
             ]
         )
         completed = subprocess.run(
@@ -2566,6 +2816,40 @@ class JinestBindingAndCycleContractTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    @unittest.skipIf(sys.flags.optimize, "the optimized child process is tested once")
+    def test_self_test_checks_are_active_under_python_optimized_mode(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, "-O", str(JINEST_MODULE_PATH), "--self-test"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Jinest self-test: OK", completed.stdout)
+
+        source = JINEST_MODULE_PATH.read_text(encoding="utf-8")
+        marker = '(resolver.root.example.rank, "o2", "override priority")'
+        self.assertIn(marker, source)
+        broken_source = source.replace(
+            marker,
+            '(resolver.root.example.rank, "deliberately-wrong", "override priority")',
+            1,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            broken_module = Path(temp_dir) / "jinest.py"
+            broken_module.write_text(broken_source, encoding="utf-8")
+            failed = subprocess.run(
+                [sys.executable, "-O", str(broken_module), "--self-test"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertTrue(failed.stderr.startswith("jinest: Jinest self-test failed"))
+        self.assertIn("Jinest self-test failed", failed.stderr)
+        self.assertNotIn("Traceback", failed.stderr)
 
     def test_runtime_jinja_meets_the_minimum_requirement(self) -> None:
         import jinja2

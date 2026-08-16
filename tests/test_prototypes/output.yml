@@ -23,4 +23,3 @@ instance_group:
     source_constant: 10
     destination: global_root.instance_group.second
     declaration: root.prototype
-

@@ -4,4 +4,3 @@ left:
 right:
   source_path: root
   destination_path: global_root.right
-

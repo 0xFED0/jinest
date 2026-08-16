@@ -7,4 +7,3 @@ left:
 right:
   origin_path: root.prototype
   destination_path: global_root.right
-

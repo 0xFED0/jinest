@@ -1,0 +1,3 @@
+# A merge result replaces the temporary cycle sentinel with a real mapping.
+target:
+  <<$: "{'value': 43}"

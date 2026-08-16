@@ -1,0 +1,7 @@
+# A structural function may return a node from another source document.
+# Destination path is rebound, but source root/origin and relative imports stay
+# anchored to that imported document.
+make()=:
+  node$: import_json('lib/library.json').prototype
+
+result$: make()

@@ -1,0 +1,9 @@
+{
+  "constant": 17,
+  "prototype": {
+    "root_value$": "root.constant",
+    "origin_path$": "origin.path",
+    "destination_path$": "path",
+    "nested$": "import_json('nested.json')"
+  }
+}

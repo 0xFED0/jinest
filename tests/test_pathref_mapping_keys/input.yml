@@ -1,0 +1,3 @@
+# A PathRef returned as a mapping key is materialized to its canonical string.
+result^: |
+  % return {path: "value"}

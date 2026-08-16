@@ -10,4 +10,3 @@ settings:
   - 8080
   - 8081
 priority: literal-wins
-

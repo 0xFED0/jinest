@@ -42,7 +42,7 @@ Syntax
 * ``Resolver.messages`` collects ``warning`` and ``hint`` diagnostics; use
   ``emit_messages=False`` or ``treat_warnings_as_errors=True`` to control them.
 
-Requires: Jinja2 >= 3.1.
+Requires: Jinja2 >= 3.1, < 4.
 When this module is copied and used directly, PyYAML is optional and needed
 only for YAML input/output. The published wheel installs PyYAML by default.
 """
@@ -59,6 +59,7 @@ import re
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from enum import Enum
 from itertools import product
 from dataclasses import dataclass, field
@@ -89,7 +90,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.14.2"
+__version__ = "0.14.3"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -187,16 +188,39 @@ class _Source:
     source_path: tuple[Any, ...] = ()
 
     @property
-    def identity(self) -> "_DocumentNodeId":
-        return _DocumentNodeId(id(self.resolver), self.source_path)
+    def document_id(self) -> "_DocumentNodeId":
+        """Stable identity of the declaration location in its document."""
+        return _DocumentNodeId(
+            self.resolver._document_identity,
+            self.source_path,
+        )
+
+    @property
+    def instance_id(self) -> "_SourceInstanceId":
+        """Identity of the concrete raw value at one declaration location.
+
+        An evaluation may temporarily use an empty cycle sentinel and later
+        produce a real mapping at the same source path. Runtime caches must
+        never conflate those values.
+        """
+        return _SourceInstanceId(self.document_id, id(self.raw), self.raw)
 
 
 @dataclass(frozen=True, slots=True)
 class _DocumentNodeId:
     """Identity of one source-node occurrence, independent of raw aliases."""
 
-    resolver_id: int
+    document_identity: object
     source_path: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceInstanceId:
+    """One concrete raw container at a document location."""
+
+    document: _DocumentNodeId
+    raw_id: int
+    raw: Any = field(compare=False, hash=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,7 +253,7 @@ class _BindingCache:
     resolved: dict[Any, Any] = field(default_factory=dict)
     public_resolved: dict[Any, Any] = field(default_factory=dict)
     layers: dict[_DeclarationId, _Source | None] = field(default_factory=dict)
-    key_indexes: dict[_DocumentNodeId, Any] = field(default_factory=dict)
+    key_indexes: dict[_SourceInstanceId, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -646,7 +670,8 @@ def _parse_self_declaration(value: Any) -> _SelfSpec | None:
             function = _parse_function_declaration(synthetic_key, body)
         except JinestError as exc:
             raise JinestError(str(exc).replace(repr(synthetic_key), repr(key), 1)) from exc
-        assert function is not None
+        if function is None:
+            raise JinestError(f"Malformed self structural function {key!r}")
         function = _FunctionSpec(
             name="__jinest_self",
             source_key=key,
@@ -661,7 +686,8 @@ def _parse_self_declaration(value: Any) -> _SelfSpec | None:
             compose = _parse_compose_declaration(synthetic_key, body)
         except JinestError as exc:
             raise JinestError(str(exc).replace(repr(synthetic_key), repr(key), 1)) from exc
-        assert compose is not None
+        if compose is None:
+            raise JinestError(f"Malformed self structural compose {key!r}")
         compose = _ComposeSpec(
             name="__jinest_self",
             source_key=key,
@@ -937,10 +963,6 @@ class _ContainerProxy:
         "_jinest_path",
         "_jinest_path_kind",
         "_jinest_children",
-        "_jinest_local_vars",
-        "_jinest_function_scope",
-        "_jinest_function_origin_source",
-        "_jinest_function_body_source_path",
         "_jinest_binding",
     )
 
@@ -962,18 +984,6 @@ class _ContainerProxy:
         object.__setattr__(self, "_jinest_path", path)
         object.__setattr__(self, "_jinest_path_kind", path_kind)
         object.__setattr__(self, "_jinest_children", {})
-        object.__setattr__(self, "_jinest_local_vars", local_vars)
-        object.__setattr__(self, "_jinest_function_scope", function_scope)
-        object.__setattr__(
-            self,
-            "_jinest_function_origin_source",
-            function_origin_source,
-        )
-        object.__setattr__(
-            self,
-            "_jinest_function_body_source_path",
-            function_body_source_path,
-        )
         frame = _EvaluationFrame(
             local_vars,
             function_scope,
@@ -982,8 +992,6 @@ class _ContainerProxy:
         )
         binding = owner._new_binding(frame)
         object.__setattr__(self, "_jinest_binding", binding)
-        # Keep legacy proxy attributes as aliases while moving their ownership
-        # to BindingCache. This makes the migration behavior-preserving.
         object.__setattr__(self, "_jinest_children", binding.cache.children)
 
     def __getattribute__(self, name: str) -> Any:
@@ -1029,7 +1037,7 @@ class _ContainerProxy:
 
     def __str__(self) -> str:
         owner = object.__getattribute__(self, "_jinest_owner")
-        return str(owner._to_plain(self, active=set()))
+        return str(owner._to_plain(self, state=_MaterializationState()))
 
     def _jinest_resolve_name(self, key: str) -> Any:
         return _MISSING
@@ -1089,7 +1097,7 @@ class _MappingProxy(_ContainerProxy, Mapping):
         owner = object.__getattribute__(self, "_jinest_owner")
         if owner._scope_has_logical(self, key):
             return owner._get_field(self, key)
-        function_scope = object.__getattribute__(self, "_jinest_function_scope")
+        function_scope = object.__getattribute__(self, "_jinest_binding").frame.function_scope
         if isinstance(function_scope, _ContainerProxy) and function_scope is not self:
             return function_scope._jinest_resolve_name(key)
         return _MISSING
@@ -1284,18 +1292,50 @@ class DiagnosticSink:
         self.messages.append(message)
         return True
 
+    def clear(self) -> None:
+        """Discard diagnostics from a completed in-place resolution run."""
+        self.messages.clear()
+        self.keys.clear()
+        self.emitted_count = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _ImportedDocument:
+    """Parsed import payload reused by independent lazy resolvers."""
+
+    data: Any
+    identity: tuple[str, Path, str]
+
 
 @dataclass(slots=True)
 class DocumentStore:
-    """Import-document cache scoped to one resolver and its import chain."""
+    """Parsed import cache scoped to one top-level resolution run."""
 
-    cache: dict[tuple[Path, str], "Resolver"] = field(default_factory=dict)
+    cache: dict[tuple[Path, str], _ImportedDocument] = field(default_factory=dict)
+    runtimes: dict[tuple[Path, str, tuple[Path, ...]], "Resolver"] = field(
+        default_factory=dict
+    )
 
-    def get(self, path: Path, format: str) -> "Resolver | None":
+    def get(self, path: Path, format: str) -> _ImportedDocument | None:
         return self.cache.get((path, format))
 
-    def put(self, path: Path, format: str, resolver: "Resolver") -> None:
-        self.cache[(path, format)] = resolver
+    def put(self, path: Path, format: str, data: Any) -> _ImportedDocument:
+        document = _ImportedDocument(data, ("import", path, format))
+        self.cache[(path, format)] = document
+        return document
+
+    def clear(self) -> None:
+        self.cache.clear()
+        self.runtimes.clear()
+
+
+@dataclass(slots=True)
+class _MaterializationState:
+    """Active identities while converting lazy nodes to plain Python values."""
+
+    bindings: set[_BindingId] = field(default_factory=set)
+    proxy_raw: dict[int, list["_ContainerProxy"]] = field(default_factory=dict)
+    plain_raw: set[int] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -1305,7 +1345,7 @@ class Materializer:
     resolver: "Resolver"
 
     def materialize(self, value: Any) -> Any:
-        return self.resolver._to_plain(value, active=set())
+        return self.resolver._to_plain(value, state=_MaterializationState())
 
 
 @dataclass(slots=True)
@@ -1336,7 +1376,7 @@ class Resolver:
     """Resolve a structured Python tree containing lazy Jinja fields.
 
     Instances are stateful and not reentrant or thread-safe. Use one Resolver
-    per concurrent resolution; immutable ResolverConfig values may be reused.
+    per concurrent resolution.
     """
 
     def __init__(
@@ -1357,6 +1397,9 @@ class Resolver:
         debug: bool = False,
         _import_chain: tuple[Path, ...] | None = None,
         _global_owner: "Resolver | None" = None,
+        _documents: DocumentStore | None = None,
+        _document_identity: object | None = None,
+        _copy_input: bool = True,
     ) -> None:
         self.in_place = in_place
         self.strict = strict
@@ -1374,15 +1417,15 @@ class Resolver:
         self.treat_warnings_as_errors = treat_warnings_as_errors
         self.debug = debug
         self._global_owner = _global_owner or self
+        if _document_identity is None:
+            self._document_identity: object = ("memory", id(self))
+        else:
+            self._document_identity = _document_identity
         self._binding_serial = 0
-        # Diagnostics that receive only a raw object use its first discovered
-        # source occurrence. Source/binding semantics never consult this map.
-        self._physical_source_fallbacks: dict[int, _Source] = {}
         if self._global_owner is self:
             self._diagnostics = DiagnosticSink()
         else:
             self._diagnostics = self._global_owner._diagnostics
-            self._physical_source_fallbacks = self._global_owner._physical_source_fallbacks
         self.messages = self._diagnostics.messages
         self._message_keys = self._diagnostics.keys
         self._function_depth = 0
@@ -1390,7 +1433,13 @@ class Resolver:
         self._user_globals = dict(globals or {})
         self._user_filters = dict(filters or {})
         self._original = data
+        self._in_place_snapshot: Any = _MISSING
         if in_place:
+            self.data = data
+        elif not _copy_input:
+            # Imported documents are immutable parsed payloads owned by the
+            # per-run DocumentStore. Bindings never mutate their source, so
+            # independent import occurrences can safely share this tree.
             self.data = data
         else:
             try:
@@ -1403,10 +1452,10 @@ class Resolver:
                 self.data = data
         self._syntax = SyntaxCompiler(self)
         self._evaluators = EvaluatorRegistry()
-        self._documents = DocumentStore()
+        self._documents = _documents or DocumentStore()
         self._import_cache = self._documents.cache
         self._materializer = Materializer(self)
-        self._source_view_cache: dict[_DocumentNodeId, _ContainerProxy] = {}
+        self._source_view_cache: dict[_SourceInstanceId, _ContainerProxy] = {}
         self.source_path = Path(source_path).expanduser().resolve() if source_path else None
         if base_dir is not None:
             self.base_dir = Path(base_dir).expanduser().resolve()
@@ -1427,9 +1476,18 @@ class Resolver:
             self.import_roots = roots
 
         self.config = ResolverConfig(
-            in_place, strict, sandboxed, self._user_globals, self._user_filters,
-            self.source_path, self.base_dir, self.import_roots, function_max_depth,
-            emit_messages, treat_warnings_as_errors, debug,
+            in_place,
+            strict,
+            sandboxed,
+            MappingProxyType(self._user_globals.copy()),
+            MappingProxyType(self._user_filters.copy()),
+            self.source_path,
+            self.base_dir,
+            self.import_roots,
+            function_max_depth,
+            emit_messages,
+            treat_warnings_as_errors,
+            debug,
         )
 
         if _import_chain is not None:
@@ -1557,11 +1615,8 @@ class Resolver:
     def _source_location(
         self,
         source: _Source | None = None,
-        raw: Any | None = None,
         path: tuple[Any, ...] | None = None,
     ) -> tuple[str | None, str | None]:
-        if source is None and raw is not None:
-            source = self._physical_source_fallbacks.get(id(raw))
         if source is None:
             return None, None
         source_path = source.source_path if path is None else path
@@ -1577,14 +1632,13 @@ class Resolver:
         *,
         dedupe_key: tuple[Any, ...] | None = None,
         source: _Source | None = None,
-        raw: Any | None = None,
         path: tuple[Any, ...] | None = None,
     ) -> None:
         """Add one deduplicated diagnostic to the shared resolver message list."""
         if level not in {"warning", "hint"}:
             raise ValueError(f"Unsupported message level: {level!r}")
         key = dedupe_key or (level, msg)
-        message_path, message_file = self._source_location(source, raw, path)
+        message_path, message_file = self._source_location(source, path=path)
         self._diagnostics.add(
             JinestMessage(level, msg, message_path, message_file), key
         )
@@ -1670,7 +1724,7 @@ class Resolver:
                     path_kind="source",
                 )
             root_source = object.__getattribute__(self._source_root, "_jinest_source")
-            self._source_view_cache[root_source.identity] = self._source_root
+            self._source_view_cache[root_source.instance_id] = self._source_root
         else:
             # Scalars have no template scope or source-view metadata.
             self._source_root = self.root
@@ -1678,10 +1732,133 @@ class Resolver:
         if isinstance(self.data, Mapping):
             # Make root diagnostics available immediately through ``messages``;
             # nested mappings are discovered when their lazy scopes are visited.
-            self._schema(self.data)
+            self._schema_for_source(root_source)
+
+    def _reset_in_place_state(self, *, fresh_resolution: bool) -> None:
+        """Rebuild reusable-root state without retaining prior resolution data."""
+        if fresh_resolution:
+            self._documents.clear()
+            self._diagnostics.clear()
+            self._function_depth = 0
+            self._function_stack.clear()
+        self._syntax.clear()
+        self._jinja_compilation_cache.clear()
+        self._jinja.template_cache.clear()
+        self._source_view_cache.clear()
+        self._reset_root_views()
+
+    @staticmethod
+    def _in_place_fingerprint(value: Any, *, active: set[int] | None = None) -> Any:
+        """Return a comparison-safe snapshot of a materialized value.
+
+        ``in_place`` accepts arbitrary ``MutableMapping`` and
+        ``MutableSequence`` implementations. Their ``__eq__`` and
+        ``__deepcopy__`` methods are application code, so neither may decide
+        whether a resolved result is still current. The fingerprint contains
+        only builtin immutable values and returns ``_MISSING`` for a value
+        outside Jinest's materialized data model.
+        """
+        if active is None:
+            active = set()
+        if value is None:
+            return ("none",)
+        if isinstance(value, bool):
+            return ("bool", value)
+        if isinstance(value, int):
+            return ("int", int(value))
+        if isinstance(value, float):
+            return ("float", float(value))
+        if isinstance(value, str):
+            return ("str", str(value))
+        if isinstance(value, bytes):
+            return ("bytes", bytes(value))
+        if isinstance(value, bytearray):
+            return ("bytearray", bytes(value))
+        if isinstance(value, time):
+            return ("time", type(value).__qualname__, value.isoformat())
+        if isinstance(value, date):
+            return ("date", type(value).__qualname__, value.isoformat())
+        if isinstance(value, Mapping):
+            value_id = id(value)
+            if value_id in active:
+                return _MISSING
+            active.add(value_id)
+            try:
+                items: list[tuple[Any, Any]] = []
+                for key, item in value.items():
+                    frozen_key = Resolver._in_place_fingerprint(key, active=active)
+                    frozen_item = Resolver._in_place_fingerprint(item, active=active)
+                    if frozen_key is _MISSING or frozen_item is _MISSING:
+                        return _MISSING
+                    items.append((frozen_key, frozen_item))
+                return ("mapping", tuple(items))
+            except Exception:
+                return _MISSING
+            finally:
+                active.remove(value_id)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            value_id = id(value)
+            if value_id in active:
+                return _MISSING
+            active.add(value_id)
+            try:
+                items = tuple(
+                    Resolver._in_place_fingerprint(item, active=active)
+                    for item in value
+                )
+                if any(item is _MISSING for item in items):
+                    return _MISSING
+                return ("sequence", items)
+            except Exception:
+                return _MISSING
+            finally:
+                active.remove(value_id)
+        return _MISSING
+
+    def _commit_in_place_result(self, result: Any) -> None:
+        """Replace the mutable root after all fallible resolution work succeeds."""
+        if isinstance(self._original, MutableMapping) and isinstance(result, Mapping):
+            previous = list(self._original.items())
+            try:
+                self._original.clear()
+                self._original.update(result)
+            except Exception:
+                # Best-effort rollback for custom mutable mappings. Standard
+                # dict/list operations cannot fail here, while custom classes
+                # may reject one of the replacement operations.
+                try:
+                    self._original.clear()
+                    self._original.update(previous)
+                except Exception:
+                    pass
+                raise
+            self.data = self._original
+            return
+        if (
+            isinstance(self._original, MutableSequence)
+            and not isinstance(self._original, (str, bytes, bytearray))
+            and isinstance(result, list)
+        ):
+            previous = list(self._original)
+            try:
+                self._original[:] = result
+            except Exception:
+                try:
+                    self._original[:] = previous
+                except Exception:
+                    pass
+                raise
+            self.data = self._original
+            return
+        self.data = result
 
     def resolve(self) -> Any:
         """Fully materialize the lazy tree into ordinary Python values."""
+        if self.in_place:
+            if self._in_place_snapshot is not _MISSING:
+                if self._in_place_fingerprint(self.data) == self._in_place_snapshot:
+                    return self.data
+            self._reset_in_place_state(fresh_resolution=True)
         try:
             result = self._materializer.materialize(self.root)
         except Exception as exc:
@@ -1693,24 +1870,20 @@ class Resolver:
         self._finalize_messages()
 
         if self.in_place:
-            if isinstance(self._original, MutableMapping) and isinstance(result, Mapping):
-                self._original.clear()
-                self._original.update(result)
-                self.data = self._original
-            elif (
-                isinstance(self._original, MutableSequence)
-                and not isinstance(self._original, (str, bytes, bytearray))
-                and isinstance(result, list)
-            ):
-                self._original[:] = result
-                self.data = self._original
-            else:
-                self.data = result
+            snapshot = self._in_place_fingerprint(result)
+            if snapshot is _MISSING:  # materialization invariant
+                raise JinestError("Could not snapshot materialized in-place result")
+            self._commit_in_place_result(result)
 
-            self._syntax.clear()
-            self._jinja_compilation_cache.clear()
-            self._source_view_cache.clear()
-            self._reset_root_views()
+            # Keep the successfully compiled source views alive. Rebuilding
+            # them here would parse the materialized output as fresh Jinest
+            # source (notably turning raw mode-looking output back into code).
+            # A later external mutation is detected above and starts a fresh
+            # run; an unchanged repeated resolve is idempotent.
+            self._in_place_snapshot = snapshot
+            self.root = self.data
+            self._source_root = self.data
+            self.global_root = self.data
             return self.data
 
         return result
@@ -1746,17 +1919,13 @@ class Resolver:
         if isinstance(value, _ContainerProxy):
             source = object.__getattribute__(value, "_jinest_source")
             if local_vars is None:
-                local_vars = object.__getattribute__(value, "_jinest_local_vars")
+                local_vars = object.__getattribute__(value, "_jinest_binding").frame.local_vars
             if function_scope is None:
-                function_scope = object.__getattribute__(value, "_jinest_function_scope")
+                function_scope = object.__getattribute__(value, "_jinest_binding").frame.function_scope
             if function_origin_source is None:
-                function_origin_source = object.__getattribute__(
-                    value, "_jinest_function_origin_source"
-                )
+                function_origin_source = object.__getattribute__(value, "_jinest_binding").frame.function_origin_source
             if function_body_source_path is None:
-                function_body_source_path = object.__getattribute__(
-                    value, "_jinest_function_body_source_path"
-                )
+                function_body_source_path = object.__getattribute__(value, "_jinest_binding").frame.function_body_source_path
         elif isinstance(value, Mapping):
             source = _Source(origin or self, value, tuple(source_path or ()))
         elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
@@ -1764,7 +1933,6 @@ class Resolver:
         else:
             return self._copy_scalar(value)
 
-        self._physical_source_fallbacks.setdefault(id(source.raw), source)
         if isinstance(source.raw, Mapping):
             return _MappingProxy(
                 self,
@@ -1821,26 +1989,20 @@ class Resolver:
             return self._copy_scalar(value)
 
         if local_vars is None:
-            local_vars = object.__getattribute__(parent, "_jinest_local_vars")
+            local_vars = object.__getattribute__(parent, "_jinest_binding").frame.local_vars
         if function_scope is None:
-            function_scope = object.__getattribute__(parent, "_jinest_function_scope")
+            function_scope = object.__getattribute__(parent, "_jinest_binding").frame.function_scope
         if function_origin_source is None:
-            function_origin_source = object.__getattribute__(
-                parent, "_jinest_function_origin_source"
-            )
+            function_origin_source = object.__getattribute__(parent, "_jinest_binding").frame.function_origin_source
         if function_body_source_path is None:
-            function_body_source_path = object.__getattribute__(
-                parent, "_jinest_function_body_source_path"
-            )
+            function_body_source_path = object.__getattribute__(parent, "_jinest_binding").frame.function_body_source_path
 
         if isinstance(value, _ContainerProxy):
             source = object.__getattribute__(value, "_jinest_source")
             raw = source.raw
             source_origin = source.resolver
-            value_local_vars = object.__getattribute__(value, "_jinest_local_vars")
-            value_body_source_path = object.__getattribute__(
-                value, "_jinest_function_body_source_path"
-            )
+            value_local_vars = object.__getattribute__(value, "_jinest_binding").frame.local_vars
+            value_body_source_path = object.__getattribute__(value, "_jinest_binding").frame.function_body_source_path
             if value_body_source_path is not None:
                 # A structural function result carries its parameter frame,
                 # but its temporary call-site scope must never leak into the
@@ -1859,15 +2021,11 @@ class Resolver:
                 if local_vars is None:
                     local_vars = value_local_vars
                 if function_scope is None:
-                    function_scope = object.__getattribute__(value, "_jinest_function_scope")
+                    function_scope = object.__getattribute__(value, "_jinest_binding").frame.function_scope
             if function_origin_source is None:
-                function_origin_source = object.__getattribute__(
-                    value, "_jinest_function_origin_source"
-                )
+                function_origin_source = object.__getattribute__(value, "_jinest_binding").frame.function_origin_source
             if function_body_source_path is None:
-                function_body_source_path = object.__getattribute__(
-                    value, "_jinest_function_body_source_path"
-                )
+                function_body_source_path = object.__getattribute__(value, "_jinest_binding").frame.function_body_source_path
         else:
             raw = value
             source_origin = origin or self
@@ -1912,7 +2070,6 @@ class Resolver:
             # Nested body fields resolve through the fresh destination
             # parent, never through the temporary proxy created at the call
             # site. The parameter frame remains on the structural node.
-            object.__setattr__(proxy, "_jinest_function_scope", parent)
             object.__getattribute__(proxy, "_jinest_binding").frame.function_scope = parent
         children[key] = (cache_token, proxy)
         return proxy
@@ -1990,7 +2147,7 @@ class Resolver:
     ) -> tuple[_MappingKeyEntry, ...]:
         """Build a destination-bound index of static, raw, and dynamic keys."""
         indexes = object.__getattribute__(bind, "_jinest_key_indexes")
-        cache_key = source.identity
+        cache_key = source.instance_id
         cached = indexes.get(cache_key, _MISSING)
         if cached is not _MISSING:
             # While dynamic keys are being evaluated, static keys are already
@@ -2295,7 +2452,8 @@ class Resolver:
                 return LayerResult(result, applied=True)
             if self_spec.mode == "structural":
                 function = self_spec.payload
-                assert isinstance(function, _FunctionSpec)
+                if not isinstance(function, _FunctionSpec):
+                    raise JinestError(f"Malformed self structural function {self_spec.source_key!r}")
                 spec = _FunctionSpec(
                     name=str(keyname),
                     source_key=self_spec.source_key,
@@ -2306,7 +2464,8 @@ class Resolver:
                 return LayerResult(self._function_value(origin_source, spec), applied=True)
             if self_spec.mode == "compose_structural":
                 compose = self_spec.payload
-                assert isinstance(compose, _ComposeSpec)
+                if not isinstance(compose, _ComposeSpec):
+                    raise JinestError(f"Malformed self structural compose {self_spec.source_key!r}")
                 spec = _ComposeSpec(
                     name=str(keyname),
                     source_key=self_spec.source_key,
@@ -2354,8 +2513,11 @@ class Resolver:
         )
         return LayerResult(result, applied=True)
 
-    def _record_schema_messages(self, raw: Mapping[Any, Any]) -> None:
+    def _record_schema_messages(self, source: _Source) -> None:
         """Report declarations that are present but cannot become effective."""
+        raw = source.raw
+        if not isinstance(raw, Mapping):
+            return
         declarations: dict[tuple[str, bool], list[tuple[int, str]]] = {}
         priority = {"": 0, "^": 1, "$": 2, "@": 3}
         for key in raw:
@@ -2404,8 +2566,8 @@ class Resolver:
                     "warning",
                     f"Field {winner!r} suppresses {suppressed!r}; local priority is "
                     "name > name^ > name$ > name@",
-                    dedupe_key=("warning", id(raw), winner, suppressed),
-                    raw=raw,
+                    dedupe_key=("warning", source.document_id, winner, suppressed),
+                    source=source,
                 )
 
         public_names = {logical for (logical, hidden) in declarations if not hidden}
@@ -2415,12 +2577,17 @@ class Resolver:
                 "hint",
                 f"Hidden field '.{logical}' takes priority over field {logical!r} "
                 "in template calculations; the public field remains in the final dump",
-                dedupe_key=("hint", id(raw), logical),
-                raw=raw,
+                dedupe_key=("hint", source.document_id, logical),
+                source=source,
             )
 
     def _schema(self, raw: Mapping[Any, Any]) -> CompiledMapping:
         return self._syntax.compile(raw)
+
+    def _schema_for_source(self, source: _Source) -> CompiledMapping:
+        schema = self._schema(source.raw)
+        self._record_schema_messages(source)
+        return schema
 
     def _compile_mapping(self, raw: Mapping[Any, Any]) -> CompiledMapping:
 
@@ -2509,7 +2676,6 @@ class Resolver:
         schema = CompiledMapping(
             raw, tuple(defaults), tuple(overrides), tuple(functions), tuple(composes)
         )
-        self._record_schema_messages(raw)
         return schema
 
     def _local_candidate(
@@ -2523,7 +2689,7 @@ class Resolver:
         """Return one local declaration from the hidden or public namespace."""
         source_key = f".{key}" if hidden and isinstance(key, str) else key
         if not hidden and isinstance(source_key, str):
-            for compose in self._schema(source.raw).composes:
+            for compose in self._schema_for_source(source).composes:
                 if compose.name == source_key:
                     return _Candidate(
                         compose.source_key,
@@ -2568,10 +2734,10 @@ class Resolver:
     def _hidden_name(key: Any) -> bool:
         return isinstance(key, str) and not key.startswith(".")
 
-    def _local_function(self, raw: Mapping[Any, Any], key: Any) -> _FunctionSpec | None:
+    def _local_function(self, source: _Source, key: Any) -> _FunctionSpec | None:
         if not isinstance(key, str) or key.startswith("."):
             return None
-        schema = self._schema(raw)
+        schema = self._schema_for_source(source)
         for function in schema.functions:
             if function.name == key:
                 return function
@@ -2613,7 +2779,7 @@ class Resolver:
             return False
         active.add(token)
         try:
-            schema = self._schema(source.raw)
+            schema = self._schema_for_source(source)
 
             for layer in reversed(schema.overrides):
                 layer_source = self._evaluate_layer(bind, source, layer)
@@ -2622,7 +2788,7 @@ class Resolver:
                 ):
                     return True
 
-            if not hidden and self._local_function(source.raw, key) is not None:
+            if not hidden and self._local_function(source, key) is not None:
                 return True
             if self._local_candidate(source, bind, key, hidden=hidden) is not None:
                 return True
@@ -2702,7 +2868,7 @@ class Resolver:
             return _MISSING
         active.add(token)
         try:
-            schema = self._schema(source.raw)
+            schema = self._schema_for_source(source)
 
             # Reverse lookup of: defaults -> local -> overrides.
             for layer in reversed(schema.overrides):
@@ -2714,7 +2880,7 @@ class Resolver:
                     return value
 
             if not hidden:
-                function = self._local_function(source.raw, key)
+                function = self._local_function(source, key)
                 if function is not None:
                     return self._function_value(source, function)
 
@@ -2767,7 +2933,7 @@ class Resolver:
                     f"must resolve to an iterable, got {type(value).__name__}"
                 ) from exc
 
-        inherited_locals = object.__getattribute__(bind, "_jinest_local_vars")
+        inherited_locals = object.__getattribute__(bind, "_jinest_binding").frame.local_vars
         if destination_parent is None:
             destination_parent = bind
         if destination_key is _MISSING:
@@ -2823,11 +2989,17 @@ class Resolver:
                 function_origin_source=source,
             )
             if structural_kind == "list":
-                assert isinstance(body, _SequenceProxy)
+                if not isinstance(body, _SequenceProxy):
+                    raise JinestError(
+                        f"Structural compose {spec.source_key!r} produced a non-list body"
+                    )
                 combined.extend(body[index] for index in range(len(body)))
                 continue
 
-            assert isinstance(body, _MappingProxy)
+            if not isinstance(body, _MappingProxy):
+                raise JinestError(
+                    f"Structural compose {spec.source_key!r} produced a non-mapping body"
+                )
             for key in self._public_keys(body):
                 if key in seen:
                     raise JinestError(
@@ -2854,7 +3026,8 @@ class Resolver:
     ) -> Any:
         if candidate.mode.startswith("compose_"):
             spec = _parse_compose_declaration(candidate.source_key, candidate.template)
-            assert spec is not None
+            if spec is None:
+                raise JinestError(f"Malformed compose declaration {candidate.source_key!r}")
             return self._resolve_compose(spec, source, bind, logical_key)
 
         candidate_source_path = source.source_path + (candidate.source_key,)
@@ -2943,7 +3116,7 @@ class Resolver:
         layer: _LayerSpec,
     ) -> _Source:
         cache = object.__getattribute__(bind, "_jinest_layer_cache")
-        cache_key = _DeclarationId(owner_source.identity, layer.source_key)
+        cache_key = _DeclarationId(owner_source.document_id, layer.source_key)
         if cache_key in cache:
             cached = cache[cache_key]
             # A recursively requested layer is temporarily empty, mirroring
@@ -3014,7 +3187,7 @@ class Resolver:
         return value
 
     def _source_view(self, source: _Source) -> _ContainerProxy:
-        cache_key = source.identity
+        cache_key = source.instance_id
         cached = source.resolver._source_view_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -3514,11 +3687,9 @@ class Resolver:
         current: _ContainerProxy | None = scope
         while isinstance(current, _ContainerProxy):
             if (
-                object.__getattribute__(current, "_jinest_function_origin_source")
+                object.__getattribute__(current, "_jinest_binding").frame.function_origin_source
                 is source
-                and object.__getattribute__(
-                    current, "_jinest_function_body_source_path"
-                )
+                and object.__getattribute__(current, "_jinest_binding").frame.function_body_source_path
                 == declaration_path
             ):
                 return True
@@ -3580,7 +3751,7 @@ class Resolver:
         """Cache compiled Jinja artifacts by declaration, kind, and source text."""
         if source_key is None:
             return factory()
-        key = (_DeclarationId(origin_source.identity, source_key), kind, template)
+        key = (_DeclarationId(origin_source.document_id, source_key), kind, template)
         bridge = origin_source.resolver._jinja
         cache = bridge.compilation_cache
         compiled = cache.get(key, _MISSING)
@@ -3627,11 +3798,24 @@ class Resolver:
         if context_path is None:
             context_path = scope_path
         if local_vars is None:
-            local_vars = object.__getattribute__(scope, "_jinest_local_vars")
-        function_origin_source = object.__getattribute__(
-            scope, "_jinest_function_origin_source"
+            local_vars = object.__getattribute__(scope, "_jinest_binding").frame.local_vars
+        frame = object.__getattribute__(scope, "_jinest_binding").frame
+        function_origin_source = frame.function_origin_source
+        function_body_source_path = frame.function_body_source_path
+        # A structural function body keeps the declaration's lexical origin,
+        # but a node returned by that body may have a different real source
+        # (most importantly an imported document). Do not let the function
+        # frame replace that node's root/origin/file/import base.
+        in_function_body = (
+            function_origin_source is not None
+            and function_body_source_path is not None
+            and origin_source.resolver is function_origin_source.resolver
+            and origin_source.source_path[: len(function_body_source_path)]
+            == function_body_source_path
         )
-        context_origin_source = function_origin_source or origin_source
+        context_origin_source = (
+            function_origin_source if in_function_body else origin_source
+        )
         if source_path is None:
             source_path = (
                 origin_source.source_path
@@ -3854,40 +4038,50 @@ class Resolver:
         if path in self._import_chain:
             return None
 
-        cached = self._documents.get(path, format)
-        if cached is not None:
-            return cached.root
+        document = self._documents.get(path, format)
+        if document is None:
+            try:
+                text = path.read_text(encoding="utf-8")
+                if format == "json":
+                    data = json.loads(text)
+                elif format == "yaml":
+                    data = _import_yaml_module().safe_load(text)
+                else:  # internal invariant
+                    raise ValueError(format)
+            except JinestError:
+                raise
+            except FileNotFoundError as exc:
+                raise JinestImportError(f"Import file not found: {requested}") from exc
+            except Exception as exc:
+                raise JinestImportError(f"Failed to import {requested}: {exc}") from exc
+            document = self._documents.put(path, format, data)
 
-        try:
-            text = path.read_text(encoding="utf-8")
-            if format == "json":
-                data = json.loads(text)
-            elif format == "yaml":
-                data = _import_yaml_module().safe_load(text)
-            else:  # internal invariant
-                raise ValueError(format)
-        except JinestError:
-            raise
-        except FileNotFoundError as exc:
-            raise JinestImportError(f"Import file not found: {requested}") from exc
-        except Exception as exc:
-            raise JinestImportError(f"Failed to import {requested}: {exc}") from exc
-
-        child = Resolver(
-            data,
-            strict=self.strict,
-            sandboxed=self.sandboxed,
-            globals=self._user_globals,
-            filters=self._user_filters,
-            source_path=path,
-            import_roots=self.import_roots,
-            function_max_depth=self.function_max_depth,
-            emit_messages=False,
-            treat_warnings_as_errors=False,
-            _import_chain=self._import_chain + (path,),
-            _global_owner=self._global_owner,
-        )
-        self._documents.put(path, format, child)
+        # Import ancestry affects cycle detection, so it is part of the
+        # runtime key. Equal occurrences can share the immutable source
+        # runtime; destination rebinding still creates fresh binding caches.
+        import_chain = self._import_chain + (path,)
+        runtime_key = (path, format, import_chain)
+        child = self._documents.runtimes.get(runtime_key)
+        if child is None:
+            child = Resolver(
+                document.data,
+                strict=self.strict,
+                sandboxed=self.sandboxed,
+                globals=self._user_globals,
+                filters=self._user_filters,
+                source_path=path,
+                import_roots=self.import_roots,
+                function_max_depth=self.function_max_depth,
+                emit_messages=False,
+                treat_warnings_as_errors=False,
+                debug=self.debug,
+                _import_chain=import_chain,
+                _global_owner=self._global_owner,
+                _documents=self._documents,
+                _document_identity=document.identity,
+                _copy_input=False,
+            )
+            self._documents.runtimes[runtime_key] = child
         return child.root
 
     # ------------------------------------------------------------------
@@ -3915,7 +4109,7 @@ class Resolver:
             return
         active.add(token)
         try:
-            schema = self._schema(source.raw)
+            schema = self._schema_for_source(source)
 
             for layer in schema.defaults:
                 self._collect_keys(
@@ -3980,67 +4174,123 @@ class Resolver:
         finally:
             active.remove(token)
 
-    def _to_plain(self, value: Any, *, active: set[tuple[int, int]]) -> Any:
+    def _to_plain_mapping_key(
+        self,
+        key: Any,
+        *,
+        state: _MaterializationState,
+    ) -> Any:
+        plain_key = self._to_plain(key, state=state)
+        # ``strict=False`` may coerce unsupported values to None, but mapping
+        # keys must never silently collapse into a different valid key.
+        if plain_key is None and key is not None:
+            raise JinestError(
+                "Unsupported mapping key after materialization: "
+                f"{type(key).__name__}"
+            )
+        try:
+            hash(plain_key)
+        except TypeError as exc:
+            raise JinestError(
+                "Unsupported mapping key after materialization: "
+                f"{type(plain_key).__name__}"
+            ) from exc
+        return plain_key
+
+    @staticmethod
+    def _set_plain_mapping_item(result: dict[Any, Any], key: Any, value: Any) -> None:
+        if key in result:
+            raise JinestError(f"Duplicate mapping key after materialization: {key!r}")
+        result[key] = value
+
+    def _to_plain(self, value: Any, *, state: _MaterializationState) -> Any:
         if isinstance(value, PathRef):
             return str(value)
 
-        if isinstance(value, _MappingProxy):
+        if isinstance(value, _ContainerProxy):
             source = object.__getattribute__(value, "_jinest_source")
-            token = (id(source.resolver), id(source.raw))
-            if token in active:
+            binding = object.__getattribute__(value, "_jinest_binding")
+            raw_id = id(source.raw)
+            ancestors = state.proxy_raw.get(raw_id, [])
+            if binding.identity in state.bindings or (
+                ancestors
+                and not self._allows_structural_materialization(value, ancestors)
+            ):
                 raise JinestError(
                     f"Cyclic container reference at "
                     f"{_format_path(object.__getattribute__(value, '_jinest_path'))}"
                 )
-            active.add(token)
+            state.bindings.add(binding.identity)
+            state.proxy_raw.setdefault(raw_id, []).append(value)
             try:
-                return {
-                    key: self._to_plain(
-                        self._get_public_field(value, key), active=active
-                    )
-                    for key in self._public_keys(value)
-                }
+                if isinstance(value, _MappingProxy):
+                    result: dict[Any, Any] = {}
+                    for key in self._public_keys(value):
+                        plain_key = self._to_plain_mapping_key(key, state=state)
+                        self._set_plain_mapping_item(
+                            result,
+                            plain_key,
+                            self._to_plain(
+                                self._get_public_field(value, key), state=state
+                            ),
+                        )
+                    return result
+                return [
+                    self._to_plain(value[index], state=state)
+                    for index in range(len(value))
+                ]
             finally:
-                active.remove(token)
-
-        if isinstance(value, _SequenceProxy):
-            source = object.__getattribute__(value, "_jinest_source")
-            token = (id(source.resolver), id(source.raw))
-            if token in active:
-                raise JinestError(
-                    f"Cyclic container reference at "
-                    f"{_format_path(object.__getattribute__(value, '_jinest_path'))}"
-                )
-            active.add(token)
-            try:
-                return [self._to_plain(value[i], active=active) for i in range(len(value))]
-            finally:
-                active.remove(token)
+                state.bindings.remove(binding.identity)
+                state.proxy_raw[raw_id].pop()
+                if not state.proxy_raw[raw_id]:
+                    del state.proxy_raw[raw_id]
 
         if isinstance(value, Mapping):
-            token = (0, id(value))
-            if token in active:
+            raw_id = id(value)
+            if raw_id in state.plain_raw:
                 raise JinestError("Cyclic mapping in materialized result")
-            active.add(token)
+            state.plain_raw.add(raw_id)
             try:
-                return {
-                    self._to_plain(k, active=active): self._to_plain(v, active=active)
-                    for k, v in value.items()
-                }
+                result: dict[Any, Any] = {}
+                for key, item in value.items():
+                    plain_key = self._to_plain_mapping_key(key, state=state)
+                    self._set_plain_mapping_item(
+                        result,
+                        plain_key,
+                        self._to_plain(item, state=state),
+                    )
+                return result
             finally:
-                active.remove(token)
+                state.plain_raw.remove(raw_id)
 
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            token = (0, id(value))
-            if token in active:
+            raw_id = id(value)
+            if raw_id in state.plain_raw:
                 raise JinestError("Cyclic sequence in materialized result")
-            active.add(token)
+            state.plain_raw.add(raw_id)
             try:
-                return [self._to_plain(item, active=active) for item in value]
+                return [self._to_plain(item, state=state) for item in value]
             finally:
-                active.remove(token)
+                state.plain_raw.remove(raw_id)
 
         return self._copy_scalar(value)
+
+    @staticmethod
+    def _allows_structural_materialization(
+        value: _ContainerProxy,
+        ancestors: Sequence[_ContainerProxy],
+    ) -> bool:
+        """Allow nested structural calls only when their argument frames differ."""
+        body_path = object.__getattribute__(value, "_jinest_binding").frame.function_body_source_path
+        local_vars = object.__getattribute__(value, "_jinest_binding").frame.local_vars
+        if body_path is None or local_vars is None:
+            return False
+        return all(
+            object.__getattribute__(ancestor, "_jinest_binding").frame.function_body_source_path
+            is not None
+            and object.__getattribute__(ancestor, "_jinest_binding").frame.local_vars is not local_vars
+            for ancestor in ancestors
+        )
 
     @staticmethod
     def _hashable_key(key: Any) -> Any:
@@ -4139,6 +4389,8 @@ def _serialize(value: Any, format: str) -> str:
 
 def _normalize_yaml_value(value: Any, *, active: set[int]) -> Any:
     """Convert accepted extended scalars to values representable by SafeDumper."""
+    if isinstance(value, PathRef):
+        return str(value)
     if isinstance(value, bytearray):
         return bytes(value)
     if isinstance(value, time):
@@ -4183,6 +4435,8 @@ def _normalize_yaml_value(value: Any, *, active: set[int]) -> Any:
 
 def _normalize_json_value(value: Any, *, active: set[int]) -> Any:
     """Convert extended scalar values to standards-compliant JSON."""
+    if isinstance(value, PathRef):
+        return str(value)
     if isinstance(value, (bytes, bytearray)):
         # Latin-1 maps every byte 0x00..0xFF to the matching Unicode code point.
         # json.loads(...).encode("latin-1") therefore reconstructs the bytes.
@@ -4316,6 +4570,13 @@ def _format_path(path: tuple[Any, ...]) -> str:
 
 
 def _self_test() -> None:
+    def expect(actual: Any, expected: Any, label: str) -> None:
+        if actual != expected:
+            raise RuntimeError(
+                f"Jinest self-test failed ({label}): "
+                f"expected {expected!r}, got {actual!r}"
+            )
+
     data = {
         "defaults1": {"rank": "d1", "d1": True},
         "defaults2": {"rank": "d2", "d2": True},
@@ -4373,40 +4634,72 @@ def _self_test() -> None:
     }
 
     resolver = Resolver(data, emit_messages=False)
-    assert resolver.root.example.rank == "o2"
-    assert resolver.root.example.z == 2
-    assert resolver.root.priority.value == 42
-    assert resolver.root.C.x == 1
-    assert resolver.root["class"].prototype.A == 1
-    assert resolver.root.inherited.instance.A == 2
-    assert resolver.root.inherited.instance.B == 1
-    assert resolver.root.inherited.instance.C == 10
-    assert resolver.root.inherited.instance.where == "global_root.inherited.instance"
-    assert resolver.root.inherited.other.where == "global_root.inherited.other"
-    assert resolver.root.native_array[0] == 7
-    assert resolver.root.native_array[1] == 9
-    assert str(resolver.root.native_array[6]) == "global_root.native_array[6]"
-    assert resolver.root.text_array[4] == "global_root.text_array[4]"
-    assert resolver.root.ready_array[:] == ["var1", "root.var2"]
-    assert str(resolver.root.path_list[0].obj.where) == "global_root.path_list[0].obj"
-    assert str(resolver.root.inherited.instance.path) == "global_root.inherited.instance"
-    assert str(resolver.root.inherited.instance.source_path) == "root.inherited.instance"
+    checks = [
+        (resolver.root.example.rank, "o2", "override priority"),
+        (resolver.root.example.z, 2, "native field"),
+        (resolver.root.priority.value, 42, "field priority"),
+        (resolver.root.C.x, 1, "prototype chain"),
+        (resolver.root["class"].prototype.A, 1, "parent lookup"),
+        (resolver.root.inherited.instance.A, 2, "rebound parent"),
+        (resolver.root.inherited.instance.B, 1, "rebound local"),
+        (resolver.root.inherited.instance.C, 10, "source root"),
+        (
+            resolver.root.inherited.instance.where,
+            "global_root.inherited.instance",
+            "rebound path",
+        ),
+        (
+            resolver.root.inherited.other.where,
+            "global_root.inherited.other",
+            "second rebound path",
+        ),
+        (resolver.root.native_array[0], 7, "native array local"),
+        (resolver.root.native_array[1], 9, "native array root"),
+        (
+            str(resolver.root.native_array[6]),
+            "global_root.native_array[6]",
+            "native array path",
+        ),
+        (
+            resolver.root.text_array[4],
+            "global_root.text_array[4]",
+            "text array path",
+        ),
+        (resolver.root.ready_array[:], ["var1", "root.var2"], "ready array"),
+        (
+            str(resolver.root.path_list[0].obj.where),
+            "global_root.path_list[0].obj",
+            "list object path",
+        ),
+        (
+            str(resolver.root.inherited.instance.path),
+            "global_root.inherited.instance",
+            "node path",
+        ),
+        (
+            str(resolver.root.inherited.instance.source_path),
+            "root.inherited.instance",
+            "node source path",
+        ),
+    ]
+    for actual, expected, label in checks:
+        expect(actual, expected, label)
 
     script = Resolver({
         "x": 4,
         "value^": "% set y = x * 2\n% return {'y': y}\n",
         "target": {"<<^": "% return {'a': 1}\n", "b": 2},
     }).resolve()
-    assert script["value"] == {"y": 8}
-    assert script["target"] == {"a": 1, "b": 2}
+    expect(script["value"], {"y": 8}, "script field")
+    expect(script["target"], {"a": 1, "b": 2}, "script merge")
 
     result = resolver.resolve()
-    assert result["cycle"] == {"a": None, "b": None}
-    assert result["example"]["rank"] == "o2"
-    assert result["example"]["d1"] is True
-    assert result["example"]["d2"] is True
-    assert result["example"]["o1"] is True
-    assert result["example"]["o2"] is True
+    expect(result["cycle"], {"a": None, "b": None}, "field cycle")
+    expect(result["example"]["rank"], "o2", "materialized priority")
+    expect(result["example"]["d1"], True, "first default")
+    expect(result["example"]["d2"], True, "second default")
+    expect(result["example"]["o1"], True, "first override")
+    expect(result["example"]["o2"], True, "second override")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         folder = Path(temp_dir)
@@ -4441,18 +4734,22 @@ via_filter$: '"base.yaml" | import | attr("constant")'
             resolve_file(folder / "main.yaml", output_format="json"),
             "json",
         )
-        assert imported["instance"]["absolute"] == 10
-        assert imported["instance"]["relative"] == 5
-        assert imported["instance"]["where"] == "global_root.instance"
-        assert imported["json_obj"]["double"] == 42
-        assert imported["json_value"] == 42
-        assert imported["via_filter"] == 10
+        expect(imported["instance"]["absolute"], 10, "import source root")
+        expect(imported["instance"]["relative"], 5, "import destination parent")
+        expect(
+            imported["instance"]["where"],
+            "global_root.instance",
+            "import destination path",
+        )
+        expect(imported["json_obj"]["double"], 42, "JSON object import")
+        expect(imported["json_value"], 42, "JSON scalar access")
+        expect(imported["via_filter"], 10, "import filter")
 
         # Lazy import cycle: the path already present in the import ancestry is None.
         (folder / "a.yaml").write_text("other$: import('b.yaml')\n", encoding="utf-8")
         (folder / "b.yaml").write_text("back$: import('a.yaml')\n", encoding="utf-8")
         cycle = _parse_text(resolve_file(folder / "a.yaml", output_format="json"), "json")
-        assert cycle == {"other": {"back": None}}
+        expect(cycle, {"other": {"back": None}}, "import cycle")
 
     print("Jinest self-test: OK")
 
@@ -4491,13 +4788,14 @@ def _main() -> None:
     parser.add_argument("--self-test", action="store_true", help="Run built-in tests")
     args = parser.parse_args()
 
-    if args.self_test:
-        _self_test()
-        return
     if not args.input:
-        parser.error("input is required unless --self-test is used")
+        if not args.self_test:
+            parser.error("input is required unless --self-test is used")
 
     try:
+        if args.self_test:
+            _self_test()
+            return
         rendered = resolve_file(
             args.input,
             output=args.output,
@@ -4514,10 +4812,12 @@ def _main() -> None:
             parser.exit(1)
         details = f"jinest: {exc}\n"
         if args.debug:
-            details += f"  at root\n  in {args.input}\n"
+            details += f"  at root\n  in {args.input or '<self-test>'}\n"
         parser.exit(1, details)
     if args.output is None:
-        print(rendered)
+        sys.stdout.write(rendered)
+        if not rendered.endswith("\n"):
+            sys.stdout.write("\n")
 
 
 if __name__ == "__main__":

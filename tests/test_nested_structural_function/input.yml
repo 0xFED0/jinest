@@ -1,0 +1,4 @@
+# The inner structural result is a finite value, not a raw-container cycle.
+box(x)=:
+  value$: x
+result$: box(box(1))

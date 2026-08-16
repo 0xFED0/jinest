@@ -57,4 +57,3 @@ duplicate_result:
     nested:
       path: global_root.duplicate_result.y.nested
   tmp: global_root.duplicate_result
-

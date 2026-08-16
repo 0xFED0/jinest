@@ -17,13 +17,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve_ref:
+    name: Resolve release revision
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Record immutable commit SHA
+        id: revision
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   build_wheel:
+    needs: resolve_ref
     uses: ./.github/workflows/build-wheel.yml
     with:
-      ref: ${{ inputs.ref }}
+      ref: ${{ needs.resolve_ref.outputs.sha }}
 
   test:
-    needs: build_wheel
+    needs: [resolve_ref, build_wheel]
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
@@ -34,7 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.resolve_ref.outputs.sha }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7
@@ -51,6 +67,9 @@ jobs:
       - name: Run Python regression tests
         run: python jinest.test.py
 
+      - name: Run Python regression tests with assertions disabled
+        run: python -O jinest.test.py
+
       - name: Run portable CLI fixtures
         run: bash run_tests.sh
 
@@ -59,7 +78,7 @@ jobs:
 
   release:
     name: Create GitHub release
-    needs: [build_wheel, test]
+    needs: [resolve_ref, build_wheel, test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -67,7 +86,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.resolve_ref.outputs.sha }}
           fetch-depth: 0
           fetch-tags: true
 

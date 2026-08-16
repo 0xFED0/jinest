@@ -1,0 +1,3 @@
+# Each attachment gets its own active import branch, even for cached documents.
+first$: "import_json('a.json')"
+second$: "import_json('x.json')"

@@ -1,0 +1,7 @@
+result:
+  node:
+    root_value: 17
+    origin_path: root.prototype
+    destination_path: global_root.result.node
+    nested:
+      value: library-relative

@@ -13,4 +13,3 @@ script_values:
 ready:
 - x * 100
 - literal
-

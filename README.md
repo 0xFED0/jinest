@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.14.2` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.14.3` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -127,7 +127,8 @@ The wheel exposes the `jinest` CLI:
 jinest config.yaml
 ```
 
-When copying `jinest.py` directly, Jinja2 is required for evaluation. PyYAML
+When copying `jinest.py` directly, Jinja2 version 3.1 through 3.x is required
+for evaluation. PyYAML
 remains optional: it is imported only for YAML input or output, so Python-object
 and JSON workflows work without it.
 
@@ -224,7 +225,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.14.2
+  version: 0.14.3
   label@: "{{ product }} v{{ version }}"
 ```
 
@@ -890,7 +891,7 @@ Convenience functions forward resolver options where applicable.
 | Option | Meaning |
 |---|---|
 | `strict=True` | Raise for undefined/unsupported values; non-strict uses `None` or empty text |
-| `in_place=False` | Write a mutable materialized root back into the original mapping/list |
+| `in_place=False` | When enabled, write a mutable materialized root back into the original mapping/list |
 | `sandboxed=True` | Use Jinja sandboxed environments |
 | `globals`, `filters` | Add trusted application values/callables |
 | `source_path` | Source filename for metadata and relative imports |
@@ -902,6 +903,12 @@ Convenience functions forward resolver options where applicable.
 | `debug=False` | Add `at`/`in` lines to stderr diagnostics |
 
 `Resolver.messages` remains available regardless of `emit_messages`.
+
+After a successful `in_place=True` resolution, `Resolver.root` and
+`Resolver.global_root` expose the materialized object. Repeating `resolve()`
+without changing that object is idempotent. If the object is edited, the next
+call treats its new contents as a fresh Jinest source and clears per-run import,
+diagnostic, syntax, and binding caches.
 
 ## CLI
 
@@ -963,7 +970,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The suite contains 98 Python regression tests and 28 implementation-neutral
+The suite contains 135 Python regression tests and 40 implementation-neutral
 portable CLI fixtures.
 
 ## Security

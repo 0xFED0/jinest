@@ -31,4 +31,3 @@ service:
     effective_key: .hidden_context$
     keymode: $
     keypath: global_root.service.hidden_context
-
