@@ -1,0 +1,55 @@
+flatten:
+- 1
+- 2
+- 3
+- 4
+- 5
+join: one-two
+product:
+- - 1
+  - a
+- - 1
+  - b
+- - 2
+  - a
+- - 2
+  - b
+zipped:
+- - 1
+  - a
+- - 2
+  - b
+empty_flatten: []
+empty_join: ''
+empty_product:
+- []
+empty_zip: []
+product_source:
+- - left
+  - right
+- - up
+  - down
+chained:
+- - left
+  - up
+- - left
+  - down
+- - right
+  - up
+- - right
+  - down
+empty_axis: []
+product_empty_axis: []
+node:
+  value: 42
+  path: global_root.node
+node_groups:
+- - value: 42
+    path: global_root.node_groups[0][0]
+- - value: 42
+    path: global_root.node_groups[1][0]
+flattened_nodes:
+- value: 42
+  path: global_root.flattened_nodes[0]
+- value: 42
+  path: global_root.flattened_nodes[1]

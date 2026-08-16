@@ -1,3 +1,3 @@
-jinest: warning: Field 'priority' suppresses 'priority^'; local priority is name > name^ > name$ > name@
-jinest: warning: Field 'priority' suppresses 'priority$'; local priority is name > name^ > name$ > name@
-jinest: warning: Field 'priority' suppresses 'priority@'; local priority is name > name^ > name$ > name@
+jinest: warning: Field 'priority' suppresses 'priority^'; local priority is name > name^ > name$ > name@ > name* > name+ > name% > name~
+jinest: warning: Field 'priority' suppresses 'priority$'; local priority is name > name^ > name$ > name@ > name* > name+ > name% > name~
+jinest: warning: Field 'priority' suppresses 'priority@'; local priority is name > name^ > name$ > name@ > name* > name+ > name% > name~

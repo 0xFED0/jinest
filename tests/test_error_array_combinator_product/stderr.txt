@@ -1,0 +1,1 @@
+jinest: Array suffix '*' for 'bad_product*' requires list or tuple elements, got int at index 0

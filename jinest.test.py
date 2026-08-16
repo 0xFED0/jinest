@@ -85,7 +85,7 @@ class JinestTestSuiteContractTests(unittest.TestCase):
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.14.4")
+        self.assertEqual(jinest.__version__, "0.15.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -885,6 +885,30 @@ class JinestMessageTests(unittest.TestCase):
         self.assertEqual(resolver.resolve(), {"left": {"value": 1}, "right": {"value": 3}})
         warnings = [message for message in resolver.messages if message.level == "warning"]
         self.assertEqual(len(warnings), 2)
+
+    def test_combinator_declarations_follow_field_priority(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "value": "winner",
+                "value^": "% return 'script'\n",
+                "value$": "native",
+                "value@": "text",
+                "value*": [[1]],
+                "value+": [[2]],
+                "value%": [[3]],
+                "value~": ["join"],
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(resolver.resolve(), {"value": "winner"})
+        self.assertEqual(len(resolver.messages), 7)
+        self.assertTrue(
+            all(
+                "name > name^ > name$ > name@ > name* > name+ > name% > name~"
+                in message.msg
+                for message in resolver.messages
+            )
+        )
 
     def test_message_output_can_be_disabled(self) -> None:
         resolver = jinest.Resolver(
@@ -1776,6 +1800,89 @@ class JinestArrayTests(unittest.TestCase):
         self.assertEqual(resolver.root.items[0:2], [1, 2])
         with self.assertRaises(IndexError):
             _ = resolver.root.items[10]
+
+    def test_array_combinator_modes_and_edge_cases(self) -> None:
+        result = jinest.resolve(
+            {
+                "flatten+": [[1, 2], [3], [4, 5]],
+                "tuple_flatten+": ((1, 2), (3,)),
+                "nested_flatten+": [[[1]], [[2]]],
+                "join~": ["one", "-", "two"],
+                "empty_join~": [],
+                "product*": [[1, 2], ["a", "b"]],
+                "empty_product*": [],
+                "zip%": [[1, 2], ["a", "b"]],
+                "empty_zip%": [],
+                "empty_axis_product*": [[1], []],
+                "zero_axis_product*": [],
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(result["flatten"], [1, 2, 3, 4, 5])
+        self.assertEqual(result["tuple_flatten"], [1, 2, 3])
+        self.assertEqual(result["nested_flatten"], [[1], [2]])
+        self.assertEqual(result["join"], "one-two")
+        self.assertEqual(result["empty_join"], "")
+        self.assertEqual(
+            result["product"],
+            [[1, "a"], [1, "b"], [2, "a"], [2, "b"]],
+        )
+        self.assertEqual(result["empty_product"], [[]])
+        self.assertEqual(result["zip"], [[1, "a"], [2, "b"]])
+        self.assertEqual(result["empty_zip"], [])
+        self.assertEqual(result["empty_axis_product"], [])
+        self.assertEqual(result["zero_axis_product"], [[]])
+
+    def test_array_combinators_compose_with_inner_native_layer(self) -> None:
+        result = jinest.resolve(
+            {
+                "axes": [["left", "right"], ["up", "down"]],
+                "product*": "=$axes",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result["product"],
+            [
+                ["left", "up"],
+                ["left", "down"],
+                ["right", "up"],
+                ["right", "down"],
+            ],
+        )
+
+    def test_array_combinators_rebind_structural_nodes(self) -> None:
+        result = jinest.resolve(
+            {
+                "node": {"value$": 42, "path$": "path"},
+                "groups$": "[[root.node], [root.node]]",
+                "flattened+": "=$groups",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result["flattened"],
+            [
+                {"value": 42, "path": "global_root.flattened[0]"},
+                {"value": 42, "path": "global_root.flattened[1]"},
+            ],
+        )
+
+    def test_array_combinators_reject_invalid_types(self) -> None:
+        invalid = [
+            {"flatten+": [1, 2]},
+            {"flatten+": [[1], 2]},
+            {"join~": ["one", 2]},
+            {"product*": [1, [2]]},
+            {"zip%": [[1], [2, 3]]},
+            {"flatten+": {"not": [1, 2]}},
+        ]
+        for data in invalid:
+            with self.subTest(data=data), self.assertRaisesRegex(
+                jinest.JinestError,
+                "Array suffix",
+            ):
+                jinest.resolve(data, emit_messages=False)
 
 
 @unittest.skipUnless(yaml is not None, "PyYAML is required for YAML tests")

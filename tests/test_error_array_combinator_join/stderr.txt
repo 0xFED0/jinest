@@ -1,0 +1,1 @@
+jinest: Array suffix '~' for 'bad_join~' requires string elements, got int at index 1

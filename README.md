@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.14.4` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.15.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -56,6 +56,7 @@ app:
 - [Text templates: `@`](#text-templates-)
 - [Multiline scripts: `^`](#multiline-scripts-)
 - [Evaluation layers, raw keys, and inline syntax](#evaluation-layers-raw-keys-and-inline-syntax)
+- [Array combinators](#array-combinators)
 - [Evaluation context](#evaluation-context)
 - [Hidden fields](#hidden-fields)
 - [Diagnostics: warnings and hints](#diagnostics-warnings-and-hints)
@@ -170,6 +171,7 @@ structural construct; a scalar prefix declares an inline evaluator.
 | `name(args)=` | Structural function |
 | `name[axis=source, ...]=` | Structural Cartesian compose |
 | `name[axis=source, ...]@` | Text Cartesian compose |
+| `name+`, `name~`, `name*`, `name%` | Flatten, string join, Cartesian product, strict zip |
 | `=$expr`, `=@text`, `=^script` | Inline evaluator in a scalar value or mapping key |
 | `<$`, `<(args)=`, `<[axis=source]=` | Declaration applied to the current slot |
 | `key\`` | Raw key: remove one final backtick and disable key parsing |
@@ -180,7 +182,7 @@ structural construct; a scalar prefix declares an inline evaluator.
 Local field priority inside one mapping is:
 
 ```text
-name > name^ > name$ > name@
+name > name^ > name$ > name@ > name* > name+ > name% > name~
 ```
 
 Lower-priority alternatives are neither parsed nor evaluated. Functions,
@@ -225,7 +227,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.14.4
+  version: 0.15.0
   label@: "{{ product }} v{{ version }}"
 ```
 
@@ -311,6 +313,28 @@ name: generated$
 
 A raw/dynamic leading dot is not hidden. Duplicate final or logical keys raise
 `JinestError`.
+
+## Array combinators
+
+Array combinators are strict outer value transformations. Their input must be a
+Python/Jinest list or tuple; mappings/dicts and other iterables are rejected.
+`+`, `*`, and `%` additionally require every element to be a list or tuple,
+while `~` requires every element to be a string:
+
+```yaml
+flatten+: [[1, 2], [3], [4, 5]]
+join~: ["one", "-", "two"]
+product*: [[1, 2], [a, b]]
+zipped%: [[1, 2], [a, b]]
+```
+
+`+` flattens exactly one level, `~` concatenates without coercion, `*` emits
+Cartesian combinations in declaration order, and `%` requires equal axis lengths
+(it never truncates). Empty input gives `""` for `~`, `[]` for `%`, and
+`[[]]` for a zero-axis `*`; an empty product axis emits `[]`. An inner inline
+layer is evaluated first, so `items*: "=$axes"` evaluates `$` and then applies
+`*`. Transformed list elements remain lazy and are rebound at their destination
+paths rather than being eagerly materialized.
 
 ## Evaluation context
 
@@ -980,7 +1004,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The suite contains 138 Python regression tests and 42 implementation-neutral
+The suite contains 143 Python regression tests and 47 implementation-neutral
 portable CLI fixtures.
 
 ## Security

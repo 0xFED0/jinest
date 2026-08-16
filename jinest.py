@@ -14,6 +14,8 @@ Syntax
   template functions in native, text, or script mode.
 * ``name(args)=`` — declare a structural function with a lazy mapping or array
   body rebound at each call site.
+* ``name+``, ``name~``, ``name*``, and ``name%`` — strict array transforms:
+  one-level flatten, string join, Cartesian product, and equal-length zip.
 * ``.name`` — a hidden field, available to Jinja as ``name`` but omitted from
   the final resolved mapping.
 * A key ending in a backtick is a raw literal key; all Jinest key parsing is
@@ -90,7 +92,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.14.4"
+__version__ = "0.15.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -436,6 +438,24 @@ _FUNCTION_MODES = {
 }
 _FUNCTION_DECLARATION_MODES = {**_FUNCTION_MODES, "=": EvaluatorKind.STRUCTURAL}
 _FUNCTION_MODE_MARKERS = {value: key for key, value in _FUNCTION_MODES.items()}
+_ARRAY_TRANSFORM_MODES = {
+    "+": "flatten",
+    "~": "join",
+    "*": "product",
+    "%": "zip",
+}
+_ARRAY_TRANSFORM_MARKERS = {
+    mode: marker for marker, mode in _ARRAY_TRANSFORM_MODES.items()
+}
+_FIELD_SUFFIX_MODES = (
+    ("^", "script"),
+    ("$", "native"),
+    ("@", "text"),
+    ("*", "product"),
+    ("+", "flatten"),
+    ("%", "zip"),
+    ("~", "join"),
+)
 
 
 def _valid_evaluator_body(value: Any, mode: str) -> bool:
@@ -2180,12 +2200,9 @@ class Resolver:
             or cls._merge_key(key)
         ):
             return None
-        if key.endswith("^"):
-            return key[:-1], "script"
-        if key.endswith("$"):
-            return key[:-1], "native"
-        if key.endswith("@"):
-            return key[:-1], "text"
+        for suffix, mode in _FIELD_SUFFIX_MODES:
+            if key.endswith(suffix):
+                return key[:-1], mode
         return None
 
     def _mapping_entries(
@@ -2454,6 +2471,91 @@ class Resolver:
             keymode=keymode,
         )
 
+    def _array_transform_list(
+        self,
+        value: Any,
+        *,
+        mode: str,
+        source_key: Any,
+        elements: bool = False,
+    ) -> list[Any]:
+        """Read a strict list input without materializing nested containers."""
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        if isinstance(value, _SequenceProxy):
+            raw = object.__getattribute__(
+                value, "_jinest_source"
+            ).raw
+            if isinstance(raw, (list, tuple)):
+                return [value[index] for index in range(len(value))]
+        expected = "list or tuple elements" if elements else "a list or tuple"
+        marker = _ARRAY_TRANSFORM_MARKERS[mode]
+        raise JinestError(
+            f"Array suffix {marker!r} for {source_key!r} requires {expected}, "
+            f"got {type(value).__name__}"
+        )
+
+    def _apply_array_transform(
+        self,
+        value: Any,
+        *,
+        mode: str,
+        source_key: Any,
+    ) -> Any:
+        """Apply one strict array combinator while preserving nested nodes."""
+        outer = self._array_transform_list(
+            value, mode=mode, source_key=source_key
+        )
+        marker = _ARRAY_TRANSFORM_MARKERS[mode]
+
+        if mode == "join":
+            parts: list[str] = []
+            for index, item in enumerate(outer):
+                if not isinstance(item, str):
+                    raise JinestError(
+                        f"Array suffix {marker!r} for {source_key!r} requires "
+                        f"string elements, got {type(item).__name__} at index {index}"
+                    )
+                parts.append(item)
+            return "".join(parts)
+
+        axes: list[list[Any]] = []
+        for index, item in enumerate(outer):
+            try:
+                axis = self._array_transform_list(
+                    item, mode=mode, source_key=source_key, elements=True
+                )
+            except JinestError as exc:
+                raise JinestError(
+                    f"Array suffix {marker!r} for {source_key!r} requires "
+                    f"list or tuple elements, got {type(item).__name__} at index {index}"
+                ) from exc
+            axes.append(axis)
+
+        if mode == "flatten":
+            flattened: list[Any] = []
+            for axis in axes:
+                flattened.extend(axis)
+            return flattened
+
+        if mode == "product":
+            return [list(items) for items in product(*axes)]
+
+        if mode == "zip":
+            if not axes:
+                return []
+            length = len(axes[0])
+            for index, axis in enumerate(axes[1:], start=1):
+                if len(axis) != length:
+                    raise JinestError(
+                        f"Array suffix {marker!r} for {source_key!r} requires "
+                        f"equal axis lengths, got {length} and {len(axis)} "
+                        f"at axis {index}"
+                    )
+            return [list(items) for items in zip(*axes)]
+
+        raise JinestError(f"Unsupported array transform mode {mode!r}")
+
     def _resolve_layer_input(
         self,
         scope: _ContainerProxy,
@@ -2567,7 +2669,11 @@ class Resolver:
         if not isinstance(raw, Mapping):
             return
         declarations: dict[tuple[str, bool], list[tuple[int, str]]] = {}
-        priority = {"": 0, "^": 1, "$": 2, "@": 3}
+        priority = {"": 0}
+        priority.update(
+            {suffix: index for index, (suffix, _) in enumerate(_FIELD_SUFFIX_MODES, 1)}
+        )
+        priority_text = "name > name^ > name$ > name@ > name* > name+ > name% > name~"
         for key in raw:
             if (
                 not isinstance(key, str)
@@ -2582,9 +2688,11 @@ class Resolver:
                 continue
             mode = ""
             base = key
-            if key.endswith(("^", "$", "@")):
-                mode = key[-1]
-                base = key[:-1]
+            for suffix, _ in _FIELD_SUFFIX_MODES:
+                if key.endswith(suffix):
+                    mode = suffix
+                    base = key[:-1]
+                    break
             if mode == "":
                 self_spec = _parse_self_declaration(raw[key])
                 if self_spec is not None and self_spec.mode in {
@@ -2613,7 +2721,7 @@ class Resolver:
                 self._record_message(
                     "warning",
                     f"Field {winner!r} suppresses {suppressed!r}; local priority is "
-                    "name > name^ > name$ > name@",
+                    f"{priority_text}",
                     dedupe_key=("warning", source.document_id, winner, suppressed),
                     source=source,
                 )
@@ -2767,7 +2875,7 @@ class Resolver:
                     )
 
         if isinstance(source_key, str):
-            for suffix, mode in (("^", "script"), ("$", "native"), ("@", "text")):
+            for suffix, mode in _FIELD_SUFFIX_MODES:
                 physical = f"{source_key}{suffix}"
                 for entry in entries:
                     if entry.key == physical and not entry.raw and not entry.dynamic:
@@ -3106,6 +3214,25 @@ class Resolver:
             keyname=logical_key,
             effective_key=candidate.source_key,
         )
+
+        if candidate.mode in _ARRAY_TRANSFORM_MODES.values():
+            transform_input = (
+                layer_result.value if layer_result.applied else candidate.template
+            )
+            value = self._apply_array_transform(
+                transform_input,
+                mode=candidate.mode,
+                source_key=candidate.source_key,
+            )
+            if self._is_container(value):
+                return self._bind_child(
+                    bind,
+                    logical_key,
+                    value,
+                    origin=source.resolver,
+                    source_path=candidate_source_path,
+                )
+            return value
 
         if candidate.mode == "concrete":
             if layer_result.applied or layer_result.escaped_literal:

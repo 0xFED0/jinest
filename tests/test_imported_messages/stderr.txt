@@ -1,1 +1,1 @@
-jinest: warning: Field 'value' suppresses 'value$'; local priority is name > name^ > name$ > name@
+jinest: warning: Field 'value' suppresses 'value$'; local priority is name > name^ > name$ > name@ > name* > name+ > name% > name~

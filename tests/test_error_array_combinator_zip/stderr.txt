@@ -1,0 +1,1 @@
+jinest: Array suffix '%' for 'bad_zip%' requires equal axis lengths, got 1 and 2 at axis 1

@@ -1,4 +1,4 @@
-jinest: warning: Field 'name' suppresses 'name^'; local priority is name > name^ > name$ > name@
-jinest: warning: Field 'name' suppresses 'name$'; local priority is name > name^ > name$ > name@
-jinest: warning: Field 'name' suppresses 'name@'; local priority is name > name^ > name$ > name@
+jinest: warning: Field 'name' suppresses 'name^'; local priority is name > name^ > name$ > name@ > name* > name+ > name% > name~
+jinest: warning: Field 'name' suppresses 'name$'; local priority is name > name^ > name$ > name@ > name* > name+ > name% > name~
+jinest: warning: Field 'name' suppresses 'name@'; local priority is name > name^ > name$ > name@ > name* > name+ > name% > name~
 jinest: hint: Hidden field '.key' takes priority over field 'key' in template calculations; the public field remains in the final dump

@@ -1,0 +1,25 @@
+# Strict one-level flattening.
+flatten+: [[1, 2], [3], [4, 5]]
+join~: [one, '-', two]
+product*: [[1, 2], [a, b]]
+zipped%: [[1, 2], [a, b]]
+
+empty_flatten+: []
+empty_join~: []
+empty_product*: []
+empty_zip%: []
+
+# The inner native layer runs before the outer product transform.
+product_source: [[left, right], [up, down]]
+chained*: '=$product_source'
+
+# A zero-length axis removes every Cartesian combination.
+empty_axis: []
+product_empty_axis*: "=$[[1, 2], empty_axis]"
+
+# Transformed arrays preserve lazy nodes and rebind each occurrence.
+node:
+  value$: 42
+  path$: path
+node_groups$: '[[root.node], [root.node]]'
+flattened_nodes+: '=$node_groups'
