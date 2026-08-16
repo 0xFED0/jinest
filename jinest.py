@@ -1317,6 +1317,7 @@ class JinjaBridge:
     compilation_cache: dict[tuple[_DeclarationId, EvaluatorKind, str], Any] = field(
         default_factory=dict
     )
+    template_cache: dict[tuple[EvaluatorKind, str], Any] = field(default_factory=dict)
 
 
 class SerializationCodecs:
@@ -3580,10 +3581,15 @@ class Resolver:
         if source_key is None:
             return factory()
         key = (_DeclarationId(origin_source.identity, source_key), kind, template)
-        cache = origin_source.resolver._jinja_compilation_cache
+        bridge = origin_source.resolver._jinja
+        cache = bridge.compilation_cache
         compiled = cache.get(key, _MISSING)
         if compiled is _MISSING:
-            compiled = factory()
+            template_key = (kind, template)
+            compiled = bridge.template_cache.get(template_key, _MISSING)
+            if compiled is _MISSING:
+                compiled = factory()
+                bridge.template_cache[template_key] = compiled
             cache[key] = compiled
         return compiled
 
