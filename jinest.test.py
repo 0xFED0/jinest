@@ -398,6 +398,79 @@ class JinestCoreTests(unittest.TestCase):
         self.assertEqual(data, {"x": 2, "y": 3})
 
 
+    def test_in_place_resolve_rebuilds_state_after_root_replacement(self) -> None:
+        """A reused mutable root must not retain prior syntax or view caches."""
+        data = {"value$": "1"}
+        resolver = jinest.Resolver(data, in_place=True, emit_messages=False)
+
+        self.assertEqual(resolver.resolve(), {"value": 1})
+        data.clear()
+        data["value$"] = "2"
+
+        self.assertEqual(resolver.resolve(), {"value": 2})
+
+    def test_failed_field_layer_and_dynamic_key_accesses_retry_cleanly(self) -> None:
+        """Each public lazy cache removes its temporary entry after an error."""
+        field_calls = 0
+
+        def flaky_field() -> int:
+            nonlocal field_calls
+            field_calls += 1
+            if field_calls == 1:
+                raise RuntimeError("transient field failure")
+            return 42
+
+        field = jinest.Resolver(
+            {"value$": "flaky_field()"},
+            globals={"flaky_field": flaky_field},
+            emit_messages=False,
+        )
+        with self.assertRaises(jinest.JinestTemplateError):
+            _ = field.root.value
+        self.assertEqual(field.root.value, 42)
+        self.assertEqual(field_calls, 2)
+
+        layer_calls = 0
+
+        def flaky_layer() -> bool:
+            nonlocal layer_calls
+            layer_calls += 1
+            if layer_calls == 1:
+                raise RuntimeError("transient layer failure")
+            return True
+
+        layer = jinest.Resolver(
+            {
+                "base": {"value": 43},
+                "target": {"<<$": "flaky_layer() and root.base"},
+            },
+            globals={"flaky_layer": flaky_layer},
+            emit_messages=False,
+        )
+        with self.assertRaises(jinest.JinestTemplateError):
+            _ = layer.root.target["value"]
+        self.assertEqual(layer.root.target["value"], 43)
+        self.assertEqual(layer_calls, 2)
+
+        key_calls = 0
+
+        def flaky_key() -> str:
+            nonlocal key_calls
+            key_calls += 1
+            if key_calls == 1:
+                raise RuntimeError("transient key failure")
+            return "value"
+
+        dynamic = jinest.Resolver(
+            {"=$flaky_key()": 44},
+            globals={"flaky_key": flaky_key},
+            emit_messages=False,
+        )
+        with self.assertRaises(jinest.JinestTemplateError):
+            list(dynamic.root)
+        self.assertEqual(dynamic.resolve(), {"value": 44})
+        self.assertEqual(key_calls, 2)
+
 class JinestFunctionTests(unittest.TestCase):
     def test_function_modes_namespace_and_structured_returns(self) -> None:
         result = jinest.resolve(
@@ -811,6 +884,58 @@ class JinestMessageTests(unittest.TestCase):
             self.assertEqual(resolver.messages[0].path, "root")
             self.assertEqual(resolver.messages[0].file, str(path.resolve()))
 
+
+    @unittest.skipUnless(yaml is not None, "PyYAML is required for YAML tests")
+    def test_imported_diagnostics_keep_source_location_and_global_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            library = folder / "library.yaml"
+            main = folder / "main.yaml"
+            library.write_text("value: literal\nvalue$: '2'\n", encoding="utf-8")
+            main.write_text(
+                "left$: import('library.yaml')\nright$: import('library.yaml')\n",
+                encoding="utf-8",
+            )
+            resolver = jinest.Resolver(
+                {
+                    "left$": "import('library.yaml')",
+                    "right$": "import('library.yaml')",
+                },
+                source_path=main,
+                emit_messages=False,
+                treat_warnings_as_errors=True,
+            )
+
+            with self.assertRaises(jinest.JinestWarningError):
+                resolver.resolve()
+
+        warnings = [message for message in resolver.messages if message.level == "warning"]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0].path, "root")
+        self.assertEqual(warnings[0].file, str(library.resolve()))
+
+    @unittest.skipUnless(yaml is not None, "PyYAML is required for YAML tests")
+    def test_debug_imported_error_uses_declaration_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            library = folder / "library.yaml"
+            main = folder / "main.yaml"
+            library.write_text("broken$: missing.value\n", encoding="utf-8")
+            main.write_text("instance$: import('library.yaml')\n", encoding="utf-8")
+            resolver = jinest.Resolver(
+                {"instance$": "import('library.yaml')"},
+                source_path=main,
+                emit_messages=False,
+                debug=True,
+            )
+            stream = io.StringIO()
+            with contextlib.redirect_stderr(stream):
+                with self.assertRaises(jinest.JinestTemplateError):
+                    resolver.resolve()
+
+        rendered = stream.getvalue()
+        self.assertIn("  at root['broken$']\n", rendered)
+        self.assertIn(f"  in {library.resolve()}\n", rendered)
 
 class JinestInlineSyntaxTests(unittest.TestCase):
     def test_raw_keys_disable_all_key_parsing(self) -> None:
@@ -1482,6 +1607,16 @@ class JinestFormatAndImportTests(unittest.TestCase):
             with self.assertRaisesRegex(jinest.JinestError, "Invalid YAML input"):
                 jinest.resolve_file(path)
 
+    def test_resolve_text_wraps_invalid_json_and_yaml(self) -> None:
+        cases = [
+            ("json", "{", "Invalid JSON input"),
+            ("yaml", "broken: [", "Invalid YAML input"),
+        ]
+        for format, text, message in cases:
+            with self.subTest(format=format):
+                with self.assertRaisesRegex(jinest.JinestError, message):
+                    jinest.resolve_text(text, format=format)
+
     def test_json_mapping_key_normalization_is_lossless(self) -> None:
         rendered = self._serialize_public_value(
             {date(2026, 8, 2): 1, b"A": 2},
@@ -1589,6 +1724,38 @@ container:
                     "where": "global_root.container.instance",
                 },
             )
+
+    def test_repeated_import_rebinds_each_destination_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            (folder / "library.yaml").write_text(
+                "source_path$: origin.path\n"
+                "destination_path$: path\n",
+                encoding="utf-8",
+            )
+            (folder / "main.yaml").write_text(
+                "left$: import('library.yaml')\n"
+                "right$: import('library.yaml')\n",
+                encoding="utf-8",
+            )
+
+            result = json.loads(
+                jinest.resolve_file(folder / "main.yaml", output_format="json")
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "left": {
+                    "source_path": "root",
+                    "destination_path": "global_root.left",
+                },
+                "right": {
+                    "source_path": "root",
+                    "destination_path": "global_root.right",
+                },
+            },
+        )
 
     def test_nested_relative_imports(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2242,6 +2409,90 @@ class JinestBindingAndCycleContractTests(unittest.TestCase):
             },
         )
         self.assertEqual(len(calls), 2)
+
+    def test_shared_templates_keep_modes_and_destination_context_isolated(self) -> None:
+        """Compiled Jinja artifacts are reusable but never capture a binding."""
+        shared = {
+            "native$": "_.marker",
+            "text@": "{{ _.marker }}",
+            "script^": "% return _.marker\n",
+            "native_literal$": "1",
+            "text_literal@": "1",
+            "script_literal^": "1",
+            "origin_path$": "origin.path",
+            "destination_path$": "path",
+        }
+
+        result = jinest.resolve(
+            {
+                "left": {"marker": "left", "node": shared},
+                "right": {"marker": "right", "node": shared},
+            },
+            emit_messages=False,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "left": {
+                    "marker": "left",
+                    "node": {
+                        "native": "left",
+                        "text": "left",
+                        "script": "left",
+                        "native_literal": 1,
+                        "text_literal": "1",
+                        "script_literal": None,
+                        "origin_path": "root.left.node",
+                        "destination_path": "global_root.left.node",
+                    },
+                },
+                "right": {
+                    "marker": "right",
+                    "node": {
+                        "native": "right",
+                        "text": "right",
+                        "script": "right",
+                        "native_literal": 1,
+                        "text_literal": "1",
+                        "script_literal": None,
+                        "origin_path": "root.right.node",
+                        "destination_path": "global_root.right.node",
+                    },
+                },
+            },
+        )
+
+    def test_shared_dynamic_keys_are_built_per_destination_binding(self) -> None:
+        shared = {"=$_.key": "value", "where$": "path"}
+
+        result = jinest.resolve(
+            {
+                "left": {"key": "left_key", "node": shared},
+                "right": {"key": "right_key", "node": shared},
+            },
+            emit_messages=False,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "left": {
+                    "key": "left_key",
+                    "node": {
+                        "left_key": "value",
+                        "where": "global_root.left.node",
+                    },
+                },
+                "right": {
+                    "key": "right_key",
+                    "node": {
+                        "right_key": "value",
+                        "where": "global_root.right.node",
+                    },
+                },
+            },
+        )
 
     def test_physical_python_container_cycle_is_an_error(self) -> None:
         source: dict[str, Any] = {}

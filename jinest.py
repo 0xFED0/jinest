@@ -4106,7 +4106,10 @@ def resolve_file(
 
 def _parse_text(text: str, format: str) -> Any:
     if format == "json":
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise JinestError(f"Invalid JSON input: {exc.msg}") from exc
     if format in {"yaml", "yml"}:
         yaml = _import_yaml_module()
         try:

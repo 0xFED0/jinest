@@ -1,0 +1,6 @@
+# One imported source is attached at two independent destinations.
+left$: "import('library.yml')"
+right$: "import('library.yml')"
+# One imported source is attached at two independent destinations.
+left$: "import('library.yml')"
+right$: "import('library.yml')"

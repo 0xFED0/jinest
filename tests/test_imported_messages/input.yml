@@ -1,0 +1,6 @@
+# The same imported declaration is reached twice, but its warning is emitted once.
+left$: "import('library.yml')"
+right$: "import('library.yml')"
+# The same imported declaration is reached twice, but its warning is emitted once.
+left$: "import('library.yml')"
+right$: "import('library.yml')"
