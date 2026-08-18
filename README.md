@@ -951,7 +951,7 @@ Convenience functions forward resolver options where applicable.
 | Option | Meaning |
 |---|---|
 | `strict=True` | Raise for undefined/unsupported values; non-strict uses `None` or empty text |
-| `in_place=False` | When enabled, write a mutable materialized root back into the original mapping/list |
+| `in_place=False` | Preserve the identity of a mutable input root and replace its contents with the materialized result |
 | `sandboxed=True` | Use Jinja sandboxed environments |
 | `globals`, `filters` | Add trusted application values/callables |
 | `source_path` | Source filename for metadata and relative imports |
@@ -964,11 +964,45 @@ Convenience functions forward resolver options where applicable.
 
 `Resolver.messages` remains available regardless of `emit_messages`.
 
-After a successful `in_place=True` resolution, `Resolver.root` and
-`Resolver.global_root` expose the materialized object. Repeating `resolve()`
-without changing that object is idempotent. If the object is edited, the next
-call treats its new contents as a fresh Jinest source and clears per-run import,
-diagnostic, syntax, and binding caches.
+With the default `in_place=False`, Jinest resolves from its own source tree and
+returns a separate materialized result; the caller's input object remains the
+original Jinest document. `in_place=True` is useful when other application code
+already holds a reference to the root mapping or list and that identity must be
+preserved while its contents become resolved values:
+
+```python
+data = {"x": 2, "y$": "x + 1"}
+shared_reference = data
+
+resolver = Resolver(data, in_place=True)
+result = resolver.resolve()
+
+assert result is data
+assert shared_reference is data
+assert data == {"x": 2, "y": 3}
+assert resolver.root is data
+assert resolver.global_root is data
+```
+
+Resolution and materialization complete before Jinest replaces the mutable root
+contents. For a normal `dict` or `list`, a rendering error therefore leaves the
+input source untouched rather than exposing a partially resolved tree. The
+identity guarantee applies to the mutable **root object only**; nested mappings
+and lists are materialized values and their original identities are not
+preserved.
+
+After a successful in-place resolution, `Resolver.root` and
+`Resolver.global_root` refer to that plain materialized root, not to lazy Jinest
+proxies. Repeating `resolve()` without changing the object is idempotent and
+returns the same root. If application code edits the object afterward, the next
+`resolve()` treats its current contents as a fresh Jinest source and clears
+per-run import, diagnostic, syntax, and binding caches.
+
+The identity-preserving behavior is mainly useful with `Resolver(...)` or
+`resolve(data, in_place=True)`, where the caller owns the Python root object.
+`resolve_text()` and `resolve_file()` parse their own internal root objects, so
+passing `in_place=True` to those convenience functions normally provides no
+observable identity benefit.
 
 ## CLI
 
