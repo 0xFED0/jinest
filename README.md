@@ -663,42 +663,40 @@ equal `N`, the later source declaration wins.
 
 ## Lazy evaluations in arrays
 
-Lists are lazy nodes and indices participate in destination paths.
+Lists are lazy Jinest nodes. Their elements are resolved only when accessed or
+materialized, and each element receives its own destination path, for example
+`global_root.items[5]`.
 
-`$`, `@`, and `^` remain scalar evaluator modes; their values must not be
-lists. Arrays are declared with an ordinary key, and each computed item opts
-in explicitly with inline or self syntax:
+An array does not inherit an evaluator mode from its key. A list-valued field
+must use an ordinary key, and every evaluated element must opt in explicitly
+with inline or self syntax:
 
 ```yaml
 values:
-  - '=$x + 1'
-  - '=@Value: {{ x }}'
-  - '=^% return x * 2'
-  - literal
+  - '=$x + 1'          # native expression; result may be any supported value
+  - '=@Value: {{ x }}' # text template; result is always a string
+  - '=^% return x * 2' # script
+  - literal            # ordinary data
 
 self_values:
   -
-    <$: x + 1
+    <$: x + 1          # self-wrapper applied to this array element
 ```
 
-The former mode-typed lazy-array form (`items$: [...]`, `items@: [...]`, or
-`items^: [...]`) is not supported; it raises a type error instead of silently
-applying a mode to every item.
+The former mode-typed array declarations (`items$: [...]`, `items@: [...]`,
+or `items^: [...]`) are invalid. They do not apply a mode to every element;
+Jinest raises a type error instead. Use an explicit directive on each element
+that should be evaluated.
 
-Unmarked strings remain data. Item directives use the array element's
-destination context, including its full `path`, `keyname`, `effective_key`,
-and `keypath` metadata. An escaped inline string remains literal.
+Inline and self directives use the element's full destination context,
+including `path`, `keyname`, `effective_key`, and `keypath`. An escaped inline
+string remains literal. Unmarked strings remain data.
 
-A list returned by an expression/script is a generated Jinest subtree, not a
-second evaluator body. Ordinary returned strings are not implicitly evaluated
-again, but explicit `=<mode>` strings and Jinest mapping keys inside that
-returned container are parsed normally. Escape them when they are literal.
-
-Example path:
-
-```text
-global_root.items[5].object
-```
+A list returned by an expression or script is a generated Jinest subtree, not
+a second evaluator body. Ordinary returned strings are not evaluated again,
+but explicit `=<mode>` strings and Jinest declaration keys in a returned
+mapping are processed normally. Escape them when they are intended as literal
+text.
 
 ## Cycles
 
