@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.16.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.16.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -173,13 +173,13 @@ structural construct; a scalar prefix declares an inline evaluator.
 | `name[axis=source, ...]@` | Text Cartesian compose |
 | `name+`, `name~`, `name*`, `name%` | Flatten, string join, Cartesian product, strict zip |
 | `=$expr`, `=@text`, `=^script` | Inline evaluator in a scalar value or mapping key |
-| `<$`, `<(args)=`, `<[axis=source]=` | Declaration applied to the current slot |
+| `<$`, `<@`, `<^`, `<(args)=`, `<[axis=source]=` | Declaration applied to the current slot |
 | `key\`` | Raw key: remove one final backtick and disable key parsing |
 | `.name`, `.name$`, `.name@`, `.name^` | Hidden field |
 | `<<$`, `<<N$`, `<<^`, `<<N^` | Default layer |
-| `<<!$`, `<<N!$`, `<<!^`, `<<N!^` | Override layer |
+| `<<!$`, `<<!N$`, `<<!^`, `<<!N^` | Override layer |
 | `<<[]`, `<<N[]` | Multiple default layers from one list |
-| `<<![]`, `<<!N[]`, `<<N![]` | Multiple override layers from one list |
+| `<<![]`, `<<!N[]` | Multiple override layers from one list |
 
 Local field priority inside one mapping is:
 
@@ -229,7 +229,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.16.0
+  version: 0.16.1
   label@: "{{ product }} v{{ version }}"
 ```
 
@@ -578,12 +578,14 @@ items:
 Supported forms are:
 
 - `<$`: one native evaluator layer;
+- `<@`: one text-template evaluator layer;
+- `<^`: one script evaluator layer;
 - `<(args)=`: structural function at the current slot;
 - `<[axis=source]=`: structural compose at the current slot.
 
-`<@` and `<^` are not currently implemented. `<$` follows the same scalar
-validation as `$` and may be nested for inside-out pipelines. Structural self
-bodies follow normal function/compose validation and rebinding.
+`<$`, `<@`, and `<^` follow the same scalar validation as their corresponding
+field modes and may be nested for inside-out pipelines. Structural self bodies
+follow normal function/compose validation and rebinding.
 
 A wrapper is recognized only when its mapping has exactly one supported key.
 With any additional key, the mapping is ordinary Jinest data. Self declarations
@@ -649,6 +651,10 @@ layer is needed; fields inside its resulting mapping remain lazy as well. Item
 order is preserved. Existing numeric ordering and `!` override behavior are
 unchanged; at the same numeric order, an ordinary `<<N$`/`<<N^` layer has
 higher effective precedence than `<<N[]`.
+
+The override marker always precedes the numeric order: use `<<!N$`,
+`<<!N^`, or `<<!N[]`. The old `<<N!$`, `<<N!^`, and `<<N![]` spellings are
+invalid declarations.
 
 Numbered keys use `N` as order; omitted `N` is `0`. Default and override
 families are sorted independently. Larger `N` has higher lookup priority; at

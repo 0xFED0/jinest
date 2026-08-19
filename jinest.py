@@ -23,11 +23,11 @@ Syntax
 * ``=$expr``, ``=@text``, and ``=^script`` — inline scalar directives for
   native expressions, text templates, and scripts; they also form dynamic
   mapping keys when used as keys.
-* ``<$``, ``<(args)=``, and ``<[axis=source]=`` — self-declaration wrappers
-  that apply one declaration to the current value slot.
+* ``<$``, ``<@``, ``<^``, ``<(args)=``, and ``<[axis=source]=`` — self-declaration
+  wrappers that apply one declaration to the current value slot.
 * Local priority is ``name`` > ``name^`` > ``name$`` > ``name@``.
 * ``<<$`` / ``<<N$`` and ``<<^`` / ``<<N^`` add lazy default layers.
-* ``<<!$`` / ``<<N!$`` and ``<<!^`` / ``<<N!^`` add lazy override layers.
+* ``<<!$`` / ``<<!N$`` and ``<<!^`` / ``<<!N^`` add lazy override layers.
 * ``<<[]`` / ``<<N[]`` and their ``!`` variants expand a list of lazy layers.
 * Lookup priority is last override, local, last default.
 * ``context`` is the destination node, ``origin`` is the source declaration
@@ -93,7 +93,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.16.0"
+__version__ = "0.16.1"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -120,12 +120,12 @@ _RESERVED_NAMES = {
     "source_file",
 }
 _MERGE_RE = re.compile(
-    # Both historic ``<<N!$`` and the more readable ``<<!N[]`` spelling
-    # are accepted.  ``[]`` is source multiplicity, not an evaluator mode.
-    r"^<<(?:(?P<leading_override>!)?(?P<order>\d*)|"
-    r"(?P<legacy_order>\d+)(?P<legacy_override>!))"
+    # ``!`` is always before the numeric order. ``[]`` is source multiplicity,
+    # not an evaluator mode.
+    r"^<<(?P<leading_override>!?)(?P<order>\d*)"
     r"(?P<mode>[$^]|\[\])$"
 )
+_INVALID_LEGACY_MERGE_RE = re.compile(r"^<<\d+!(?:[$^]|\[\])$")
 _MISSING = object()
 _EMPTY_MAPPING: Mapping[Any, Any] = {}
 _NODE_META_NAMES = {"path", "source_path", "root", "file"}
@@ -389,7 +389,7 @@ class _SelfSpec:
     """One parsed declaration wrapper applied to its containing value slot."""
 
     source_key: str
-    mode: str  # native, structural, compose_structural
+    mode: str  # native, text, script, structural, compose_structural
     payload: Any  # expression body, _FunctionSpec, or _ComposeSpec
 
 
@@ -757,8 +757,12 @@ def _parse_self_declaration(value: Any) -> _SelfSpec | None:
     key, body = next(iter(value.items()))
     if not isinstance(key, str) or not key.startswith("<"):
         return None
-    if key == "<$":
-        return _SelfSpec(key, "native", body)
+    if key in {"<$", "<@", "<^"}:
+        return _SelfSpec(
+            key,
+            {"<$": "native", "<@": "text", "<^": "script"}[key],
+            body,
+        )
     if key.startswith("<(") and key.endswith(")="):
         synthetic_key = "__jinest_self" + key[1:]
         try:
@@ -2217,7 +2221,12 @@ class Resolver:
     def _merge_key(key: Any) -> re.Match[str] | None:
         if not isinstance(key, str) or _literal_syntax_key(key):
             return None
-        return _MERGE_RE.fullmatch(key)
+        match = _MERGE_RE.fullmatch(key)
+        if match is None and _INVALID_LEGACY_MERGE_RE.fullmatch(key):
+            raise JinestError(
+                f"Invalid merge declaration {key!r}; use '<<!N' before the mode"
+            )
+        return match
 
     @classmethod
     def _template_key(cls, key: Any) -> tuple[Any, str] | None:
@@ -2611,7 +2620,7 @@ class Resolver:
 
         self_spec = _parse_self_declaration(value)
         if self_spec is not None:
-            if self_spec.mode == "native":
+            if self_spec.mode in {"native", "text", "script"}:
                 inner = self._resolve_layer_input(
                     scope,
                     self_spec.payload,
@@ -2622,16 +2631,17 @@ class Resolver:
                     effective_key=effective_key,
                     local_vars=local_vars,
                 )
+                mode_marker = {"native": "$", "text": "@", "script": "^"}[self_spec.mode]
                 result = self._apply_render_layer(
                     scope,
                     inner.value,
-                    mode="native",
+                    mode=self_spec.mode,
                     origin_source=origin_source,
                     source_key=self_spec.source_key,
                     context_path=context_path,
                     keyname=keyname,
                     effective_key=effective_key,
-                    keymode="$",
+                    keymode=mode_marker,
                     local_vars=local_vars,
                 )
                 return LayerResult(result, applied=True)
@@ -2965,7 +2975,7 @@ class Resolver:
             match = self._merge_key(key)
             if match is None:
                 continue
-            order_text = match.group("order") or match.group("legacy_order")
+            order_text = match.group("order")
             order = int(order_text) if order_text else 0
             multiple = match.group("mode") == "[]"
             spec = _LayerSpec(
@@ -2973,10 +2983,7 @@ class Resolver:
                 template=template,
                 order=order,
                 position=position,
-                override=bool(
-                    match.group("leading_override")
-                    or match.group("legacy_override")
-                ),
+                override=bool(match.group("leading_override")),
                 mode=(
                     EvaluatorKind.SCRIPT
                     if match.group("mode") == "^"
@@ -5050,13 +5057,13 @@ def _self_test() -> None:
         "overrides1": {"rank": "o1", "o1": True},
         "overrides2": {"rank": "o2", "o2": True},
         "example": {
-            "<<2!$": "root.overrides2",
+            "<<!2$": "root.overrides2",
             "<<2$": "root.defaults2",
             "x": 1,
             "y@": "{{ x }}",
             "z$": "x + (y | int)",
             "rank": "local",
-            "<<1!$": "root.overrides1",
+            "<<!1$": "root.overrides1",
             "<<1$": "root.defaults1",
         },
         "priority": {

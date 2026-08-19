@@ -26,7 +26,7 @@ overrides_two:
 
 target:
   # Source order is deliberately scrambled; N controls order within each family.
-  <<2!^: |
+  <<!2^: |
     % return global_root.overrides_two
   <<2$: global_root.defaults_two
 
@@ -34,7 +34,7 @@ target:
   local_only: true
   shared: from-local
 
-  <<1!$: global_root.overrides_one
+  <<!1$: global_root.overrides_one
   <<1^: |
     % return global_root.defaults_one
 

@@ -17,8 +17,8 @@ service:
     % return root.defaults_two
   rank: local
   port: 8080
-  <<1!$: root.overrides_one
-  <<2!^: |
+  <<!1$: root.overrides_one
+  <<!2^: |
     % return root.overrides_two
 empty_layer:
   <<$: "none"

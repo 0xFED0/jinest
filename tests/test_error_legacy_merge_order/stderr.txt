@@ -1,0 +1,1 @@
+jinest: Invalid merge declaration '<<1!$'; use '<<!N' before the mode

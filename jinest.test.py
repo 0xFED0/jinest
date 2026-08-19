@@ -85,7 +85,7 @@ class JinestTestSuiteContractTests(unittest.TestCase):
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.16.0")
+        self.assertEqual(jinest.__version__, "0.16.1")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -1176,6 +1176,18 @@ class JinestInlineSyntaxTests(unittest.TestCase):
                 ):
                     resolver.resolve()
 
+    def test_self_wrapper_uses_mapping_protocol_for_proxy_items_field(self) -> None:
+        """A user field named items must not shadow parser internals."""
+        result = jinest.resolve(
+            {
+                "items": ["sentinel"],
+                "make()=": {"value": 1},
+                "array": "=$[root.make()]",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(result["array"], [{"value": 1}])
+
     def test_self_dollar_and_inline_layers_are_equivalent(self) -> None:
         result = jinest.resolve(
             {
@@ -1189,6 +1201,26 @@ class JinestInlineSyntaxTests(unittest.TestCase):
         self.assertEqual(
             result,
             {"x": 2, "suffix": 3, "inline": 3, "wrapped": 3},
+        )
+
+    def test_self_text_and_script_wrappers_use_standard_evaluators(self) -> None:
+        result = jinest.resolve(
+            {
+                "value": 2,
+                "text_source": "hello",
+                "text": {"<@": "{{ text_source }} {{ value }}"},
+                "script": {"<^": "% return value + 3\n"},
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "value": 2,
+                "text_source": "hello",
+                "text": "hello 2",
+                "script": 5,
+            },
         )
 
     def test_self_dollar_pipeline_and_type_validation(self) -> None:
@@ -1323,6 +1355,42 @@ class JinestInlineSyntaxTests(unittest.TestCase):
 
 
 class JinestComposeTests(unittest.TestCase):
+    def test_nested_structural_compose_preserves_inner_axis_locals(self) -> None:
+        """Nested compose frames must retain both outer and inner axes."""
+        result = jinest.resolve(
+            {
+                "values": [1, 2],
+                "outer[i=values]=": [
+                    {
+                        "inner[j=values]=": [
+                            {"outer_value$": "i", "inner_value$": "j"}
+                        ]
+                    }
+                ],
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "values": [1, 2],
+                "outer": [
+                    {
+                        "inner": [
+                            {"outer_value": 1, "inner_value": 1},
+                            {"outer_value": 1, "inner_value": 2},
+                        ]
+                    },
+                    {
+                        "inner": [
+                            {"outer_value": 2, "inner_value": 1},
+                            {"outer_value": 2, "inner_value": 2},
+                        ]
+                    },
+                ],
+            },
+        )
+
     def test_structural_compose_axis_order_mapping_and_text(self) -> None:
         result = jinest.resolve(
             {
@@ -1601,6 +1669,41 @@ class JinestComposeTests(unittest.TestCase):
 
 
 class JinestLayerTests(unittest.TestCase):
+    def test_legacy_merge_order_is_rejected(self) -> None:
+        for key in ("<<1!$", "<<1![]"):
+            with self.subTest(key=key), self.assertRaisesRegex(
+                jinest.JinestError,
+                r"Invalid merge declaration",
+            ):
+                jinest.resolve({"target": {key: {"value": 1}}}, emit_messages=False)
+
+    def test_structural_function_layer_preserves_full_frame_metadata(self) -> None:
+        """Merge layers must preserve the same origin as ordinary attachments."""
+        result = jinest.resolve(
+            {
+                "make(x)=": {
+                    "value$": "x",
+                    "origin_where@": "{{ origin.path }}",
+                    "nested": {"origin_where@": "{{ origin.path }}"},
+                },
+                "attached": "=$root.make(1)",
+                "native_layer": {"<<$": "root.make(2)"},
+                "script_layer": {"<<^": "% return root.make(3)\n"},
+                "multi_layer": {"<<[]": ["=$root.make(4)"]},
+            },
+            emit_messages=False,
+        )
+        for name, value in (
+            ("attached", 1),
+            ("native_layer", 2),
+            ("script_layer", 3),
+            ("multi_layer", 4),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(result[name]["value"], value)
+                self.assertEqual(result[name]["origin_where"], "root")
+                self.assertEqual(result[name]["nested"]["origin_where"], "root")
+
     def test_layer_order_defaults_local_overrides(self) -> None:
         data = {
             "defaults1": {"rank": "d1", "d1": True},
@@ -1610,10 +1713,10 @@ class JinestLayerTests(unittest.TestCase):
             "example": {
                 # Deliberately scrambled source order. Numeric order controls
                 # each family independently.
-                "<<2!$": "root.overrides2",
+                "<<!2$": "root.overrides2",
                 "<<2$": "root.defaults2",
                 "rank": "local",
-                "<<1!$": "root.overrides1",
+                "<<!1$": "root.overrides1",
                 "<<1$": "root.defaults1",
             },
         }
@@ -2672,7 +2775,7 @@ class JinestScriptTests(unittest.TestCase):
                 "target": {
                     "<<2^": "% return root.defaults\n",
                     "x": 2,
-                    "<<1!^": "% return root.overrides\n",
+                    "<<!1^": "% return root.overrides\n",
                 },
             }
         )["target"]
@@ -2810,8 +2913,8 @@ class JinestScriptEdgeTests(unittest.TestCase):
                     "<<2$": "root.d2",
                     "<<1^": "% return root.d1\n",
                     "rank": "local",
-                    "<<2!$": "root.o2",
-                    "<<1!^": "% return root.o1\n",
+                "<<!2$": "root.o2",
+                "<<!1^": "% return root.o1\n",
                 },
             }
         )["target"]

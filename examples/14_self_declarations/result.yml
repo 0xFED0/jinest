@@ -3,6 +3,9 @@ value: 2
 suffix: 3
 inline: 3
 wrapped: 3
+text_source: hello
+self_text: hello 2
+self_script: 5
 
 # The nested layers evaluate the inner expression string first.
 pipeline: 3

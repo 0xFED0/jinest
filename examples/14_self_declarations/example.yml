@@ -12,6 +12,14 @@ inline: =$value + 1
 wrapped:
   <$: value + 1
 
+# Text and script self wrappers use the corresponding standard evaluators.
+text_source: hello
+self_text:
+  <@: '{{ text_source }} {{ value }}'
+self_script:
+  <^: |
+    % return value + 3
+
 # Layers compose inside-out: the inner layer returns the expression string,
 # then the outer `$` layer evaluates that string.
 pipeline$:
