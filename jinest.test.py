@@ -85,7 +85,7 @@ class JinestTestSuiteContractTests(unittest.TestCase):
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.16.1")
+        self.assertEqual(jinest.__version__, "0.17.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -268,8 +268,8 @@ class JinestCoreTests(unittest.TestCase):
                         "}",
                     ]
                 ),
-                "array_context$": [
-                    "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode, 'keypath': keypath}"
+                "array_context": [
+                    "=${'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode, 'keypath': keypath}"
                 ],
                 ".hidden_context$": "{'keyname': keyname, 'effective_key': effective_key, 'keymode': keymode, 'keypath': keypath}",
                 "hidden_report$": "hidden_context",
@@ -294,7 +294,7 @@ class JinestCoreTests(unittest.TestCase):
                 "array_context": [
                     {
                         "keyname": "array_context",
-                        "effective_key": "array_context$",
+                        "effective_key": "array_context",
                         "keymode": "$",
                         "keypath": "global_root.array_context[0].array_context",
                     }
@@ -1239,20 +1239,20 @@ class JinestInlineSyntaxTests(unittest.TestCase):
                 emit_messages=False,
             )
 
-    def test_lazy_array_layers_compose_instead_of_override(self) -> None:
+    def test_inline_directives_in_arrays_apply_without_field_mode(self) -> None:
         result = jinest.resolve(
             {
                 "value": 2,
-                "items$": [
-                    '=$"value + 1"',
+                "items": [
+                    "=$value + 1",
                     "=@{{ value }}",
-                    '=^% return "value * 3"\n',
+                    "=^% return value * 3\n",
                     "`=$value",
                 ],
             },
             emit_messages=False,
         )
-        self.assertEqual(result, {"value": 2, "items": [3, 2, 6, "=$value"]})
+        self.assertEqual(result, {"value": 2, "items": [3, "2", 6, "=$value"]})
 
     def test_self_structural_function_and_compose(self) -> None:
         result = jinest.resolve(
@@ -1334,14 +1334,14 @@ class JinestInlineSyntaxTests(unittest.TestCase):
         )
         self.assertEqual(resolver.messages, [])
 
-    def test_inline_directives_compose_with_legacy_array_mode(self) -> None:
+    def test_inline_directives_in_arrays_are_explicit_item_layers(self) -> None:
         resolver = jinest.Resolver(
             {
                 "value": 2,
-                "items$": [
-                    '=$"value + 1"',
+                "items": [
+                    "=$value + 1",
                     "=@{{ value }}",
-                    '=^% return "value * 3"\n',
+                    "=^% return value * 3\n",
                     "`=$value",
                 ],
             },
@@ -1349,7 +1349,7 @@ class JinestInlineSyntaxTests(unittest.TestCase):
         )
         self.assertEqual(
             resolver.resolve(),
-            {"value": 2, "items": [3, 2, 6, "=$value"]},
+            {"value": 2, "items": [3, "2", 6, "=$value"]},
         )
         self.assertEqual(resolver.messages, [])
 
@@ -1954,32 +1954,46 @@ class JinestPrototypeTests(unittest.TestCase):
 
 
 class JinestArrayTests(unittest.TestCase):
+    def test_legacy_mode_typed_arrays_are_rejected(self) -> None:
+        """Evaluator suffixes remain scalar-only; item evaluation is explicit."""
+        for source in (
+            {"items$": ["1"]},
+            {"items@": ["1"]},
+            {"items^": ["% return 1"]},
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    jinest.JinestTemplateError,
+                    "requires a string body",
+                ):
+                    jinest.resolve(source, emit_messages=False)
+
     def test_native_and_text_array_items(self) -> None:
         result = jinest.resolve(
             {
                 "var1": 7,
                 "var2": 9,
-                "native_array$": [
-                    "var1",
-                    "root.var2",
-                    "1",
-                    "true",
+                "native_array": [
+                    "=$var1",
+                    "=$root.var2",
+                    "=$1",
+                    "=$true",
                     5,
                     "none",
-                    "path",
+                    "=$path",
                 ],
-                "text_array@": [
-                    "{{ var1 }}",
-                    "v={{ root.var2 }}",
-                    "{{ 1 }}",
-                    "{{ true }}",
-                    "{{ path }}",
+                "text_array": [
+                    "=@{{ var1 }}",
+                    "=@v={{ root.var2 }}",
+                    "=@{{ 1 }}",
+                    "=@{{ true }}",
+                    "=@{{ path }}",
                 ],
             }
         )
         self.assertEqual(
             result["native_array"],
-            [7, 9, 1, True, 5, None, "global_root.native_array[6]"],
+            [7, 9, 1, True, 5, "none", "global_root.native_array[6]"],
         )
         self.assertEqual(
             result["text_array"],
@@ -1989,9 +2003,9 @@ class JinestArrayTests(unittest.TestCase):
     def test_array_is_lazy_per_item(self) -> None:
         resolver = jinest.Resolver(
             {
-                "items$": [
-                    "40 + 2",
-                    "missing.deep.value",
+                "items": [
+                    "=$40 + 2",
+                    "=$missing.deep.value",
                 ]
             }
         )
@@ -2018,7 +2032,7 @@ class JinestArrayTests(unittest.TestCase):
         self.assertEqual(result["some-key"]["where"], "global_root['some-key']")
 
     def test_sequence_indexing_slicing_and_negative_index(self) -> None:
-        resolver = jinest.Resolver({"items$": ["1", "2", "3"]})
+        resolver = jinest.Resolver({"items": ["=$1", "=$2", "=$3"]})
         self.assertEqual(resolver.root.items[-1], 3)
         self.assertEqual(resolver.root.items[0:2], [1, 2])
         with self.assertRaises(IndexError):
@@ -2757,11 +2771,11 @@ class JinestScriptTests(unittest.TestCase):
         result = jinest.resolve(
             {
                 "x": 5,
-                "values^": [
-                    "% return x + 1\n",
-                    "% set y = x * 2\n% return y\n",
-                    "% return 3\n",
-                    "% return none\n",
+                "values": [
+                    "=^% return x + 1\n",
+                    "=^% set y = x * 2\n% return y\n",
+                    "=^% return 3\n",
+                    "=^% return none\n",
                 ],
             }
         )

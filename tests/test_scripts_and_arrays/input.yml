@@ -1,17 +1,16 @@
-# Native, text, and script arrays resolve each string item lazily.
+# Arrays are ordinary lazy nodes; each computed item opts in explicitly.
 x: 4
-native_values$:
-  - "x * 2"
-  - "{'answer': x + 1}"
+native_values:
+  - '=$x * 2'
+  - '=$x + 1'
   - 7
-text_values@:
-  - "x={{ x }}"
-  - "path={{ path }}"
-script_values^:
-  - |
-      % return x + 10
-  - |
-      % for item in [1, 2, 3]
+text_values:
+  - '=@x={{ x }}'
+  - '=@path={{ path }}'
+script_values:
+  - '=^% return x + 10'
+  - |-
+      =^% for item in [1, 2, 3]
         % if item == 2
           % return {"found": item}
         % endif

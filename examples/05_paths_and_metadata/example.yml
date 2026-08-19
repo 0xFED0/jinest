@@ -80,11 +80,11 @@ calc:
   # string; the outer $ evaluates that string and observes its own $ mode.
   layered_key_context$: '=@{"inner_mode": "{{ keymode }}", "outer_mode": keymode}'
 
-  # For a legacy mode-typed array item, path is the item destination while
-  # keypath remains the syntactic alias path[keyname].
-  array_key_context$:
+  # For an explicitly inline-evaluated array item, path is the item destination
+  # while keypath remains the syntactic alias path[keyname].
+  array_key_context:
     - >-
-      {'path': path, 'keyname': keyname, 'keypath': keypath, 'keymode': keymode}
+      =${'path': path, 'keyname': keyname, 'keypath': keypath, 'keymode': keymode}
 
   # A dynamic key has no final logical name/path while its expression runs.
   =$"dynamic_" ~ ("unset" if keyname is none and keypath is none else "set"):

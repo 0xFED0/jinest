@@ -1,34 +1,35 @@
 # Run from the repository root:
 #   python jinest.py examples/02_scripts_and_arrays/example.yml --output-format yaml
 #
-# Lists directly under $, @, or ^ resolve each string item in that mode.
+# Lists are ordinary lazy nodes. Use explicit inline directives for items that
+# should be evaluated; plain strings remain data.
 
 base: 4
 
-# Each string item is an independent native expression; numbers and booleans pass through.
-native_values$:
-  - base + 1
-  - root.base * 2
-  - "true"
-  - "{'nested': base}"
-  - path
+# Each explicitly marked item is an independent native expression.
+native_values:
+  - '=$base + 1'
+  - '=$root.base * 2'
+  - '=$true'
+  - '=$base * 3'
+  - '=$path'
   - 99
 
-# Every item must be a string because @ always renders a text template.
-text_values@:
-  - "base={{ base }}"
-  - "root={{ root.base }}"
-  - "item path={{ path }}"
-  - "99"
+# Text items opt in individually with `=@`.
+text_values:
+  - '=@base={{ base }}'
+  - '=@root={{ root.base }}'
+  - '=@item path={{ path }}'
+  - '=@99'
 
-# Script strings execute independently; numeric/boolean items pass through.
-script_values^:
-  - |
-      % return base + 10
-  - |
-      % set doubled = base * 2
+# Script items opt in individually with `=^`.
+script_values:
+  - |-
+      =^% return base + 10
+  - |-
+      =^% set doubled = base * 2
       % return {"doubled": doubled}
-  - "% return 99"
+  - '=^% return 99'
 
 # The expression itself runs once. Its returned list then becomes an ordinary
 # Jinest subtree: plain strings stay data, while explicit inline directives

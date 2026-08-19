@@ -9,10 +9,10 @@ pipeline$:
 nested:
   <$:
     <$: "\"value + 1\""
-items$:
-  - =$"value + 1"
+items:
+  - =$value + 1
   - =@{{ value }}
-  - =^% return "value * 3"
+  - =^% return value * 3
   - '`=$value'
 function_name: make
 =$function_name:

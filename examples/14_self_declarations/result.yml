@@ -11,10 +11,10 @@ self_script: 5
 pipeline: 3
 nested: 3
 
-# Inline array layers run before the outer legacy `$` mode.
+# Explicit inline directives evaluate individual array items.
 items:
 - 3
-- 2
+- '2'
 - 6
 - =$value
 

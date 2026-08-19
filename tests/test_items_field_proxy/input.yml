@@ -1,0 +1,5 @@
+# Regression: a user field named items must not shadow Mapping.items internally.
+items: [sentinel]
+make()=:
+  value: 1
+array: '=$[root.make()]'

@@ -28,13 +28,13 @@ nested:
   <$:
     <$: "\"value + 1\""
 
-# Legacy lazy-array `$` mode remains available. Inline directives are inner
-# layers, so each item is evaluated by its inline mode and then by `$`.
-items$:
-  - '=$"value + 1"'
+# Array items opt in explicitly with inline directives; unmarked strings stay
+# literal data.
+items:
+  - '=$value + 1'
   - '=@{{ value }}'
   - |
-    =^% return "value * 3"
+    =^% return value * 3
   - '`=$value'                 # escaped inline syntax stays literal
 
 # A dynamic key can host a self structural-function declaration. The function

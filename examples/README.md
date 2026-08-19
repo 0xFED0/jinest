@@ -34,7 +34,7 @@ commented result files, and checks the exact JSON byte escapes in example 09.
 | Directory | Features demonstrated |
 |---|---|
 | `01_field_modes` | Literal fields, `@`, `$`, `^`, native values, local priority and diagnostics, hidden fields, raw keys |
-| `02_scripts_and_arrays` | Line statements, native `return`, loops, `$`/`@`/`^` arrays, per-item paths, slices, and generated Jinest subtrees |
+| `02_scripts_and_arrays` | Line statements, native `return`, loops, explicit inline `=$`/`=@`/`=^` array items, per-item paths, slices, and generated Jinest subtrees |
 | `03_lazy_layers` | Native/script default and override layers, independent numbering, precedence, null and recursive layers |
 | `04_prototypes_and_context` | Reusable destination-bound prototypes; `context`, `_`, `path`, `origin`, `root`, and `global_root` |
 | `05_paths_and_metadata` | `PathRef`, metadata collisions, path/source helpers, declaration key context, dynamic keys and rebinding |
@@ -46,7 +46,7 @@ commented result files, and checks the exact JSON byte escapes in example 09.
 | `11_functions` | Native/text/script and mapping/list structural functions, defaults, namespaces, and independent destination rebinding |
 | `12_matrix_by_code` | Building a version/module matrix with script loops and structural functions |
 | `13_matrix_by_composition` | The same version/module matrix with Cartesian structural and text compose declarations |
-| `14_self_declarations` | Self `$` wrappers, nested evaluation pipelines, layered lazy arrays, dynamic structural functions, self compose, and wrapper validation |
+| `14_self_declarations` | Self `$`/`@`/`^` wrappers, nested evaluation pipelines, explicit array items, dynamic structural functions, self compose, and wrapper validation |
 
 Comments are intentionally retained in checked-in `result.yml` files. A fresh
 CLI output is therefore value-equivalent rather than byte-for-byte identical.

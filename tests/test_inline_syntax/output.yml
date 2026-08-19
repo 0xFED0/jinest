@@ -17,7 +17,3 @@ items:
 - item=4
 - 16
 - =@item={{ value }}
-legacy:
-- 5
-- 4
-- 20

@@ -25,9 +25,3 @@ items:
   - "=@item={{ value }}"
   - "=^% return value * 4"
   - "`=@item={{ value }}"
-
-# Inline elements form inner layers before the legacy `$` array mode.
-legacy$:
-  - "value + 1"
-  - "=@{{ value }}"
-  - '=^% return "value * 5"'

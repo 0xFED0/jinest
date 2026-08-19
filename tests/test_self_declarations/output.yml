@@ -6,7 +6,7 @@ pipeline: 3
 nested: 3
 items:
 - 3
-- 2
+- '2'
 - 6
 - =$value
 function_name: make

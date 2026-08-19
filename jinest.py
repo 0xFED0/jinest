@@ -38,8 +38,8 @@ Syntax
 * Path helpers: ``normalize_path``, ``absolute_path``, ``relative_path``,
   ``path_of``, ``source_path_of``, ``at``, ``get``, ``root_of``, and
   ``source_file``.
-* Lists directly under ``$``, ``@``, or ``^`` resolve string items lazily in
-  native-expression, text-template, or script mode respectively.
+* Lists are ordinary lazy nodes; explicit ``=$``, ``=@``, ``=^``, or self
+  wrappers select evaluation for individual items.
 * ``import_yaml`` (alias ``import``) and ``import_json`` load lazy trees whose
   source ``root`` and file metadata remain independent.
 * ``Resolver.messages`` collects ``warning`` and ``hint`` diagnostics; use
@@ -93,7 +93,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.16.1"
+__version__ = "0.17.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -1217,10 +1217,9 @@ class _MappingProxy(_ContainerProxy, Mapping):
 
 
 class _SequenceProxy(_ContainerProxy, Sequence):
-    """Lazy sequence, optionally resolving each string item as Jinja."""
+    """Lazy sequence whose items may contain inline or self declarations."""
 
     __slots__ = (
-        "_jinest_item_mode",
         "_jinest_key_context",
         "_jinest_resolved",
     )
@@ -1232,8 +1231,7 @@ class _SequenceProxy(_ContainerProxy, Sequence):
         parent: _ContainerProxy | None,
         path: tuple[Any, ...],
         *,
-        item_mode: str | None = None,
-        key_context: tuple[Any, Any, str | None] | None = None,
+        key_context: tuple[Any, Any] | None = None,
         path_kind: str = "global",
         local_vars: Mapping[str, Any] | None = None,
         function_scope: "_ContainerProxy | None" = None,
@@ -1251,9 +1249,6 @@ class _SequenceProxy(_ContainerProxy, Sequence):
             function_origin_source,
             function_body_source_path,
         )
-        if item_mode not in {None, "native", "text", "script"}:
-            raise ValueError(f"Unsupported sequence item mode: {item_mode!r}")
-        object.__setattr__(self, "_jinest_item_mode", item_mode)
         object.__setattr__(self, "_jinest_key_context", key_context)
         cache = object.__getattribute__(self, "_jinest_binding").cache
         object.__setattr__(self, "_jinest_resolved", cache.resolved)
@@ -1292,13 +1287,11 @@ class _SequenceProxy(_ContainerProxy, Sequence):
 
         try:
             item = raw[normalized]
-            mode = object.__getattribute__(self, "_jinest_item_mode")
             item_path = object.__getattribute__(self, "_jinest_path") + (normalized,)
 
             key_context = object.__getattribute__(self, "_jinest_key_context")
             keyname = None if key_context is None else key_context[0]
             effective_key = None if key_context is None else key_context[1]
-            outer_keymode = None if key_context is None else key_context[2]
             layer_result = owner._resolve_layer_input(
                 self,
                 item,
@@ -1308,32 +1301,7 @@ class _SequenceProxy(_ContainerProxy, Sequence):
                 keyname=keyname,
                 effective_key=effective_key,
             )
-            if mode is not None and not layer_result.escaped_literal:
-                if layer_result.applied:
-                    value = owner._apply_render_layer(
-                        self,
-                        layer_result.value,
-                        mode=mode,
-                        origin_source=source,
-                        source_key=normalized,
-                        context_path=item_path,
-                        keyname=keyname,
-                        effective_key=effective_key,
-                        keymode=outer_keymode,
-                    )
-                else:
-                    value = owner._render(
-                        self,
-                        item,
-                        mode=mode,
-                        origin_source=source,
-                        source_path=source.source_path + (normalized,),
-                        context_path=item_path,
-                        keyname=keyname,
-                        effective_key=effective_key,
-                        keymode=outer_keymode,
-                    )
-            elif not layer_result.applied and not layer_result.escaped_literal:
+            if not layer_result.applied and not layer_result.escaped_literal:
                 value = item
             else:
                 value = layer_result.value
@@ -2007,8 +1975,7 @@ class Resolver:
         *,
         origin: "Resolver | None" = None,
         source_path: tuple[Any, ...] | None = None,
-        sequence_item_mode: str | None = None,
-        sequence_key_context: tuple[Any, Any, str | None] | None = None,
+        sequence_key_context: tuple[Any, Any] | None = None,
         path_kind: str = "global",
         local_vars: Mapping[str, Any] | None = None,
         function_scope: _ContainerProxy | None = None,
@@ -2048,8 +2015,6 @@ class Resolver:
             source.raw, (str, bytes, bytearray)
         ):
             if isinstance(value, _SequenceProxy):
-                if sequence_item_mode is None:
-                    sequence_item_mode = object.__getattribute__(value, "_jinest_item_mode")
                 if sequence_key_context is None:
                     sequence_key_context = object.__getattribute__(
                         value, "_jinest_key_context"
@@ -2059,7 +2024,6 @@ class Resolver:
                 source,
                 parent,
                 path,
-                item_mode=sequence_item_mode,
                 key_context=sequence_key_context,
                 path_kind=path_kind,
                 local_vars=local_vars,
@@ -2077,8 +2041,7 @@ class Resolver:
         *,
         origin: "Resolver | None" = None,
         source_path: tuple[Any, ...] | None = None,
-        sequence_item_mode: str | None = None,
-        sequence_key_context: tuple[Any, Any, str | None] | None = None,
+        sequence_key_context: tuple[Any, Any] | None = None,
         local_vars: Mapping[str, Any] | None = None,
         function_scope: _ContainerProxy | None = None,
         function_origin_source: _Source | None = None,
@@ -2138,7 +2101,6 @@ class Resolver:
             id(raw),
             id(source_origin),
             source_origin_path,
-            sequence_item_mode,
             sequence_key_context,
             id(local_vars) if local_vars is not None else None,
             id(function_scope) if function_scope is not None else None,
@@ -2157,7 +2119,6 @@ class Resolver:
             path=path,
             origin=source_origin,
             source_path=source_origin_path,
-            sequence_item_mode=sequence_item_mode,
             sequence_key_context=sequence_key_context,
             path_kind=path_kind,
             local_vars=local_vars,
@@ -3488,6 +3449,7 @@ class Resolver:
                         layer_result.value,
                         origin=source.resolver,
                         source_path=candidate_source_path,
+                        sequence_key_context=(logical_key, candidate.source_key),
                         local_vars=local_vars,
                     )
                 return layer_result.value
@@ -3497,6 +3459,7 @@ class Resolver:
                 candidate.template,
                 origin=source.resolver,
                 source_path=candidate_source_path,
+                sequence_key_context=(logical_key, candidate.source_key),
                 local_vars=local_vars,
             )
 
@@ -3516,19 +3479,6 @@ class Resolver:
             )
         elif layer_result.escaped_literal:
             return layer_result.value
-        elif isinstance(candidate.template, Sequence) and not isinstance(
-            candidate.template, (str, bytes, bytearray)
-        ):
-            return self._bind_child(
-                bind,
-                logical_key,
-                candidate.template,
-                origin=source.resolver,
-                source_path=candidate_source_path,
-                sequence_item_mode=candidate.mode,
-                sequence_key_context=(logical_key, candidate.source_key, mode_marker),
-                local_vars=local_vars,
-            )
         else:
             value = self._render(
                 bind,
@@ -3549,6 +3499,7 @@ class Resolver:
                 value,
                 origin=source.resolver,
                 source_path=candidate_source_path,
+                sequence_key_context=(logical_key, candidate.source_key),
                 local_vars=local_vars,
             )
         return value
@@ -5092,13 +5043,21 @@ def _self_test() -> None:
         "C": {"<<$": "root.B"},
         "var1": 7,
         "var2": 9,
-        "native_array$": ["var1", "root.var2", "1", "true", 5, "none", "path"],
-        "text_array@": [
-            "{{ var1 }}",
-            "v={{ root.var2 }}",
-            "{{ 1 }}",
-            "{{ true }}",
-            "{{ path }}",
+        "native_array": [
+            "=$var1",
+            "=$root.var2",
+            "=$1",
+            "=$true",
+            5,
+            "none",
+            "=$path",
+        ],
+        "text_array": [
+            "=@{{ var1 }}",
+            "=@v={{ root.var2 }}",
+            "=@{{ 1 }}",
+            "=@{{ true }}",
+            "=@{{ path }}",
         ],
         "ready_array$": "['var1', 'root.var2']",
         "path_list": [

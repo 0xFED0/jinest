@@ -1,0 +1,20 @@
+attached:
+  value: 1
+  origin_where: root
+  nested:
+    origin_where: root
+native_layer:
+  value: 2
+  origin_where: root
+  nested:
+    origin_where: root
+script_layer:
+  value: 3
+  origin_where: root
+  nested:
+    origin_where: root
+multi_layer:
+  value: 4
+  origin_where: root
+  nested:
+    origin_where: root

@@ -1,0 +1,15 @@
+# Regression: structural-function results used as layers must preserve origin.
+make(x)=:
+  value$: x
+  origin_where@: '{{ origin.path }}'
+  nested:
+    origin_where@: '{{ origin.path }}'
+attached: '=$root.make(1)'
+native_layer:
+  <<$: root.make(2)
+script_layer:
+  <<^: |
+    % return root.make(3)
+multi_layer:
+  <<[]:
+    - '=$root.make(4)'

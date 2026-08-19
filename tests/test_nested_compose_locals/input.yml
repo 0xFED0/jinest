@@ -1,0 +1,6 @@
+# Regression: nested structural compose must retain both axis frames.
+values: [1, 2]
+outer[i=values]=:
+  - inner[j=values]=:
+      - outer_value$: i
+        inner_value$: j

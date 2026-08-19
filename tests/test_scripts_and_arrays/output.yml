@@ -1,7 +1,7 @@
 x: 4
 native_values:
 - 8
-- answer: 5
+- 5
 - 7
 text_values:
 - x=4
@@ -9,7 +9,7 @@ text_values:
 script_values:
 - 14
 - found: 2
-- null
+- literal
 ready:
 - x * 100
 - literal

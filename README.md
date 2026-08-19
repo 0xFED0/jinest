@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.16.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.17.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -217,9 +217,10 @@ attempts$: 3
 enabled$: true
 ```
 
-Mappings, `null`, dates, bytes, and other non-string bodies are invalid. A
-direct list has the legacy mode-array semantics described below. Return a
-structure or another scalar from a string expression.
+Mappings, lists, `null`, dates, bytes, and other non-string bodies are invalid
+as evaluator bodies. Return a structure or another scalar from a string
+expression; to evaluate individual list items, use explicit inline or self
+directives as described in [Lazy arrays](#lazy-arrays).
 
 ## Text templates: `@`
 
@@ -229,7 +230,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.16.1
+  version: 0.17.0
   label@: "{{ product }} v{{ version }}"
 ```
 
@@ -259,8 +260,8 @@ Rules:
 - Returned mappings/lists become Jinest subtrees.
 - Numeric and boolean bodies pass through; other non-string bodies are invalid.
 
-A direct list uses legacy mode-array semantics rather than being one script
-body.
+Lists are not script bodies. To run scripts in an array, mark each item with
+an explicit `=^` inline directive (or a `<^` self wrapper).
 
 ## Evaluation layers, raw keys, and inline syntax
 
@@ -360,9 +361,9 @@ functions/compose use `=` and text compose uses `@`. During dynamic-key
 evaluation, `keyname` and `keypath` are `none` because the final key does not
 yet exist.
 
-`keypath` is deliberately a syntactic alias. For an item of `items$`, `path`
-already includes the array index, so the alias is `path["items"]`; it need not
-equal the enclosing declaration path.
+`keypath` is deliberately a syntactic alias. For an explicitly evaluated item
+of an array field such as `items`, `path` already includes the array index, so
+the alias is `path["items"]`; it need not equal the enclosing declaration path.
 
 Function parameters and compose-axis locals have priority over context fields.
 
@@ -664,36 +665,34 @@ equal `N`, the later source declaration wins.
 
 Lists are lazy nodes and indices participate in destination paths.
 
-A list directly under `$`, `@`, or `^` is the legacy mode-typed array form:
-the list is a container and every item is one body of that mode.
+`$`, `@`, and `^` remain scalar evaluator modes; their values must not be
+lists. Arrays are declared with an ordinary key, and each computed item opts
+in explicitly with inline or self syntax:
 
 ```yaml
-native_values$:
-  - "x + 1"
-  - 123
-  - true
+values:
+  - '=$x + 1'
+  - '=@Value: {{ x }}'
+  - '=^% return x * 2'
+  - literal
 
-text_values@:
-  - "Value: {{ x }}"
-  - "42"
-
-script_values^:
-  - "% return x * 2"
-  - 123
-  - false
+self_values:
+  -
+    <$: x + 1
 ```
 
-For `$`/`^`, items must be strings, numbers, or booleans. For `@`, every item
-must be a string. `null`, mappings, and nested lists are invalid mode bodies.
+The former mode-typed lazy-array form (`items$: [...]`, `items@: [...]`, or
+`items^: [...]`) is not supported; it raises a type error instead of silently
+applying a mode to every item.
 
-Inline/self syntax inside a mode-typed array is an inner layer and the array
-mode is outer. An escaped inline string remains literal and bypasses the outer
-mode.
+Unmarked strings remain data. Item directives use the array element's
+destination context, including its full `path`, `keyname`, `effective_key`,
+and `keypath` metadata. An escaped inline string remains literal.
 
 A list returned by an expression/script is a generated Jinest subtree, not a
-second legacy mode-typed body. Ordinary returned strings are not implicitly
-evaluated again, but explicit `=<mode>` strings and Jinest mapping keys inside
-that returned container are parsed normally. Escape them when they are literal.
+second evaluator body. Ordinary returned strings are not implicitly evaluated
+again, but explicit `=<mode>` strings and Jinest mapping keys inside that
+returned container are parsed normally. Escape them when they are literal.
 
 Example path:
 
