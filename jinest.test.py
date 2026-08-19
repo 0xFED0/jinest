@@ -1704,6 +1704,53 @@ class JinestLayerTests(unittest.TestCase):
                 self.assertEqual(result[name]["origin_where"], "root")
                 self.assertEqual(result[name]["nested"]["origin_where"], "root")
 
+    def test_structural_function_layer_preserves_origin_for_dynamic_keys_and_compose(
+        self,
+    ) -> None:
+        """All structural-function output paths must keep the lexical origin.
+
+        Ordinary fields are covered above. Dynamic-key indexing and compose
+        expansion use separate traversal paths, so keep this regression
+        explicit: attaching the same function directly or as a merge layer
+        must not change ``origin.path`` or the resulting key.
+        """
+        result = jinest.resolve(
+            {
+                "make()=": {
+                    "=@{{ origin.path }}": 1,
+                    "items[i=[1]]=": [
+                        {"origin_where@": "{{ origin.path }}"}
+                    ],
+                },
+                "attached": "=$root.make()",
+                "layered": {"<<$": "root.make()"},
+            },
+            emit_messages=False,
+        )
+        expected = {
+            "root": 1,
+            "items": [{"origin_where": "root"}],
+        }
+        self.assertEqual(result["attached"], expected)
+        self.assertEqual(result["layered"], expected)
+
+    def test_nested_structural_function_layer_preserves_argument_origin(self) -> None:
+        """Nested layers must preserve the origin of a function argument node."""
+        result = jinest.resolve(
+            {
+                "source": {"=@{{ origin.path }}": 1},
+                "make(x)=": {
+                    "nested": {"<<$": "x"},
+                },
+                "direct": "=$root.make(root.source)",
+                "layered": {"<<$": "root.make(root.source)"},
+            },
+            emit_messages=False,
+        )
+        expected = {"nested": {"root.source": 1}}
+        self.assertEqual(result["direct"], expected)
+        self.assertEqual(result["layered"], expected)
+
     def test_layer_order_defaults_local_overrides(self) -> None:
         data = {
             "defaults1": {"rank": "d1", "d1": True},

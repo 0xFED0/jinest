@@ -1,0 +1,8 @@
+source:
+  "=@{{ origin.path }}": 1
+make(x)=:
+  nested:
+    <<$: x
+direct: "=$root.make(root.source)"
+layered:
+  <<$: root.make(root.source)

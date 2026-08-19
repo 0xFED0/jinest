@@ -64,7 +64,7 @@ app:
 - [Compose declarations](#compose-declarations)
 - [Self-declaration wrappers](#self-declaration-wrappers)
 - [Lazy layers](#lazy-layers)
-- [Lazy arrays](#lazy-arrays)
+- [Lazy evaluations in arrays](#lazy-evaluations-in-arrays)
 - [Cycles](#cycles)
 - [Node metadata](#node-metadata)
 - [PathRef](#pathref)
@@ -220,7 +220,7 @@ enabled$: true
 Mappings, lists, `null`, dates, bytes, and other non-string bodies are invalid
 as evaluator bodies. Return a structure or another scalar from a string
 expression; to evaluate individual list items, use explicit inline or self
-directives as described in [Lazy arrays](#lazy-arrays).
+directives as described in [Lazy evaluations in arrays](#lazy-evaluations-in-arrays).
 
 ## Text templates: `@`
 
@@ -661,7 +661,7 @@ Numbered keys use `N` as order; omitted `N` is `0`. Default and override
 families are sorted independently. Larger `N` has higher lookup priority; at
 equal `N`, the later source declaration wins.
 
-## Lazy arrays
+## Lazy evaluations in arrays
 
 Lists are lazy nodes and indices participate in destination paths.
 

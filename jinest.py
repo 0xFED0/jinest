@@ -252,6 +252,7 @@ class _EvaluationFrame:
     function_scope: "_ContainerProxy | None" = None
     function_origin_source: _Source | None = None
     function_body_source_path: tuple[Any, ...] | None = None
+    context_origin_source: _Source | None = None
 
 
 @dataclass(slots=True)
@@ -294,6 +295,7 @@ class _LayerValue:
 
     source: _Source
     local_vars: Mapping[str, Any] | None = None
+    context_origin_source: _Source | None = None
 
 
 @dataclass(slots=True)
@@ -754,7 +756,11 @@ def _parse_self_declaration(value: Any) -> _SelfSpec | None:
     """Parse a one-key ``<...`` wrapper without materializing its marker."""
     if not isinstance(value, Mapping) or len(value) != 1:
         return None
-    key, body = next(iter(value.items()))
+    # Do not call ``value.items()`` here: a Jinest mapping may legitimately
+    # contain a field named ``items``, which shadows the Mapping method via
+    # its lazy attribute lookup.  The protocol operations are unambiguous.
+    key = next(iter(value))
+    body = value[key]
     if not isinstance(key, str) or not key.startswith("<"):
         return None
     if key in {"<$", "<@", "<^"}:
@@ -1076,6 +1082,7 @@ class _ContainerProxy:
         function_scope: "_ContainerProxy | None" = None,
         function_origin_source: _Source | None = None,
         function_body_source_path: tuple[Any, ...] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> None:
         object.__setattr__(self, "_jinest_owner", owner)
         object.__setattr__(self, "_jinest_source", source)
@@ -1088,6 +1095,7 @@ class _ContainerProxy:
             function_scope,
             function_origin_source,
             function_body_source_path,
+            context_origin_source,
         )
         binding = owner._new_binding(frame)
         object.__setattr__(self, "_jinest_binding", binding)
@@ -1163,6 +1171,7 @@ class _MappingProxy(_ContainerProxy, Mapping):
         function_scope: "_ContainerProxy | None" = None,
         function_origin_source: _Source | None = None,
         function_body_source_path: tuple[Any, ...] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> None:
         super().__init__(
             owner,
@@ -1174,6 +1183,7 @@ class _MappingProxy(_ContainerProxy, Mapping):
             function_scope,
             function_origin_source,
             function_body_source_path,
+            context_origin_source,
         )
         cache = object.__getattribute__(self, "_jinest_binding").cache
         object.__setattr__(self, "_jinest_resolved", cache.resolved)
@@ -1237,6 +1247,7 @@ class _SequenceProxy(_ContainerProxy, Sequence):
         function_scope: "_ContainerProxy | None" = None,
         function_origin_source: _Source | None = None,
         function_body_source_path: tuple[Any, ...] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> None:
         super().__init__(
             owner,
@@ -1248,6 +1259,7 @@ class _SequenceProxy(_ContainerProxy, Sequence):
             function_scope,
             function_origin_source,
             function_body_source_path,
+            context_origin_source,
         )
         object.__setattr__(self, "_jinest_key_context", key_context)
         cache = object.__getattribute__(self, "_jinest_binding").cache
@@ -1981,6 +1993,7 @@ class Resolver:
         function_scope: _ContainerProxy | None = None,
         function_origin_source: _Source | None = None,
         function_body_source_path: tuple[Any, ...] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> Any:
         if isinstance(value, _ContainerProxy):
             source = object.__getattribute__(value, "_jinest_source")
@@ -1992,6 +2005,8 @@ class Resolver:
                 function_origin_source = object.__getattribute__(value, "_jinest_binding").frame.function_origin_source
             if function_body_source_path is None:
                 function_body_source_path = object.__getattribute__(value, "_jinest_binding").frame.function_body_source_path
+            if context_origin_source is None:
+                context_origin_source = object.__getattribute__(value, "_jinest_binding").frame.context_origin_source
         elif isinstance(value, Mapping):
             source = _Source(origin or self, value, tuple(source_path or ()))
         elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
@@ -2010,6 +2025,7 @@ class Resolver:
                 function_scope,
                 function_origin_source,
                 function_body_source_path,
+                context_origin_source,
             )
         if isinstance(source.raw, Sequence) and not isinstance(
             source.raw, (str, bytes, bytearray)
@@ -2030,6 +2046,7 @@ class Resolver:
                 function_scope=function_scope,
                 function_origin_source=function_origin_source,
                 function_body_source_path=function_body_source_path,
+                context_origin_source=context_origin_source,
             )
         return copy.deepcopy(source.raw)
 
@@ -2046,6 +2063,7 @@ class Resolver:
         function_scope: _ContainerProxy | None = None,
         function_origin_source: _Source | None = None,
         function_body_source_path: tuple[Any, ...] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> Any:
         if not self._is_container(value):
             return self._copy_scalar(value)
@@ -2058,13 +2076,30 @@ class Resolver:
             function_origin_source = object.__getattribute__(parent, "_jinest_binding").frame.function_origin_source
         if function_body_source_path is None:
             function_body_source_path = object.__getattribute__(parent, "_jinest_binding").frame.function_body_source_path
+        if context_origin_source is None:
+            context_origin_source = object.__getattribute__(parent, "_jinest_binding").frame.context_origin_source
 
         if isinstance(value, _ContainerProxy):
             source = object.__getattribute__(value, "_jinest_source")
             raw = source.raw
             source_origin = source.resolver
-            value_local_vars = object.__getattribute__(value, "_jinest_binding").frame.local_vars
-            value_body_source_path = object.__getattribute__(value, "_jinest_binding").frame.function_body_source_path
+            value_frame = object.__getattribute__(value, "_jinest_binding").frame
+            value_local_vars = value_frame.local_vars
+            value_body_source_path = value_frame.function_body_source_path
+            value_context_origin_source = value_frame.context_origin_source
+            if value_context_origin_source is None:
+                function_origin = value_frame.function_origin_source
+                in_function_body = (
+                    function_origin is not None
+                    and value_body_source_path is not None
+                    and source.resolver is function_origin.resolver
+                    and source.source_path[: len(value_body_source_path)]
+                    == value_body_source_path
+                )
+                value_context_origin_source = (
+                    function_origin if in_function_body else source
+                )
+            context_origin_source = value_context_origin_source
             if value_body_source_path is not None:
                 # A structural function result carries its parameter frame,
                 # but its temporary call-site scope must never leak into the
@@ -2080,14 +2115,25 @@ class Resolver:
                 function_scope = None
                 function_body_source_path = value_body_source_path
             else:
-                if local_vars is None:
-                    local_vars = value_local_vars
+                # Rebinding a node produced inside a compose/function frame
+                # must retain that node's locals.  Merge them over the
+                # destination frame so axis/parameter names remain visible
+                # and continue to shadow inherited names normally.
+                if value_local_vars is not None:
+                    if local_vars is None:
+                        local_vars = value_local_vars
+                    elif local_vars is not value_local_vars:
+                        merged_locals = dict(local_vars)
+                        merged_locals.update(value_local_vars)
+                        local_vars = merged_locals
                 if function_scope is None:
                     function_scope = object.__getattribute__(value, "_jinest_binding").frame.function_scope
             if function_origin_source is None:
                 function_origin_source = object.__getattribute__(value, "_jinest_binding").frame.function_origin_source
             if function_body_source_path is None:
                 function_body_source_path = object.__getattribute__(value, "_jinest_binding").frame.function_body_source_path
+            if context_origin_source is None:
+                context_origin_source = value_context_origin_source
         else:
             raw = value
             source_origin = origin or self
@@ -2106,6 +2152,7 @@ class Resolver:
             id(function_scope) if function_scope is not None else None,
             id(function_origin_source) if function_origin_source is not None else None,
             function_body_source_path,
+            id(context_origin_source) if context_origin_source is not None else None,
         )
         cached = children.get(key)
         if cached is not None and cached[0] == cache_token:
@@ -2125,6 +2172,7 @@ class Resolver:
             function_scope=function_scope,
             function_origin_source=function_origin_source,
             function_body_source_path=function_body_source_path,
+            context_origin_source=context_origin_source,
         )
         if function_body_source_path is not None and isinstance(proxy, _ContainerProxy):
             # Nested body fields resolve through the fresh destination
@@ -2208,10 +2256,17 @@ class Resolver:
         bind: _MappingProxy,
         *,
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> tuple[_MappingKeyEntry, ...]:
         """Build a destination-bound index of static, raw, and dynamic keys."""
         indexes = object.__getattribute__(bind, "_jinest_key_indexes")
-        cache_key = (source.instance_id, id(local_vars) if local_vars is not None else None)
+        cache_key = (
+            source.instance_id,
+            id(local_vars) if local_vars is not None else None,
+            id(context_origin_source)
+            if context_origin_source is not None
+            else None,
+        )
         cached = indexes.get(cache_key, _MISSING)
         if cached is not _MISSING:
             # While dynamic keys are being evaluated, static keys are already
@@ -2294,6 +2349,7 @@ class Resolver:
                     effective_key=source_key,
                     keymode=marker,
                     local_vars=local_vars,
+                    context_origin_source=context_origin_source,
                 )
                 if not isinstance(key, str):
                     raise JinestError(
@@ -2446,6 +2502,7 @@ class Resolver:
         effective_key: Any | None,
         keymode: str | None,
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> Any:
         """Apply an outer mode to a result produced by an inner layer."""
         if not _valid_evaluator_body(value, mode):
@@ -2471,6 +2528,7 @@ class Resolver:
             effective_key=effective_key,
             keymode=keymode,
             local_vars=local_vars,
+            context_origin_source=context_origin_source,
         )
 
     def _array_transform_list(
@@ -2569,6 +2627,7 @@ class Resolver:
         keyname: Any | None = None,
         effective_key: Any | None = None,
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> LayerResult:
         """Resolve an inner inline/self layer.
 
@@ -2591,6 +2650,7 @@ class Resolver:
                     keyname=keyname,
                     effective_key=effective_key,
                     local_vars=local_vars,
+                    context_origin_source=context_origin_source,
                 )
                 mode_marker = {"native": "$", "text": "@", "script": "^"}[self_spec.mode]
                 result = self._apply_render_layer(
@@ -2604,6 +2664,7 @@ class Resolver:
                     effective_key=effective_key,
                     keymode=mode_marker,
                     local_vars=local_vars,
+                    context_origin_source=context_origin_source,
                 )
                 return LayerResult(result, applied=True)
             if self_spec.mode == "structural":
@@ -2649,6 +2710,7 @@ class Resolver:
                     keyname,
                     destination_parent=scope,
                     destination_key=destination_key,
+                    context_origin_source=context_origin_source,
                 ), applied=True)
             raise JinestError(f"Unsupported self declaration mode {self_spec.mode!r}")
 
@@ -2667,6 +2729,7 @@ class Resolver:
             effective_key=effective_key,
             keymode=_FUNCTION_MODE_MARKERS[mode],
             local_vars=local_vars,
+            context_origin_source=context_origin_source,
         )
         return LayerResult(result, applied=True)
 
@@ -2773,6 +2836,7 @@ class Resolver:
         bind: _MappingProxy,
         *,
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> tuple[tuple[_LayerSpec, ...], tuple[_LayerSpec, ...]]:
         """Return the destination-bound, flat merge topology for ``source``.
 
@@ -2782,7 +2846,13 @@ class Resolver:
         """
         schema = self._schema_for_source(source)
         cache = object.__getattribute__(bind, "_jinest_binding").cache.normalized_layers
-        cache_key = (source.instance_id, id(local_vars) if local_vars is not None else None)
+        cache_key = (
+            source.instance_id,
+            id(local_vars) if local_vars is not None else None,
+            id(context_origin_source)
+            if context_origin_source is not None
+            else None,
+        )
         stack = cache.get(cache_key)
         if stack is not None:
             return (
@@ -2799,10 +2869,20 @@ class Resolver:
         cache[cache_key] = stack
         try:
             self._normalize_layer_specs(
-                bind, source, schema.defaults, stack.defaults, local_vars=local_vars
+                bind,
+                source,
+                schema.defaults,
+                stack.defaults,
+                local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
             self._normalize_layer_specs(
-                bind, source, schema.overrides, stack.overrides, local_vars=local_vars
+                bind,
+                source,
+                schema.overrides,
+                stack.overrides,
+                local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
         except Exception:
             cache.pop(cache_key, None)
@@ -2817,6 +2897,7 @@ class Resolver:
         destination: list[_LayerSpec],
         *,
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> None:
         """Append flat lazy item specs without evaluating their mappings."""
         for spec in specs:
@@ -2833,6 +2914,7 @@ class Resolver:
                 source_key=spec.source_key,
                 context_path=declaration_path,
                 local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
             value = layer_result.value
             sequence: _SequenceProxy
@@ -3005,6 +3087,7 @@ class Resolver:
         *,
         hidden: bool,
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> _Candidate | None:
         """Return one local declaration from the hidden or public namespace."""
         source_key = f".{key}" if hidden and isinstance(key, str) else key
@@ -3016,7 +3099,12 @@ class Resolver:
                         compose.template,
                         f"compose_{compose.mode}",
                     )
-        entries = self._mapping_entries(source, bind, local_vars=local_vars)
+        entries = self._mapping_entries(
+            source,
+            bind,
+            local_vars=local_vars,
+            context_origin_source=context_origin_source,
+        )
         for concrete in entries:
             if concrete.key != source_key:
                 continue
@@ -3071,7 +3159,17 @@ class Resolver:
         if key in resolved:
             return True
         source = object.__getattribute__(scope, "_jinest_source")
-        return self._contains(source, key, bind=scope, active=set(), hidden=None)
+        context_origin_source = object.__getattribute__(
+            scope, "_jinest_binding"
+        ).frame.context_origin_source
+        return self._contains(
+            source,
+            key,
+            bind=scope,
+            active=set(),
+            hidden=None,
+            context_origin_source=context_origin_source,
+        )
 
     def _contains(
         self,
@@ -3082,14 +3180,31 @@ class Resolver:
         active: set[tuple[Any, ...]],
         hidden: bool | None,
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> bool:
+        if context_origin_source is None:
+            context_origin_source = object.__getattribute__(
+                bind, "_jinest_binding"
+            ).frame.context_origin_source
         if hidden is None:
             if self._hidden_name(key) and self._contains(
-                source, key, bind=bind, active=active, hidden=True, local_vars=local_vars
+                source,
+                key,
+                bind=bind,
+                active=active,
+                hidden=True,
+                local_vars=local_vars,
+                context_origin_source=context_origin_source,
             ):
                 return True
             return self._contains(
-                source, key, bind=bind, active=active, hidden=False, local_vars=local_vars
+                source,
+                key,
+                bind=bind,
+                active=active,
+                hidden=False,
+                local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
 
         token = (
@@ -3098,17 +3213,27 @@ class Resolver:
             self._hashable_key(key),
             hidden,
             id(local_vars) if local_vars is not None else None,
+            id(context_origin_source) if context_origin_source is not None else None,
         )
         if token in active:
             return False
         active.add(token)
         try:
             defaults, overrides = self._layer_stack(
-                source, bind, local_vars=local_vars
+                source,
+                bind,
+                local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
 
             for layer in reversed(overrides):
-                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
+                layer_value = self._evaluate_layer(
+                    bind,
+                    source,
+                    layer,
+                    local_vars=local_vars,
+                    context_origin_source=context_origin_source,
+                )
                 if self._contains(
                     layer_value.source,
                     key,
@@ -3116,18 +3241,32 @@ class Resolver:
                     active=active,
                     hidden=hidden,
                     local_vars=layer_value.local_vars,
+                    context_origin_source=(
+                        layer_value.context_origin_source or context_origin_source
+                    ),
                 ):
                     return True
 
             if not hidden and self._local_function(source, key) is not None:
                 return True
             if self._local_candidate(
-                source, bind, key, hidden=hidden, local_vars=local_vars
+                source,
+                bind,
+                key,
+                hidden=hidden,
+                local_vars=local_vars,
+                context_origin_source=context_origin_source,
             ) is not None:
                 return True
 
             for layer in reversed(defaults):
-                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
+                layer_value = self._evaluate_layer(
+                    bind,
+                    source,
+                    layer,
+                    local_vars=local_vars,
+                    context_origin_source=context_origin_source,
+                )
                 if self._contains(
                     layer_value.source,
                     key,
@@ -3135,6 +3274,9 @@ class Resolver:
                     active=active,
                     hidden=hidden,
                     local_vars=layer_value.local_vars,
+                    context_origin_source=(
+                        layer_value.context_origin_source or context_origin_source
+                    ),
                 ):
                     return True
             return False
@@ -3186,17 +3328,34 @@ class Resolver:
         active: set[tuple[Any, ...]],
         hidden: bool | None,
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> Any:
         """Look up a key, preferring the hidden namespace when requested."""
+        if context_origin_source is None:
+            context_origin_source = object.__getattribute__(
+                bind, "_jinest_binding"
+            ).frame.context_origin_source
         if hidden is None:
             if self._hidden_name(key):
                 value = self._lookup(
-                    source, key, bind=bind, active=active, hidden=True, local_vars=local_vars
+                    source,
+                    key,
+                    bind=bind,
+                    active=active,
+                    hidden=True,
+                    local_vars=local_vars,
+                    context_origin_source=context_origin_source,
                 )
                 if value is not _MISSING:
                     return value
             return self._lookup(
-                source, key, bind=bind, active=active, hidden=False, local_vars=local_vars
+                source,
+                key,
+                bind=bind,
+                active=active,
+                hidden=False,
+                local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
 
         token = (
@@ -3205,18 +3364,28 @@ class Resolver:
             self._hashable_key(key),
             hidden,
             id(local_vars) if local_vars is not None else None,
+            id(context_origin_source) if context_origin_source is not None else None,
         )
         if token in active:
             return _MISSING
         active.add(token)
         try:
             defaults, overrides = self._layer_stack(
-                source, bind, local_vars=local_vars
+                source,
+                bind,
+                local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
 
             # Reverse lookup of: defaults -> local -> overrides.
             for layer in reversed(overrides):
-                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
+                layer_value = self._evaluate_layer(
+                    bind,
+                    source,
+                    layer,
+                    local_vars=local_vars,
+                    context_origin_source=context_origin_source,
+                )
                 value = self._lookup(
                     layer_value.source,
                     key,
@@ -3224,6 +3393,9 @@ class Resolver:
                     active=active,
                     hidden=hidden,
                     local_vars=layer_value.local_vars,
+                    context_origin_source=(
+                        layer_value.context_origin_source or context_origin_source
+                    ),
                 )
                 if value is not _MISSING:
                     return value
@@ -3234,15 +3406,27 @@ class Resolver:
                     return self._function_value(source, function)
 
             candidate = self._local_candidate(
-                source, bind, key, hidden=hidden, local_vars=local_vars
+                source, bind, key, hidden=hidden, local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
             if candidate is not None:
                 return self._resolve_candidate(
-                    candidate, source, bind, key, local_vars=local_vars
+                    candidate,
+                    source,
+                    bind,
+                    key,
+                    local_vars=local_vars,
+                    context_origin_source=context_origin_source,
                 )
 
             for layer in reversed(defaults):
-                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
+                layer_value = self._evaluate_layer(
+                    bind,
+                    source,
+                    layer,
+                    local_vars=local_vars,
+                    context_origin_source=context_origin_source,
+                )
                 value = self._lookup(
                     layer_value.source,
                     key,
@@ -3250,6 +3434,9 @@ class Resolver:
                     active=active,
                     hidden=hidden,
                     local_vars=layer_value.local_vars,
+                    context_origin_source=(
+                        layer_value.context_origin_source or context_origin_source
+                    ),
                 )
                 if value is not _MISSING:
                     return value
@@ -3267,6 +3454,7 @@ class Resolver:
         *,
         destination_parent: _ContainerProxy | None = None,
         destination_key: Any = _MISSING,
+        context_origin_source: _Source | None = None,
     ) -> Any:
         """Expand one compose declaration through ordinary lazy bindings."""
         declaration_path = source.source_path + (spec.source_key,)
@@ -3282,6 +3470,7 @@ class Resolver:
                 effective_key=spec.source_key,
                 keymode="=" if spec.mode == "structural" else "@",
                 prepare_native=False,
+                context_origin_source=context_origin_source,
             )
             try:
                 axis_values.append(list(value))
@@ -3329,6 +3518,7 @@ class Resolver:
                         effective_key=spec.source_key,
                         keymode="@",
                         local_vars=frame,
+                        context_origin_source=context_origin_source,
                     )
                 )
             return "".join(parts)
@@ -3363,6 +3553,7 @@ class Resolver:
                 local_vars=frame,
                 function_scope=bind,
                 function_origin_source=source,
+                context_origin_source=context_origin_source,
             )
             if structural_kind == "list":
                 if not isinstance(body, _SequenceProxy):
@@ -3376,7 +3567,9 @@ class Resolver:
                 raise JinestError(
                     f"Structural compose {spec.source_key!r} produced a non-mapping body"
                 )
-            for key in self._public_keys(body):
+            for key in self._public_keys(
+                body, context_origin_source=context_origin_source
+            ):
                 if key in seen:
                     raise JinestError(
                         f"Duplicate dynamic mapping key {key!r} from compose "
@@ -3391,6 +3584,7 @@ class Resolver:
             combined,
             origin=source.resolver,
             source_path=declaration_path,
+            context_origin_source=context_origin_source,
         )
 
     def _resolve_candidate(
@@ -3401,12 +3595,19 @@ class Resolver:
         logical_key: Any,
         *,
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> Any:
         if candidate.mode.startswith("compose_"):
             spec = _parse_compose_declaration(candidate.source_key, candidate.template)
             if spec is None:
                 raise JinestError(f"Malformed compose declaration {candidate.source_key!r}")
-            return self._resolve_compose(spec, source, bind, logical_key)
+            return self._resolve_compose(
+                spec,
+                source,
+                bind,
+                logical_key,
+                context_origin_source=context_origin_source,
+            )
 
         candidate_source_path = source.source_path + (candidate.source_key,)
         layer_result = self._resolve_layer_input(
@@ -3418,6 +3619,7 @@ class Resolver:
             keyname=logical_key,
             effective_key=candidate.source_key,
             local_vars=local_vars,
+            context_origin_source=context_origin_source,
         )
 
         if candidate.mode in _ARRAY_TRANSFORM_MODES.values():
@@ -3437,6 +3639,7 @@ class Resolver:
                     origin=source.resolver,
                     source_path=candidate_source_path,
                     local_vars=local_vars,
+                    context_origin_source=context_origin_source,
                 )
             return value
 
@@ -3451,6 +3654,7 @@ class Resolver:
                         source_path=candidate_source_path,
                         sequence_key_context=(logical_key, candidate.source_key),
                         local_vars=local_vars,
+                        context_origin_source=context_origin_source,
                     )
                 return layer_result.value
             return self._bind_child(
@@ -3461,6 +3665,7 @@ class Resolver:
                 source_path=candidate_source_path,
                 sequence_key_context=(logical_key, candidate.source_key),
                 local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
 
         mode_marker = {"native": "$", "text": "@", "script": "^"}[candidate.mode]
@@ -3476,6 +3681,7 @@ class Resolver:
                 effective_key=candidate.source_key,
                 keymode=mode_marker,
                 local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
         elif layer_result.escaped_literal:
             return layer_result.value
@@ -3490,6 +3696,7 @@ class Resolver:
                 effective_key=candidate.source_key,
                 keymode=mode_marker,
                 local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
 
         if candidate.mode in {"native", "script"} or self._is_container(value):
@@ -3501,6 +3708,7 @@ class Resolver:
                 source_path=candidate_source_path,
                 sequence_key_context=(logical_key, candidate.source_key),
                 local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
         return value
 
@@ -3511,11 +3719,19 @@ class Resolver:
         layer: _LayerSpec,
         *,
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> _LayerValue:
+        if context_origin_source is None:
+            context_origin_source = object.__getattribute__(
+                bind, "_jinest_binding"
+            ).frame.context_origin_source
         cache = object.__getattribute__(bind, "_jinest_layer_cache")
         cache_key = (
             _DeclarationId(owner_source.document_id, layer.source_key),
             id(local_vars) if local_vars is not None else None,
+            id(context_origin_source)
+            if context_origin_source is not None
+            else None,
         )
         if cache_key in cache:
             cached = cache[cache_key]
@@ -3543,6 +3759,7 @@ class Resolver:
                     origin_source=owner_source,
                     source_key=layer.source_key,
                     local_vars=local_vars,
+                    context_origin_source=context_origin_source,
                 )
             )
 
@@ -3555,9 +3772,26 @@ class Resolver:
                     )
                 )
             elif isinstance(value, _MappingProxy):
+                frame = object.__getattribute__(value, "_jinest_binding").frame
+                value_source = object.__getattribute__(value, "_jinest_source")
+                value_context_origin = frame.context_origin_source
+                if value_context_origin is None:
+                    function_body_path = frame.function_body_source_path
+                    function_origin = frame.function_origin_source
+                    in_function_body = (
+                        function_origin is not None
+                        and function_body_path is not None
+                        and value_source.resolver is function_origin.resolver
+                        and value_source.source_path[: len(function_body_path)]
+                        == function_body_path
+                    )
+                    value_context_origin = (
+                        function_origin if in_function_body else value_source
+                    )
                 result = _LayerValue(
-                    object.__getattribute__(value, "_jinest_source"),
-                    object.__getattribute__(value, "_jinest_binding").frame.local_vars,
+                    value_source,
+                    frame.local_vars,
+                    value_context_origin,
                 )
             elif isinstance(value, Mapping):
                 result = _LayerValue(
@@ -4201,6 +4435,7 @@ class Resolver:
         keymode: str | None = None,
         local_vars: Mapping[str, Any] | None = None,
         prepare_native: bool = True,
+        context_origin_source: _Source | None = None,
     ) -> Any:
         if mode not in {"text", "native", "script"}:
             raise ValueError(f"Unsupported render mode: {mode!r}")
@@ -4225,9 +4460,10 @@ class Resolver:
             and origin_source.source_path[: len(function_body_source_path)]
             == function_body_source_path
         )
-        context_origin_source = (
-            function_origin_source if in_function_body else origin_source
-        )
+        if context_origin_source is None:
+            context_origin_source = (
+                function_origin_source if in_function_body else origin_source
+            )
         if source_path is None:
             source_path = (
                 origin_source.source_path
@@ -4500,12 +4736,27 @@ class Resolver:
     # Key enumeration and materialization
     # ------------------------------------------------------------------
 
-    def _public_keys(self, scope: _MappingProxy) -> list[Any]:
+    def _public_keys(
+        self,
+        scope: _MappingProxy,
+        *,
+        context_origin_source: _Source | None = None,
+    ) -> list[Any]:
         source = object.__getattribute__(scope, "_jinest_source")
+        if context_origin_source is None:
+            context_origin_source = object.__getattribute__(
+                scope, "_jinest_binding"
+            ).frame.context_origin_source
         result: list[Any] = []
         seen: set[Any] = set()
         self._collect_keys(
-            source, bind=scope, result=result, seen=seen, active=set(), local_vars=None
+            source,
+            bind=scope,
+            result=result,
+            seen=seen,
+            active=set(),
+            local_vars=None,
+            context_origin_source=context_origin_source,
         )
         return result
 
@@ -4516,24 +4767,35 @@ class Resolver:
         bind: _MappingProxy,
         result: list[Any],
         seen: set[Any],
-        active: set[tuple[int, int, int | None]],
+        active: set[tuple[int, int, int | None, int | None]],
         local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
     ) -> None:
         token = (
             id(source.resolver),
             id(source.raw),
             id(local_vars) if local_vars is not None else None,
+            id(context_origin_source) if context_origin_source is not None else None,
         )
         if token in active:
             return
         active.add(token)
         try:
             defaults, overrides = self._layer_stack(
-                source, bind, local_vars=local_vars
+                source,
+                bind,
+                local_vars=local_vars,
+                context_origin_source=context_origin_source,
             )
 
             for layer in defaults:
-                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
+                layer_value = self._evaluate_layer(
+                    bind,
+                    source,
+                    layer,
+                    local_vars=local_vars,
+                    context_origin_source=context_origin_source,
+                )
                 self._collect_keys(
                     layer_value.source,
                     bind=bind,
@@ -4541,9 +4803,17 @@ class Resolver:
                     seen=seen,
                     active=active,
                     local_vars=layer_value.local_vars,
+                    context_origin_source=(
+                        layer_value.context_origin_source or context_origin_source
+                    ),
                 )
 
-            for entry in self._mapping_entries(source, bind, local_vars=local_vars):
+            for entry in self._mapping_entries(
+                source,
+                bind,
+                local_vars=local_vars,
+                context_origin_source=context_origin_source,
+            ):
                 source_key = entry.key
                 if entry.compose:
                     logical = entry.key
@@ -4587,7 +4857,13 @@ class Resolver:
                     result.append(logical)
 
             for layer in overrides:
-                layer_value = self._evaluate_layer(bind, source, layer, local_vars=local_vars)
+                layer_value = self._evaluate_layer(
+                    bind,
+                    source,
+                    layer,
+                    local_vars=local_vars,
+                    context_origin_source=context_origin_source,
+                )
                 self._collect_keys(
                     layer_value.source,
                     bind=bind,
@@ -4595,6 +4871,9 @@ class Resolver:
                     seen=seen,
                     active=active,
                     local_vars=layer_value.local_vars,
+                    context_origin_source=(
+                        layer_value.context_origin_source or context_origin_source
+                    ),
                 )
         finally:
             active.remove(token)

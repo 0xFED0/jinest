@@ -1,12 +1,14 @@
-values: [1, 2]
+values:
+- 1
+- 2
 outer:
-  - inner:
-      - outer_value: 1
-        inner_value: 1
-      - outer_value: 1
-        inner_value: 2
-  - inner:
-      - outer_value: 2
-        inner_value: 1
-      - outer_value: 2
-        inner_value: 2
+- inner:
+  - outer_value: 1
+    inner_value: 1
+  - outer_value: 1
+    inner_value: 2
+- inner:
+  - outer_value: 2
+    inner_value: 1
+  - outer_value: 2
+    inner_value: 2

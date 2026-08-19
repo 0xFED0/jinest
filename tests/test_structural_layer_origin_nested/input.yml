@@ -1,0 +1,7 @@
+make()=:
+  "=@{{ origin.path }}": 1
+  "items[i=[1]]=":
+    - origin_where@: "{{ origin.path }}"
+attached: "=$root.make()"
+layered:
+  <<$: root.make()

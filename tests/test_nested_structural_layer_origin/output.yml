@@ -1,0 +1,8 @@
+source:
+  root.source: 1
+direct:
+  nested:
+    root.source: 1
+layered:
+  nested:
+    root.source: 1
