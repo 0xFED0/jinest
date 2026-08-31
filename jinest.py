@@ -93,7 +93,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.17.0"
+__version__ = "0.17.1"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -1026,13 +1026,16 @@ class _JinestContext(Context):
             parent.get(_INTERNAL_FUNCTION_LOCALS),
         )
 
-        # Function arguments and script locals are explicit context variables.
-        # They must shadow attachments and fields, while ordinary Jinest lookup
-        # retains its historical field-before-global priority.
-        if function_locals is not None:
-            value = super().resolve_or_missing(key)
-            if value is not missing:
-                return value
+        # Function arguments and Jinja lexical locals are explicit variables.
+        # They shadow attachments and fields, but unrelated globals must not
+        # jump ahead of Jinest lookup merely because a local frame exists.
+        # ``Context.resolve_or_missing()`` cannot express that distinction: it
+        # searches both ``vars`` and ``parent`` (which also contains globals).
+        value = self.vars.get(key, missing)
+        if value is not missing:
+            return value
+        if function_locals is not None and key in function_locals:
+            return function_locals[key]
 
         if key not in _RESERVED_NAMES and isinstance(scope, _ContainerProxy):
             value = scope._jinest_resolve_name(key)

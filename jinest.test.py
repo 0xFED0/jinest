@@ -85,7 +85,7 @@ class JinestTestSuiteContractTests(unittest.TestCase):
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.17.0")
+        self.assertEqual(jinest.__version__, "0.17.1")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -392,6 +392,33 @@ class JinestCoreTests(unittest.TestCase):
             filters={"triple": lambda x: x * 3},
         )
         self.assertEqual(result, {"native": 10, "text": "12"})
+
+    def test_unrelated_globals_do_not_shadow_fields_in_local_frames(self) -> None:
+        result = jinest.resolve(
+            {
+                "scalar(x)$": "value + x",
+                "structural(x)=": {"seen$": "value", "argument$": "x"},
+                "items": [1],
+                "value": 1,
+                "scalar_result$": "scalar(2)",
+                "structural_result$": "structural(2)",
+                "composed[i=items]=": [
+                    {"seen$": "value", "axis_value$": "i"},
+                ],
+            },
+            globals={"value": 99},
+            emit_messages=False,
+        )
+
+        self.assertEqual(result["scalar_result"], 3)
+        self.assertEqual(
+            result["structural_result"],
+            {"seen": 1, "argument": 2},
+        )
+        self.assertEqual(
+            result["composed"],
+            [{"seen": 1, "axis_value": 1}],
+        )
 
     def test_in_place_mapping(self) -> None:
         data = {"x": 2, "y$": "x + 1"}

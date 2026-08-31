@@ -1,0 +1,16 @@
+# Explicit function/compose locals shadow fields, but unrelated Jinja globals
+# do not. ``range`` is deliberately also the name of a standard Jinja global.
+scalar(x)$: range
+structural(x)=:
+  seen$: range
+  argument$: x
+
+items: [1]
+range: field-value
+scalar_result$: scalar(2)
+structural_result$: structural(2)
+composed[i=items]=:
+  - seen$: range
+    axis_value$: i
+
+# Function and compose declarations themselves are omitted from output.

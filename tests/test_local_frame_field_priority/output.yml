@@ -1,0 +1,10 @@
+items:
+- 1
+range: field-value
+scalar_result: field-value
+structural_result:
+  seen: field-value
+  argument: 2
+composed:
+- seen: field-value
+  axis_value: 1

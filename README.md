@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.17.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.17.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -230,7 +230,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.17.0
+  version: 0.17.1
   label@: "{{ product }} v{{ version }}"
 ```
 
