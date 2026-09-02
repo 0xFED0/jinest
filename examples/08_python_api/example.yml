@@ -29,3 +29,7 @@ selected$: missing.suppressed.expression
 
 .lookup_value: private-for-lookup
 lookup_value: public-for-output
+
+# Functions stay declarations, so this structural function is not emitted.
+factory(kind)=:
+  kind$: kind

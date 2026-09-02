@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.18.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.19.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -231,7 +231,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.18.0
+  version: 0.19.0
   label@: "{{ product }} v{{ version }}"
 ```
 
@@ -991,6 +991,92 @@ Fields evaluate once per binding. A failed evaluation clears its partial
 value/child/key cache, so later access retries instead of observing incomplete
 state.
 
+### Programmable lazy runtime
+
+`node()` creates a lazy mapping/list binding; `resolve()` materializes either
+its full root (with no argument) or an explicitly selected node/path. Targeted
+resolution never commits an `in_place=True` root.
+
+```python
+node = resolver.node({"value$": "input * factor"}, vars={"input": 5, "factor": 2})
+assert node.value == 10                 # lazy field access
+assert resolver.resolve(node) == {"value": 10}
+assert resolver.resolve(resolver.root.path.answer) == 42
+
+resolver.update_globals({"factor": 3}) # existing cached fields stay cached
+resolver.clear_cache(resolver.root.path.answer)
+```
+
+`update_globals()` and `update_filters()` update both native/text and script
+environments, including independent documents already cached by
+`import_json`, `import_yaml`, or `import_tree`. They intentionally do not clear
+memoized fields; use `clear_cache()` when an already evaluated value must be
+recomputed. Full invalidation also reaches live synthetic/rebound nodes created
+through the same resolver. Globals and filters are trusted application capabilities: normal
+Python callables are supported, but their safety is governed by the normal
+Jinja sandbox callable policy.
+
+A declared Jinest function has `.call(*args, **kwargs)` for an immediate
+Python invocation in the context that exposed it, and `.fn()` for a reusable
+callable adapter with optional `context`/`vars`. Both use the same argument
+binding and evaluator path. Structural functions return a lazy node, which can
+then be materialized explicitly with `resolver.resolve`.
+`PathRef.info` is a small immutable Python metadata object. It is deliberately
+Python-only and is not exposed to Jinja; a real `info` path segment remains
+navigable as `path["info"]` (and can be selected with `at(...)`).
+
+The single-file `helpers` namespace exposes thin Python facades:
+`helpers.path`, `helpers.files`, `helpers.runtime`, `helpers.documents`,
+`helpers.serialization`, and `helpers.collections`. The key distinctions are:
+
+```text
+node -> lazy Jinest binding        resolve -> plain materialized value
+load -> file to plain data         import -> independent lazy document
+from_* -> text to plain data       to_* -> serialized text
+export -> value/node to file
+```
+
+`helpers.runtime.literal(value)` returns an ordinary recursively escaped tree:
+every string mapping key gains one raw-key backtick and inline-looking scalar
+strings gain one leading escape backtick. Feeding that tree through Jinest
+therefore recovers literal external data without treating it as syntax.
+
+### Helper namespaces
+
+All helpers are available after `import jinest` as `jinest.helpers`, including
+when only `jinest.py` is copied into an application. They are Python facades;
+none of these names are added to the Jinja environment.
+
+| Namespace | Public functions | Purpose |
+|---|---|---|
+| `helpers.path` | `normalize_path`, `absolute_path`, `relative_path`, `path_of`, `source_path_of`, `at`, `get`, `root_of`, `source_file`, `source_dir` | Navigate and inspect Jinest node paths. A node or `PathRef` supplies its owner automatically; bare string paths require `resolver=` or an `anchor=`. |
+| `helpers.files` | `file_path`, `read_text`, `read_lines`, `read_bytes`, `file_exists` | Read-only source-aware filesystem access. With a resolver/node anchor it uses the same base-directory and `import_roots` policy as imports. |
+| `helpers.runtime` | `node`, `resolve`, `eval`, `render`, `script`, `literal` | Lazy binding, explicit materialization, and the three normal evaluator modes. `literal` is recursive source escaping, not an opaque wrapper. |
+| `helpers.documents` | `load_json`, `load_yaml`, `import_json`, `import_yaml`, `import_tree`, `export_json`, `export_yaml` | Separate plain parsing/loading, lazy independent documents, and normalized export. `import_tree(..., source="plugin://...")` preserves a virtual source identity. |
+| `helpers.serialization` | `from_json`, `from_yaml`, `to_json`, `to_yaml`, `json_normalize`, `yaml_normalize`, `serialize` | Parse/normalize/serialize without reinterpreting ordinary mappings as Jinest source. `serialize(..., file=...)` also writes and returns the text. |
+| `helpers.collections` | `combine`, `union`, `intersect`, `difference`, `symmetric_difference` | Jinest-specific deterministic mapping merge and order-preserving equality-based list set operations, including unhashable items. |
+
+Examples:
+
+```python
+from jinest import Resolver, helpers
+
+resolver = Resolver({"service": {"port": 8080}}, emit_messages=False)
+port = helpers.path.at(resolver.root.path.service.port, resolver=resolver)
+assert port == 8080
+
+safe = helpers.runtime.literal({"x$": "external data"})
+assert resolver.resolve(safe) == {"x$": "external data"}
+
+text = helpers.serialization.to_json(resolver.root.path.service)
+helpers.documents.export_yaml(resolver.root.path.service, "service.yaml")
+```
+
+`load_json`/`load_yaml` and `from_json`/`from_yaml` return ordinary Python
+data. `import_json`/`import_yaml`/`import_tree` return lazy independent
+Jinest documents. Conversely, `to_*` and `export_*` treat ordinary Python
+structures as data; they never parse their keys as Jinest declarations.
+
 ### Files and text
 
 ```python
@@ -1135,7 +1221,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The suite contains 168 Python regression tests and 60 implementation-neutral
+The suite contains 176 Python regression tests and 61 implementation-neutral
 portable CLI fixtures.
 
 ## Security

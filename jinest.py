@@ -27,7 +27,8 @@ Syntax
   mapping keys when used as keys.
 * ``<$``, ``<@``, ``<^``, ``<(args)=``, and ``<[axis=source]=`` — self-declaration
   wrappers that apply one declaration to the current value slot.
-* Local priority is ``name`` > ``name^`` > ``name$`` > ``name@``.
+* Local priority is ``name`` > ``name^`` > ``name$`` > ``name@`` >
+  ``name*`` > ``name+`` > ``name%`` > ``name~``.
 * ``<<=`` / ``<<N=`` attach direct mapping default layers; ``<<!=`` /
   ``<<!N=`` are their override variants.
 * ``<<$`` / ``<<N$`` and ``<<^`` / ``<<N^`` add evaluated default layers.
@@ -66,11 +67,12 @@ import os
 import re
 import sys
 import tempfile
+import weakref
 from collections.abc import Mapping, Sequence
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from enum import Enum
 from itertools import product
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, time
 from pathlib import Path
 from typing import Any, Iterator, MutableMapping, MutableSequence, NoReturn
@@ -92,13 +94,16 @@ __all__ = [
     "JinestImportError",
     "JinestPathError",
     "PathRef",
+    "PathRefInfo",
+    "JinestFunction",
     "Resolver",
+    "helpers",
     "resolve",
     "resolve_text",
     "resolve_file",
 ]
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -560,14 +565,13 @@ def _inline_directive(value: Any) -> tuple[str, str] | None:
 
 
 def _escaped_inline_literal(value: Any) -> str | None:
-    """Return an escaped inline directive as a literal string, if applicable."""
-    if (
-        isinstance(value, str)
-        and len(value) >= 3
-        and value[0] == "`"
-        and value[1] == "="
-        and value[2] in _FUNCTION_MODES
-    ):
+    """Remove exactly one escape before an inline directive-shaped string."""
+    if not isinstance(value, str) or not value.startswith("`"):
+        return None
+    index = 0
+    while index < len(value) and value[index] == "`":
+        index += 1
+    if index + 1 < len(value) and value[index] == "=" and value[index + 1] in _FUNCTION_MODES:
         return value[1:]
     return None
 
@@ -845,19 +849,64 @@ def _parse_self_declaration(value: Any) -> _SelfSpec | None:
 
 
 class JinestFunction:
-    """Safe lazy callable exposed to Jinja for one function declaration."""
+    """A lazy Jinest function declaration, callable from Jinja or Python."""
 
-    __slots__ = ("_jinest_owner", "_jinest_spec", "_jinest_source")
+    __slots__ = ("_jinest_owner", "_jinest_spec", "_jinest_source", "_jinest_scope")
 
     def __init__(
         self,
         owner: "Resolver",
         spec: _FunctionSpec,
         source: _Source,
+        scope: "_ContainerProxy | None" = None,
     ) -> None:
         object.__setattr__(self, "_jinest_owner", owner)
         object.__setattr__(self, "_jinest_spec", spec)
         object.__setattr__(self, "_jinest_source", source)
+        object.__setattr__(self, "_jinest_scope", scope)
+
+    def _python_call(
+        self,
+        scope: "_ContainerProxy",
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        vars: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Single Python-to-Jinest invocation bridge used by call() and fn()."""
+        owner = object.__getattribute__(self, "_jinest_owner")
+        source = object.__getattribute__(self, "_jinest_source")
+        locals_map = dict(object.__getattribute__(scope, "_jinest_binding").frame.local_vars or {})
+        if vars is not None:
+            locals_map.update(vars)
+        return owner._invoke_python_function(self, scope, source, args, kwargs, locals_map)
+
+    def call(self, *args: Any, **kwargs: Any) -> Any:
+        """Invoke this declaration immediately in the context that exposed it."""
+        owner = object.__getattribute__(self, "_jinest_owner")
+        scope = owner._coerce_api_scope(
+            default=object.__getattribute__(self, "_jinest_scope")
+        )
+        return self._python_call(scope, args, kwargs)
+
+    def fn(
+        self,
+        *,
+        context: Any = _MISSING,
+        vars: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Return a Python callable adapter, optionally rebound with locals."""
+        owner = object.__getattribute__(self, "_jinest_owner")
+        spec = object.__getattribute__(self, "_jinest_spec")
+        scope = owner._coerce_api_scope(
+            context, default=object.__getattribute__(self, "_jinest_scope")
+        )
+
+        def adapter(*args: Any, **kwargs: Any) -> Any:
+            return self._python_call(scope, args, kwargs, vars)
+
+        adapter.__name__ = spec.name
+        adapter.__qualname__ = spec.name
+        return adapter
 
     @pass_context
     def __call__(self, jinja_context: Context, *args: Any, **kwargs: Any) -> Any:
@@ -868,6 +917,18 @@ class JinestFunction:
     def __repr__(self) -> str:
         spec = object.__getattribute__(self, "_jinest_spec")
         return f"<JinestFunction {spec.name}>"
+
+
+@dataclass(frozen=True, slots=True)
+class PathRefInfo:
+    """Read-only Python metadata for a :class:`PathRef`."""
+
+    owner: "Resolver"
+    kind: str
+    segments: tuple[Any, ...]
+    relative: bool
+    anchor: tuple[Any, ...]
+    up: int
 
 
 class PathRef:
@@ -921,6 +982,15 @@ class PathRef:
             return object.__getattribute__(self, "_jinest_parent")()
         if name == "absolute":
             return object.__getattribute__(self, "_jinest_absolute")()
+        if name == "info":
+            return PathRefInfo(
+                object.__getattribute__(self, "_jinest_owner"),
+                object.__getattribute__(self, "_jinest_kind"),
+                object.__getattribute__(self, "_jinest_segments"),
+                object.__getattribute__(self, "_jinest_relative"),
+                object.__getattribute__(self, "_jinest_anchor_segments"),
+                object.__getattribute__(self, "_jinest_up"),
+            )
         return object.__getattribute__(self, "_jinest_append")(name)
 
     def __getitem__(self, key: Any) -> "PathRef":
@@ -1089,9 +1159,14 @@ class _JinestContext(Context):
 
 
 class _SandboxedNativeEnvironment(SandboxedEnvironment, NativeEnvironment):
-    """NativeEnvironment with Jinja sandbox checks enabled."""
+    """NativeEnvironment with Jinest-specific sandbox checks."""
 
     def is_safe_attribute(self, obj: Any, attr: str, value: Any) -> bool:
+        # ``PathRef.info`` is deliberately Python-only. PathRef otherwise keeps
+        # attribute navigation semantics, so a real ``info`` path segment is
+        # still reachable with brackets.
+        if attr == "info" and isinstance(obj, PathRef):
+            return False
         if attr == "_" and isinstance(obj, (_ContainerProxy, PathRef)):
             return True
         if isinstance(obj, _ContainerProxy) and attr in _NODE_META_NAMES:
@@ -1112,6 +1187,7 @@ class _ContainerProxy:
         "_jinest_path_kind",
         "_jinest_children",
         "_jinest_binding",
+        "__weakref__",
     )
 
     def __init__(
@@ -1143,6 +1219,7 @@ class _ContainerProxy:
         binding = owner._new_binding(frame)
         object.__setattr__(self, "_jinest_binding", binding)
         object.__setattr__(self, "_jinest_children", binding.cache.children)
+        owner._register_live_node(self)
 
     def __getattribute__(self, name: str) -> Any:
         if name == "_":
@@ -1175,8 +1252,7 @@ class _ContainerProxy:
             return source.resolver._source_root
         if name == "file":
             source = object.__getattribute__(self, "_jinest_source")
-            path = source.resolver.source_path
-            return str(path) if path is not None else None
+            return source.resolver._source_label
         return object.__getattribute__(self, name)
 
     def __repr__(self) -> str:
@@ -1437,6 +1513,7 @@ class DocumentStore:
     runtimes: dict[tuple[Path, str, tuple[Path, ...]], "Resolver"] = field(
         default_factory=dict
     )
+    tree_runtimes: dict[str, "Resolver"] = field(default_factory=dict)
 
     def get(self, path: Path, format: str) -> _ImportedDocument | None:
         return self.cache.get((path, format))
@@ -1449,6 +1526,7 @@ class DocumentStore:
     def clear(self) -> None:
         self.cache.clear()
         self.runtimes.clear()
+        self.tree_runtimes.clear()
 
 
 @dataclass(slots=True)
@@ -1522,6 +1600,7 @@ class Resolver:
         _documents: DocumentStore | None = None,
         _document_identity: object | None = None,
         _copy_input: bool = True,
+        _source_label: str | None = None,
     ) -> None:
         self.in_place = in_place
         self.strict = strict
@@ -1578,7 +1657,11 @@ class Resolver:
         self._import_cache = self._documents.cache
         self._materializer = Materializer(self)
         self._source_view_cache: dict[_SourceInstanceId, _ContainerProxy] = {}
+        # Weak references keep externally-held synthetic/rebound nodes in the
+        # same invalidation graph without making their lifetime global.
+        self._live_nodes: dict[int, weakref.ReferenceType[_ContainerProxy]] = {}
         self.source_path = Path(source_path).expanduser().resolve() if source_path else None
+        self._source_label = _source_label or (str(self.source_path) if self.source_path else None)
         if base_dir is not None:
             self.base_dir = Path(base_dir).expanduser().resolve()
         elif self.source_path is not None:
@@ -1974,8 +2057,35 @@ class Resolver:
             return
         self.data = result
 
-    def resolve(self) -> Any:
-        """Fully materialize the lazy tree into ordinary Python values."""
+    def resolve(
+        self,
+        target: Any = _MISSING,
+        *,
+        context: Any = _MISSING,
+        origin: Any = _MISSING,
+        root: Any = _MISSING,
+        vars: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Materialize the root or one explicitly selected lazy value.
+
+        Supplying ``target`` never commits an ``in_place`` resolver. Plain
+        mappings/lists are first bound through :meth:`node`, so targeted and
+        synthetic resolution share the ordinary lazy runtime.
+        """
+        if target is not _MISSING:
+            value = self._coerce_api_target(
+                target, context=context, origin=origin, root=root, vars=vars
+            )
+            try:
+                result = self._materializer.materialize(value)
+            except Exception as exc:
+                self._flush_messages()
+                self._emit_debug_error(exc)
+                raise
+            self._finalize_messages()
+            return result
+        if any(value is not _MISSING for value in (context, origin, root)) or vars is not None:
+            raise TypeError("context, origin, root, and vars require an explicit target")
         if self.in_place:
             if self._in_place_snapshot is not _MISSING:
                 if self._in_place_fingerprint(self.data) == self._in_place_snapshot:
@@ -1984,35 +2094,283 @@ class Resolver:
         try:
             result = self._materializer.materialize(self.root)
         except Exception as exc:
-            # Diagnostics discovered before a rendering error are still useful
-            # to API callers and CLI users.
             self._flush_messages()
             self._emit_debug_error(exc)
             raise
         self._finalize_messages()
-
         if self.in_place:
             snapshot = self._in_place_fingerprint(result)
-            if snapshot is _MISSING:  # materialization invariant
+            if snapshot is _MISSING:
                 raise JinestError("Could not snapshot materialized in-place result")
             self._commit_in_place_result(result)
-
-            # Keep the successfully compiled source views alive. Rebuilding
-            # them here would parse the materialized output as fresh Jinest
-            # source (notably turning raw mode-looking output back into code).
-            # A later external mutation is detected above and starts a fresh
-            # run; an unchanged repeated resolve is idempotent.
             self._in_place_snapshot = snapshot
             self.root = self.data
             self._source_root = self.data
             self.global_root = self.data
             return self.data
-
         return result
+
+    def _coerce_api_scope(
+        self, context: Any = _MISSING, *, default: _ContainerProxy | None = None
+    ) -> _ContainerProxy:
+        if context is _MISSING:
+            context = default if default is not None else self.root
+        if isinstance(context, PathRef):
+            context = object.__getattribute__(context, "_jinest_owner")._at_path(context)
+        elif isinstance(context, str):
+            context = self._at(context, frame=None)
+        if not isinstance(context, _ContainerProxy):
+            raise TypeError("context must resolve to a Jinest mapping or list node")
+        return context
+
+    def _api_locals(self, scope: _ContainerProxy, vars: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+        if vars is None:
+            return object.__getattribute__(scope, "_jinest_binding").frame.local_vars
+        if not isinstance(vars, Mapping):
+            raise TypeError("vars must be a mapping")
+        result = dict(object.__getattribute__(scope, "_jinest_binding").frame.local_vars or {})
+        result.update(vars)
+        return result
+
+    def _coerce_api_target(
+        self, target: Any, *, context: Any, origin: Any, root: Any,
+        vars: Mapping[str, Any] | None,
+    ) -> Any:
+        if isinstance(target, PathRef):
+            owner = object.__getattribute__(target, "_jinest_owner")
+            target = owner._at_path(target)
+        if isinstance(target, _ContainerProxy):
+            if context is origin is root is _MISSING and vars is None:
+                return target
+            return self.node(target, context=context, origin=origin, root=root, vars=vars)
+        if isinstance(target, Mapping) or (
+            isinstance(target, Sequence) and not isinstance(target, (str, bytes, bytearray))
+        ):
+            return self.node(target, context=context, origin=origin, root=root, vars=vars)
+        if any(value is not _MISSING for value in (context, origin, root)) or vars is not None:
+            raise TypeError("binding overrides require a mapping/list/node target")
+        return target
+
+    def node(
+        self, value: Any, *, context: Any = _MISSING, origin: Any = _MISSING,
+        root: Any = _MISSING, vars: Mapping[str, Any] | None = None,
+    ) -> _ContainerProxy:
+        """Bind a mapping/list as a lazy Jinest node without materializing it."""
+        if not self._is_container(value):
+            raise TypeError("node() requires a mapping or non-string sequence")
+        if isinstance(value, _ContainerProxy) and context is origin is root is _MISSING and vars is None:
+            return value
+        default_parent = (
+            object.__getattribute__(value, "_jinest_parent")
+            if isinstance(value, _ContainerProxy) else None
+        )
+        parent = self._coerce_api_scope(context, default=default_parent)
+        locals_map = self._api_locals(parent, vars)
+        existing_node = isinstance(value, _ContainerProxy)
+        if existing_node:
+            source = object.__getattribute__(value, "_jinest_source")
+            source_origin = source.resolver
+            source_path = source.source_path
+            context_origin_source = object.__getattribute__(value, "_jinest_binding").frame.context_origin_source
+        else:
+            source_origin = self
+            source_path = ("<synthetic>", id(value))
+            context_origin_source = None
+        if origin is not _MISSING:
+            origin_node = self._coerce_api_scope(origin)
+            context_origin_source = object.__getattribute__(origin_node, "_jinest_source")
+            source_origin = context_origin_source.resolver
+        if root is not _MISSING:
+            root_node = self._coerce_api_scope(root)
+            root_source = object.__getattribute__(root_node, "_jinest_source")
+            root_origin = root_source.resolver
+            # A synthetic node has no intrinsic declaration root, so an
+            # explicit root may establish it. Existing sources instead retain
+            # their source identity and may only be rebound inside that tree.
+            if origin is _MISSING and not existing_node:
+                source_origin = root_origin
+                context_origin_source = root_source
+            elif root_origin is not source_origin:
+                raise JinestError("origin and root must belong to the same source tree")
+        path = object.__getattribute__(parent, "_jinest_path") + ("<node>",)
+        bound = self._wrap(
+            value, parent=parent, path=path, origin=source_origin,
+            source_path=source_path, path_kind=object.__getattribute__(parent, "_jinest_path_kind"),
+            local_vars=locals_map, context_origin_source=context_origin_source,
+        )
+        if not isinstance(bound, _ContainerProxy):
+            raise TypeError("node() requires a mapping or non-string sequence")
+        return bound
+
+    def _clear_binding_cache(self, node: _ContainerProxy, visited: set[_BindingId]) -> None:
+        binding = object.__getattribute__(node, "_jinest_binding")
+        if binding.identity in visited:
+            return
+        visited.add(binding.identity)
+        cache = binding.cache
+        for cached in tuple(cache.children.values()):
+            child = cached[1]
+            if isinstance(child, _ContainerProxy):
+                self._clear_binding_cache(child, visited)
+        cache.children.clear(); cache.resolved.clear(); cache.public_resolved.clear()
+        cache.layers.clear(); cache.normalized_layers.clear(); cache.key_indexes.clear()
+
+    def _runtime_graph(self) -> tuple["Resolver", ...]:
+        """Return this global runtime and its cached independent documents."""
+        owner = self._global_owner
+        candidates = [owner, *owner._documents.runtimes.values(), *owner._documents.tree_runtimes.values()]
+        result: list[Resolver] = []
+        seen: set[int] = set()
+        for candidate in candidates:
+            if candidate._global_owner is owner and id(candidate) not in seen:
+                seen.add(id(candidate))
+                result.append(candidate)
+        return tuple(result)
+
+    def clear_cache(self, target: Any = _MISSING) -> None:
+        """Invalidate lazy binding caches without discarding sources or globals."""
+        if target is _MISSING:
+            # Parsed documents and compiled templates deliberately survive;
+            # only destination-local lazy state is invalidated.
+            for runtime in self._runtime_graph():
+                visited: set[_BindingId] = set()
+                if isinstance(runtime.root, _ContainerProxy):
+                    runtime._clear_binding_cache(runtime.root, visited)
+                # Synthetic nodes and explicit rebinding can remain live in
+                # Python without being attached under ``root``. They share
+                # this resolver's runtime contract and must not stay stale.
+                for reference in tuple(runtime._live_nodes.values()):
+                    node = reference()
+                    if node is not None:
+                        runtime._clear_binding_cache(node, visited)
+            return
+        if isinstance(target, PathRef):
+            owner = object.__getattribute__(target, "_jinest_owner")
+            absolute = target._jinest_absolute()
+            segments = object.__getattribute__(absolute, "_jinest_segments")
+            if not segments:
+                owner.clear_cache(object.__getattribute__(absolute, "_jinest_root")); return
+            parent_path = PathRef(owner, object.__getattribute__(absolute, "_jinest_root"), object.__getattribute__(absolute, "_jinest_kind"), segments[:-1])
+            parent = owner._at_path(parent_path)
+            if isinstance(parent, _ContainerProxy):
+                key = segments[-1]
+                cache = object.__getattribute__(parent, "_jinest_binding").cache
+                child = cache.children.get(key)
+                if child is not None and isinstance(child[1], _ContainerProxy):
+                    owner._clear_binding_cache(child[1], set())
+                cache.children.pop(key, None); cache.resolved.pop(key, None); cache.public_resolved.pop(key, None)
+                cache.key_indexes.clear(); cache.layers.clear(); cache.normalized_layers.clear()
+                return
+            raise JinestPathError(f"Path {target} has no container parent")
+        if not isinstance(target, _ContainerProxy):
+            raise TypeError("clear_cache() target must be a Jinest node or PathRef")
+        object.__getattribute__(target, "_jinest_owner")._clear_binding_cache(target, set())
+
+    def _apply_globals(self, mapping: Mapping[str, Any]) -> None:
+        self._user_globals.update(mapping)
+        for environment in (self.environment, self.script_environment):
+            environment.globals.update(mapping)
+        self.config = replace(self.config, globals=MappingProxyType(self._user_globals.copy()))
+
+    def update_globals(self, mapping: Mapping[str, Any]) -> None:
+        """Update globals for future evaluations throughout this resolver graph."""
+        if not isinstance(mapping, Mapping):
+            raise TypeError("globals must be a mapping")
+        for runtime in self._runtime_graph():
+            runtime._apply_globals(mapping)
+
+    def _apply_filters(self, mapping: Mapping[str, Any]) -> None:
+        self._user_filters.update(mapping)
+        for environment in (self.environment, self.script_environment):
+            environment.filters.update(mapping)
+        self.config = replace(self.config, filters=MappingProxyType(self._user_filters.copy()))
+
+    def update_filters(self, mapping: Mapping[str, Any]) -> None:
+        """Update filters for future evaluations throughout this resolver graph."""
+        if not isinstance(mapping, Mapping):
+            raise TypeError("filters must be a mapping")
+        for runtime in self._runtime_graph():
+            runtime._apply_filters(mapping)
+
+    def _api_render(self, template: Any, mode: str, *, context: Any = _MISSING, vars: Mapping[str, Any] | None = None) -> Any:
+        scope = self._coerce_api_scope(context)
+        source = object.__getattribute__(scope, "_jinest_source")
+        return self._render(scope, template, mode=mode, origin_source=source,
+                            source_key=None, local_vars=self._api_locals(scope, vars))
+
+    def eval(self, expression: Any, *, context: Any = _MISSING, vars: Mapping[str, Any] | None = None) -> Any:
+        return self._api_render(expression, "native", context=context, vars=vars)
+
+    def render(self, template: Any, *, context: Any = _MISSING, vars: Mapping[str, Any] | None = None) -> str:
+        return self._api_render(template, "text", context=context, vars=vars)
+
+    def script(self, source: Any, *, context: Any = _MISSING, vars: Mapping[str, Any] | None = None) -> Any:
+        return self._api_render(source, "script", context=context, vars=vars)
+
+    def normalize_path(self, value: Any, *, anchor: Any = _MISSING) -> PathRef:
+        return self._normalize_path(value, frame=None, anchor=anchor)
+
+    def absolute_path(self, value: Any, *, anchor: Any = _MISSING) -> PathRef:
+        return self._absolute_path(value, anchor=anchor, frame=None)
+
+    def relative_path(self, target: Any, *, base: Any = _MISSING) -> PathRef:
+        return self._relative_path(target, base=base, frame=None)
+
+    def at(self, target: Any, *, anchor: Any = _MISSING) -> Any:
+        return self._at(target, anchor=anchor, frame=None)
+
+    def get(self, target: Any, default: Any = None, *, anchor: Any = _MISSING) -> Any:
+        try:
+            return self.at(target, anchor=anchor)
+        except (KeyError, IndexError, TypeError, JinestPathError, UndefinedError):
+            return default
+
+    def import_tree(self, value: Any, *, source: str | os.PathLike[str] = "memory://tree", base_dir: str | os.PathLike[str] | None = None) -> Any:
+        """Create/reuse an independent lazy document from a Python tree."""
+        if not self._is_container(value):
+            raise TypeError("import_tree() requires a mapping or non-string sequence")
+        identity = str(source)
+        source_path = None
+        try:
+            candidate = Path(source).expanduser()
+            if (
+                isinstance(source, os.PathLike)
+                or candidate.is_absolute()
+                or os.fspath(source).endswith((".json", ".yaml", ".yml"))
+            ):
+                source_path = candidate.resolve()
+                identity = str(source_path)
+        except TypeError:
+            pass
+        cache = self._documents.tree_runtimes
+        cached = cache.get(identity)
+        if cached is not None:
+            return cached.root
+        child = Resolver(value, strict=self.strict, sandboxed=self.sandboxed,
+            globals=self._user_globals, filters=self._user_filters,
+            source_path=source_path, base_dir=base_dir or (source_path.parent if source_path else self.base_dir),
+            import_roots=self.import_roots, function_max_depth=self.function_max_depth,
+            emit_messages=False, treat_warnings_as_errors=False, debug=self.debug,
+            _global_owner=self._global_owner, _documents=self._documents,
+            _document_identity=("tree", identity), _copy_input=False,
+            _source_label=identity)
+        cache[identity] = child
+        return child.root
+
 
     # ------------------------------------------------------------------
     # Binding and source ownership
     # ------------------------------------------------------------------
+
+    def _register_live_node(self, node: _ContainerProxy) -> None:
+        """Track a node weakly so full cache invalidation reaches it too."""
+        key = id(node)
+
+        def discard(reference: weakref.ReferenceType[_ContainerProxy]) -> None:
+            if self._live_nodes.get(key) is reference:
+                self._live_nodes.pop(key, None)
+
+        self._live_nodes[key] = weakref.ref(node, discard)
 
     def _new_binding(self, frame: _EvaluationFrame) -> _Binding:
         """Create destination-local state; no cache survives a rebind."""
@@ -3305,8 +3663,13 @@ class Resolver:
                 return function
         return None
 
-    def _function_value(self, source: _Source, spec: _FunctionSpec) -> JinestFunction:
-        return JinestFunction(self, spec, source)
+    def _function_value(
+        self,
+        source: _Source,
+        spec: _FunctionSpec,
+        scope: _ContainerProxy | None = None,
+    ) -> JinestFunction:
+        return JinestFunction(self, spec, source, scope)
 
     def _iter_field_candidates(
         self,
@@ -3689,7 +4052,7 @@ class Resolver:
         if candidate.mode == "function":
             if not isinstance(candidate.template, _FunctionSpec):
                 raise JinestError(f"Malformed function declaration {candidate.source_key!r}")
-            return self._function_value(source, candidate.template)
+            return self._function_value(source, candidate.template, bind)
 
         if candidate.mode.startswith("compose_"):
             spec = _parse_compose_declaration(candidate.source_key, candidate.template)
@@ -4266,6 +4629,26 @@ class Resolver:
     # ------------------------------------------------------------------
     # Jinja rendering and imports
     # ------------------------------------------------------------------
+
+    def _invoke_python_function(
+        self,
+        function: JinestFunction,
+        scope: _ContainerProxy,
+        source: _Source,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        local_vars: Mapping[str, Any] | None,
+    ) -> Any:
+        """Invoke a declared function through the same Jinja call machinery."""
+        class PythonCallContext:
+            def __init__(self) -> None:
+                self.vars = {_INTERNAL_SCOPE: scope, _INTERNAL_FUNCTION_LOCALS: local_vars}
+                self.parent = dict(self.vars)
+
+            def resolve_or_missing(self, name: str) -> Any:
+                return self.vars.get(name, missing)
+
+        return self._invoke_function(function, PythonCallContext(), args, kwargs)
 
     def _invoke_function(
         self,
@@ -5121,6 +5504,187 @@ class Resolver:
             return key
         except TypeError:
             return (type(key).__name__, repr(key))
+
+
+# ----------------------------------------------------------------------
+# Public helper namespaces (kept in this single module intentionally)
+# ----------------------------------------------------------------------
+
+
+def _api_owner(value: Any = _MISSING, resolver: Resolver | None = None) -> Resolver:
+    """Get the owning runtime from one public node/path or an explicit resolver."""
+    if resolver is not None:
+        if not isinstance(resolver, Resolver):
+            raise TypeError("resolver must be a Resolver")
+        return resolver
+    if isinstance(value, PathRef):
+        return object.__getattribute__(value, "_jinest_owner")
+    if isinstance(value, _ContainerProxy):
+        return object.__getattribute__(value, "_jinest_owner")
+    raise TypeError("resolver is required when it cannot be inferred from a Jinest node or PathRef")
+
+
+def _api_owner_from(*values: Any, resolver: Resolver | None = None) -> Resolver:
+    """Infer a resolver from the first public node/path among ``values``."""
+    if resolver is not None:
+        return _api_owner(resolver=resolver)
+    for value in values:
+        if value is not _MISSING and isinstance(value, (PathRef, _ContainerProxy)):
+            return _api_owner(value)
+    raise TypeError("resolver is required when it cannot be inferred from a Jinest node or PathRef")
+
+def _api_materialize(value: Any, resolver: Resolver | None = None) -> Any:
+    if isinstance(value, (PathRef, _ContainerProxy)):
+        return _api_owner(value, resolver).resolve(value)
+    return value
+
+
+def _literal_tree(value: Any, active: set[int] | None = None) -> Any:
+    """Recursively escape ordinary data for a future Jinest parse."""
+    if active is None:
+        active = set()
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in active:
+            raise JinestError("Cyclic mapping cannot be converted by literal()")
+        active.add(marker)
+        try:
+            return {
+                (key + "`") if isinstance(key, str) else key: _literal_tree(item, active)
+                for key, item in value.items()
+            }
+        finally:
+            active.remove(marker)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        marker = id(value)
+        if marker in active:
+            raise JinestError("Cyclic sequence cannot be converted by literal()")
+        active.add(marker)
+        try:
+            return [_literal_tree(item, active) for item in value]
+        finally:
+            active.remove(marker)
+    if isinstance(value, str):
+        index = 0
+        while index < len(value) and value[index] == "`":
+            index += 1
+        if index + 1 < len(value) and value[index] == "=" and value[index + 1] in _FUNCTION_MODES:
+            return "`" + value
+    return value
+
+
+def _api_path_of(value: Any, *, source: bool = False) -> PathRef:
+    owner = _api_owner(value)
+    return owner._path_of(value, source=source)
+
+
+def _api_source_dir(value: Any, *, resolver: Resolver | None = None) -> str | None:
+    owner = _api_owner(value, resolver)
+    if isinstance(value, PathRef):
+        return str(owner.base_dir)
+    file = owner._source_file(value)
+    return str(Path(file).parent) if file else str(owner.base_dir)
+
+
+def _api_file_path(value: Any, *, anchor: Any = _MISSING, resolver: Resolver | None = None) -> Path:
+    owner = _api_owner_from(anchor, value, resolver=resolver)
+    # A document resolver's base_dir already follows its source (including
+    # import_tree's explicit virtual-source fallback), so path helpers and
+    # Jinest imports share the same canonical policy.
+    base = owner.base_dir
+    path = Path(os.fspath(value)).expanduser()
+    path = path if path.is_absolute() else base / path
+    path = path.resolve()
+    if owner.import_roots is not None and not any(path.is_relative_to(root) for root in owner.import_roots):
+        raise JinestImportError(f"Import path is outside permitted roots: {value}")
+    return path
+
+
+def _api_read_text(path: Any, *, anchor: Any = _MISSING, resolver: Resolver | None = None, encoding: str = "utf-8") -> str:
+    return _api_file_path(path, anchor=anchor, resolver=resolver).read_text(encoding=encoding)
+
+
+def _api_import(path: Any, format: str, *, resolver: Resolver | None = None, anchor: Any = _MISSING) -> Any:
+    return _api_owner_from(anchor, resolver=resolver)._import_tree(path, format)
+
+
+def _api_serialize(value: Any, *, format: str = "json", file: str | os.PathLike[str] | None = None, resolver: Resolver | None = None) -> str:
+    text = SerializationCodecs.serialize(_api_materialize(value, resolver), format.lower())
+    if file is not None:
+        Path(file).write_text(text + ("" if text.endswith("\n") else "\n"), encoding="utf-8")
+    return text
+
+
+def _ordered_union(*values: Any) -> list[Any]:
+    result: list[Any] = []
+    for group in values:
+        for item in group:
+            if not any(item == existing for existing in result): result.append(item)
+    return result
+
+
+def _ordered_intersect(first: Any, *rest: Any) -> list[Any]:
+    result: list[Any] = []
+    for item in first:
+        if all(any(item == candidate for candidate in group) for group in rest) and not any(item == existing for existing in result):
+            result.append(item)
+    return result
+
+
+def _ordered_filter(first: Any, rest: Any, *, include: bool) -> list[Any]:
+    result=[]
+    for item in first:
+        present=any(item == candidate for candidate in rest)
+        if present is include and not any(item == old for old in result): result.append(item)
+    return result
+
+
+def _combine(a: Mapping[Any, Any], b: Mapping[Any, Any], recursive: bool = False) -> dict[Any, Any]:
+    result = dict(a)
+    for key, value in b.items():
+        if recursive and isinstance(result.get(key), Mapping) and isinstance(value, Mapping):
+            result[key] = _combine(result[key], value, recursive=True)
+        else: result[key] = value
+    return result
+
+
+def _api_root_of(value: Any) -> Any:
+    owner = _api_owner(value)
+    if isinstance(value, PathRef):
+        return object.__getattribute__(value._jinest_absolute(), "_jinest_root")
+    return owner._root_of(value)
+
+
+def _api_source_file(value: Any) -> str | None:
+    owner = _api_owner(value)
+    if isinstance(value, PathRef):
+        return owner._source_label
+    return owner._source_file(value)
+
+
+def _runtime_owner(resolver: Resolver | None, kwargs: Mapping[str, Any]) -> Resolver:
+    return _api_owner_from(
+        kwargs.get("context", _MISSING), kwargs.get("origin", _MISSING),
+        kwargs.get("root", _MISSING), resolver=resolver,
+    )
+
+
+helpers = SimpleNamespace(
+    path=SimpleNamespace(
+        normalize_path=lambda value, *, resolver=None, anchor=_MISSING: _api_owner_from(value, anchor, resolver=resolver).normalize_path(value, anchor=anchor),
+        absolute_path=lambda value, *, resolver=None, anchor=_MISSING: _api_owner_from(value, anchor, resolver=resolver).absolute_path(value, anchor=anchor),
+        relative_path=lambda target, *, resolver=None, base=_MISSING: _api_owner_from(target, base, resolver=resolver).relative_path(target, base=base),
+        path_of=lambda value: _api_path_of(value), source_path_of=lambda value: _api_path_of(value, source=True),
+        at=lambda target, *, resolver=None, anchor=_MISSING: _api_owner_from(target, anchor, resolver=resolver).at(target, anchor=anchor),
+        get=lambda target, default=None, *, resolver=None, anchor=_MISSING: _api_owner_from(target, anchor, resolver=resolver).get(target, default, anchor=anchor),
+        root_of=_api_root_of, source_file=_api_source_file, source_dir=_api_source_dir,
+    ),
+    files=SimpleNamespace(file_path=_api_file_path, read_text=_api_read_text, read_lines=lambda path, **kwargs: _api_read_text(path, **kwargs).splitlines(), read_bytes=lambda path, **kwargs: _api_file_path(path, **kwargs).read_bytes(), file_exists=lambda path, **kwargs: _api_file_path(path, **kwargs).exists()),
+    runtime=SimpleNamespace(node=lambda value, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).node(value, **kwargs), resolve=lambda value, *, resolver=None, **kwargs: _api_owner_from(value, kwargs.get("context", _MISSING), resolver=resolver).resolve(value, **kwargs), eval=lambda expression, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).eval(expression, **kwargs), render=lambda template, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).render(template, **kwargs), script=lambda source, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).script(source, **kwargs), literal=_literal_tree),
+    documents=SimpleNamespace(load_json=lambda path: SerializationCodecs.parse(Path(path).read_text(encoding="utf-8"), "json"), load_yaml=lambda path: SerializationCodecs.parse(Path(path).read_text(encoding="utf-8"), "yaml"), import_json=lambda path, *, resolver=None, anchor=_MISSING: _api_import(path, "json", resolver=resolver, anchor=anchor), import_yaml=lambda path, *, resolver=None, anchor=_MISSING: _api_import(path, "yaml", resolver=resolver, anchor=anchor), import_tree=lambda value, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).import_tree(value, **kwargs), export_json=lambda value, path, **kwargs: _api_serialize(value, format="json", file=path, **kwargs), export_yaml=lambda value, path, **kwargs: _api_serialize(value, format="yaml", file=path, **kwargs)),
+    serialization=SimpleNamespace(from_json=lambda text: SerializationCodecs.parse(text, "json"), from_yaml=lambda text: SerializationCodecs.parse(text, "yaml"), to_json=lambda value, **kwargs: _api_serialize(value, format="json", **kwargs), to_yaml=lambda value, **kwargs: _api_serialize(value, format="yaml", **kwargs), json_normalize=lambda value: _normalize_json_value(_api_materialize(value), active=set()), yaml_normalize=lambda value: _normalize_yaml_value(_api_materialize(value), active=set()), serialize=_api_serialize),
+    collections=SimpleNamespace(combine=_combine, union=_ordered_union, intersect=lambda first, *rest: _ordered_intersect(first, *rest), difference=lambda first, *rest: _ordered_filter(first, _ordered_union(*rest), include=False), symmetric_difference=lambda a, b: _ordered_union(_ordered_filter(a, b, include=False), _ordered_filter(b, a, include=False))),
+)
 
 
 # ----------------------------------------------------------------------

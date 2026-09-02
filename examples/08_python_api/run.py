@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -13,7 +14,7 @@ HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
 sys.path.insert(0, str(REPOSITORY))
 
-from jinest import JinestWarningError, Resolver  # noqa: E402
+from jinest import JinestWarningError, Resolver, helpers  # noqa: E402
 
 
 def surround(value: object, left: str, right: str) -> str:
@@ -33,6 +34,30 @@ resolver = Resolver(
 
 # A valid field can be read without eagerly resolving the entire document.
 assert resolver.root.doubled == 10
+
+# Python API: synthetic lazy bindings, explicit globals and targeted resolve.
+resolver.update_globals({"factor": 10})
+synthetic = resolver.node({"value$": "input * factor"}, vars={"input": 5})
+assert synthetic.value == 50
+assert resolver.resolve(resolver.root.path.value) == 5
+assert resolver.eval("factor") == 10
+assert resolver.root.factory.fn()("web").kind == "web"
+
+# The helper namespaces are Python-only facades over the same runtime.
+assert helpers.path.at(resolver.root.path.value) == 5  # owner inferred from PathRef
+assert helpers.runtime.render("{{ factor }}", resolver=resolver) == "10"
+assert helpers.runtime.eval("value", context=resolver.root.path) == 5
+assert resolver.resolve(helpers.runtime.literal({"x$": "literal"}), vars={}) == {"x$": "literal"}
+assert helpers.serialization.from_json('{"x": 1}') == {"x": 1}
+assert helpers.collections.combine({"x": {"a": 1}}, {"x": {"b": 2}}, recursive=True) == {"x": {"a": 1, "b": 2}}
+assert helpers.documents.load_yaml(HERE / "example.yml")["value"] == 5
+assert helpers.files.read_lines(HERE / "example.yml", resolver=resolver)
+plugin_defaults = helpers.documents.import_tree({"port": 8080}, resolver=resolver, source="plugin://example/defaults")
+assert plugin_defaults.file == "plugin://example/defaults"
+with tempfile.TemporaryDirectory() as temporary:
+    destination = Path(temporary) / "synthetic.yaml"
+    assert "value: 50" in helpers.documents.export_yaml(synthetic, destination)
+    assert destination.exists()
 
 result = resolver.resolve()
 assert result is data  # in_place=True preserves the original mapping object.

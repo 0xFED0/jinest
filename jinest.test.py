@@ -83,9 +83,159 @@ class JinestTestSuiteContractTests(unittest.TestCase):
         self.assertEqual(private_accesses, [])
 
 
+class JinestPythonApiTests(unittest.TestCase):
+    def test_targeted_resolution_node_and_path_info(self) -> None:
+        resolver = jinest.Resolver(
+            {"branch": {"x": 2, "y$": "x * factor"}, "unused$": "missing.value"},
+            globals={"factor": 3}, emit_messages=False,
+        )
+        self.assertEqual(resolver.resolve(resolver.root.path.branch.y), 6)
+        self.assertEqual(resolver.root.path.branch.info.segments, ("branch",))
+        node = resolver.node({"value$": "input * factor", "unused$": "missing.value"}, vars={"input": 5, "factor": 2})
+        self.assertEqual(node.value, 10)  # sibling stays unevaluated
+        self.assertEqual(resolver.resolve({"value$": "input * factor"}, vars={"input": 5, "factor": 2}), {"value": 10})
+
+    def test_cache_updates_and_python_function_adapter(self) -> None:
+        resolver = jinest.Resolver(
+            {"a$": "factor", "b$": "factor", "double(x)$": "x * factor"},
+            globals={"factor": 2}, emit_messages=False,
+        )
+        self.assertEqual(resolver.root.a, 2)
+        resolver.update_globals({"factor": 3})
+        self.assertEqual(resolver.root.a, 2)
+        self.assertEqual(resolver.root.b, 3)
+        resolver.clear_cache(resolver.root.path.a)
+        self.assertEqual(resolver.root.a, 3)
+        self.assertEqual(resolver.root.double.call(4), 12)
+        self.assertEqual(resolver.root.double.fn()(4), 12)
+
+    def test_api_helpers_infer_owners_and_hide_python_pathref_info_from_jinja(self) -> None:
+        resolver = jinest.Resolver(
+            {"branch": {"value": 2}, "rendered@": "{{ path.info.kind }}"},
+            strict=False,
+            emit_messages=False,
+        )
+        path = resolver.root.path.branch
+        # Node/PathRef ownership is sufficient; an explicit resolver is only
+        # needed for a bare string with no anchor.
+        self.assertEqual(jinest.helpers.path.at(path).value, 2)
+        self.assertEqual(jinest.helpers.path.get(resolver.root.path.missing, "fallback"), "fallback")
+        self.assertEqual(jinest.helpers.path.absolute_path(path), path)
+        self.assertEqual(jinest.helpers.path.root_of(path), resolver.root)
+        self.assertEqual(jinest.helpers.runtime.eval("value", context=path), 2)
+        self.assertEqual(resolver.resolve()["rendered"], "")
+
+        external = jinest.Resolver({"answer": 9}, emit_messages=False)
+        synthetic = resolver.node({"value$": "root.answer"}, root=external.root)
+        self.assertEqual(synthetic.value, 9)
+        with self.assertRaisesRegex(jinest.JinestError, "same source tree"):
+            resolver.node({"value": 1}, origin=resolver.root, root=external.root)
+
+    def test_api_updates_and_cache_cover_cached_independent_documents(self) -> None:
+        resolver = jinest.Resolver({"root$": "factor"}, globals={"factor": 1}, emit_messages=False)
+        document = resolver.import_tree(
+            {"native$": "factor", "text@": "{{ factor | wrap }}", "script^": "% return factor"},
+            source="plugin://api/runtime",
+        )
+        self.assertEqual(document.native, 1)  # memoized before the update
+        resolver.update_globals({"factor": 3})
+        resolver.update_filters({"wrap": lambda value: f"<{value}>"})
+        self.assertEqual(document.native, 1)
+        self.assertEqual(document.text, "<3>")
+        self.assertEqual(document.script, 3)
+        resolver.clear_cache()
+        self.assertEqual(document.native, 3)
+
+    def test_full_cache_clear_reaches_live_synthetic_nodes(self) -> None:
+        resolver = jinest.Resolver({}, globals={"factor": 1}, emit_messages=False)
+        synthetic = resolver.node({"value$": "factor"})
+        self.assertEqual(synthetic.value, 1)
+        resolver.update_globals({"factor": 2})
+        self.assertEqual(synthetic.value, 1)
+        resolver.clear_cache()
+        self.assertEqual(synthetic.value, 2)
+
+    def test_source_aware_file_helpers_use_anchor_document_base_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            source = folder / "plugin"
+            text = folder / "schema.txt"
+            text.write_text("schema", encoding="utf-8")
+            resolver = jinest.Resolver({}, emit_messages=False)
+            document = resolver.import_tree({}, source=source)
+            self.assertEqual(jinest.helpers.files.read_text("schema.txt", anchor=document), "schema")
+            self.assertEqual(jinest.helpers.files.file_path("schema.txt", anchor=document), text)
+
+    def test_literal_helpers_serialization_and_collections(self) -> None:
+        value = {"x$": "literal", "nested": {"value": "=$not_code"}}
+        escaped = jinest.helpers.runtime.literal(value)
+        resolver = jinest.Resolver({}, emit_messages=False)
+        self.assertEqual(resolver.resolve(escaped), value)
+        self.assertEqual(jinest.helpers.serialization.to_json({"data": b"\xff"}), '{\n  "data": "ÿ"\n}')
+        self.assertEqual(jinest.helpers.collections.union([{ "x": 1 }], [{ "x": 1 }, {"x": 2}]), [{"x": 1}, {"x": 2}])
+
+    def test_every_helper_namespace_uses_shared_runtime_primitives(self) -> None:
+        resolver = jinest.Resolver(
+            {"branch": {"value": 2}, "template$": "factor * 2"},
+            globals={"factor": 3}, emit_messages=False,
+        )
+        path = resolver.root.path.branch
+        self.assertEqual(jinest.helpers.path.path_of(resolver.root.branch), path)
+        self.assertEqual(jinest.helpers.path.source_path_of(resolver.root.branch).info.segments, ("branch",))
+        self.assertEqual(jinest.helpers.path.at(path, resolver=resolver).value, 2)
+        self.assertEqual(jinest.helpers.path.get(resolver.root.path.missing, "fallback", resolver=resolver), "fallback")
+        self.assertEqual(jinest.helpers.path.root_of(resolver.root.branch), resolver.root)
+        self.assertIsNone(jinest.helpers.path.source_file(resolver.root.branch))
+        self.assertTrue(jinest.helpers.path.source_dir(resolver.root.branch))
+        self.assertEqual(jinest.helpers.path.normalize_path(path), path)
+        self.assertEqual(jinest.helpers.path.absolute_path(path, resolver=resolver), path)
+        self.assertEqual(str(jinest.helpers.path.relative_path(path, resolver=resolver, base=resolver.root.path)), "context.branch")
+        self.assertEqual(jinest.helpers.runtime.eval("factor", resolver=resolver), 3)
+        self.assertEqual(jinest.helpers.runtime.render("{{ factor }}", resolver=resolver), "3")
+        self.assertEqual(jinest.helpers.runtime.script("% return factor", resolver=resolver), 3)
+        node = jinest.helpers.runtime.node({"x$": "factor"}, resolver=resolver)
+        self.assertEqual(jinest.helpers.runtime.resolve(node), {"x": 3})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            json_path = folder / "data.json"; json_path.write_text('{"x": 1}', encoding="utf-8")
+            yaml_path = folder / "data.yaml"; yaml_path.write_text('x: 2\n', encoding="utf-8")
+            text_path = folder / "note.txt"; text_path.write_text('one\ntwo\n', encoding="utf-8")
+            self.assertEqual(jinest.helpers.documents.load_json(json_path), {"x": 1})
+            self.assertEqual(jinest.helpers.documents.load_yaml(yaml_path), {"x": 2})
+            self.assertEqual(jinest.helpers.documents.import_json(json_path, resolver=resolver).x, 1)
+            self.assertEqual(jinest.helpers.documents.import_yaml(yaml_path, resolver=resolver).x, 2)
+            tree = jinest.helpers.documents.import_tree({"x$": "2"}, resolver=resolver, source="plugin://test/defaults")
+            self.assertEqual(tree.file, "plugin://test/defaults")
+            self.assertEqual(tree.x, 2)
+            self.assertEqual(jinest.helpers.files.file_path(text_path, resolver=resolver), text_path)
+            self.assertEqual(jinest.helpers.files.read_text(text_path, resolver=resolver), "one\ntwo\n")
+            self.assertEqual(jinest.helpers.files.read_lines(text_path, resolver=resolver), ["one", "two"])
+            self.assertEqual(jinest.helpers.files.read_bytes(text_path, resolver=resolver), b"one\ntwo\n")
+            self.assertTrue(jinest.helpers.files.file_exists(text_path, resolver=resolver))
+            output = folder / "out.json"
+            self.assertEqual(jinest.helpers.documents.export_json(node, output), '{\n  "x": 3\n}')
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"x": 3})
+            yaml_output = folder / "out.yaml"
+            self.assertIn("x: 3", jinest.helpers.documents.export_yaml(node, yaml_output))
+            self.assertTrue(yaml_output.is_file())
+            self.assertEqual(jinest.helpers.serialization.from_json('{"x": 1}'), {"x": 1})
+            self.assertEqual(jinest.helpers.serialization.from_yaml('x: 1\n'), {"x": 1})
+            self.assertIn('x: 3', jinest.helpers.serialization.to_yaml(node))
+            self.assertEqual(jinest.helpers.serialization.json_normalize(node), {"x": 3})
+            self.assertEqual(jinest.helpers.serialization.yaml_normalize(node), {"x": 3})
+            self.assertEqual(jinest.helpers.serialization.serialize(node, format="json"), '{\n  "x": 3\n}')
+
+        helpers = jinest.helpers.collections
+        self.assertEqual(helpers.combine({"x": {"a": 1}}, {"x": {"b": 2}}, recursive=True), {"x": {"a": 1, "b": 2}})
+        self.assertEqual(helpers.intersect([1, 2, 2], [2, 3]), [2])
+        self.assertEqual(helpers.difference([1, 2, 1], [2]), [1])
+        self.assertEqual(helpers.symmetric_difference([1, 2], [2, 3]), [1, 3])
+
+
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.18.0")
+        self.assertEqual(jinest.__version__, "0.19.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
