@@ -85,7 +85,7 @@ class JinestTestSuiteContractTests(unittest.TestCase):
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.17.1")
+        self.assertEqual(jinest.__version__, "0.18.0")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]
@@ -875,6 +875,286 @@ class JinestFunctionTests(unittest.TestCase):
             jinest.resolve(
                 {"square(x)$": "x * x", "result$": "square.__class__"}
             )
+
+
+class JinestOverlayControlTests(unittest.TestCase):
+    def test_direct_layers_are_lazy_and_follow_existing_precedence(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "target": {
+                    "<<=": {"rank": "direct", "lazy$": "missing.value"},
+                    "<<1=": {"rank": "numbered"},
+                    "<<$": "{'rank': 'native'}",
+                    "<<^": "% return {'rank': 'script'}\n",
+                    "<<[]": [{"rank": "multi"}],
+                    "rank": "local",
+                    # This public winner proves the unrelated lazy field in
+                    # the direct layer is never rendered during output.
+                    "lazy": "safe",
+                    "<<!=": {"rank": "override"},
+                    "<<!1=": {"rank": "numbered override"},
+                }
+            },
+            emit_messages=False,
+        )
+        # Binding the direct layer must not evaluate an unrelated field.
+        self.assertEqual(str(resolver.root.target.path), "global_root.target")
+        self.assertEqual(resolver.resolve(), {"target": {"rank": "numbered override", "lazy": "safe"}})
+
+        for body in (123, [], "=$mapping"):
+            with self.subTest(body=body), self.assertRaisesRegex(
+                jinest.JinestMergeError, "Direct merge"
+            ):
+                jinest.resolve({"target": {"<<=": body}}, emit_messages=False)
+
+    def test_tombstones_and_visibility_masks_share_lookup_with_output(self) -> None:
+        result = jinest.resolve(
+            {
+                "target": {
+                    "<<=": {"deleted": 1, "masked": 2, "public": 3},
+                    "<<1=": {"deleted-": None, "masked.": None},
+                    ".hidden": 4,
+                    "seen$": "masked + hidden",
+                },
+                "override": {
+                    "x": 10,
+                    "<<!=": {"x.": None},
+                    "inside$": "x",
+                },
+                "raw-`": 7,
+                "raw.`": 8,
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "target": {"public": 3, "seen": 6},
+                "override": {"inside": 10},
+                "raw-": 7,
+                "raw.": 8,
+            },
+        )
+
+        # A higher value recreates a tombstoned inherited field, while a
+        # higher hidden value recreates it only for lookup.
+        recreated = jinest.resolve(
+            {
+                "a": {"<<=": {"x": 1}, "<<1=": {"x-": None}, "x": 2},
+                "b": {"<<=": {"x": 1}, "<<1=": {"x-": None}, ".x": 2, "check$": "x"},
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(recreated, {"a": {"x": 2}, "b": {"check": 2}})
+
+        # Controls also apply to a public value declared in the same mapping.
+        # A mask preserves it for lookup; a tombstone removes the channel.
+        same_mapping = jinest.resolve(
+            {
+                "masked": {"x": 1, "x.": None, "seen$": "x"},
+                "deleted": {"x": 1, "x-": None},
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(same_mapping, {"masked": {"seen": 1}, "deleted": {}})
+
+        for key, value in (("x-", False), ("x-", 0), ("x.", "no"), ("x.", True)):
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                jinest.JinestError, "requires a null body"
+            ):
+                jinest.resolve({key: value}, emit_messages=False)
+
+    def test_hidden_layers_cover_all_source_modes_and_keep_nested_values_normal(self) -> None:
+        result = jinest.resolve(
+            {
+                "base": {"native": 1},
+                "target": {
+                    ".<<=": {"direct": 1, "nested": {"public": 2}},
+                    ".<<1$": "root.base",
+                    ".<<2^": "% return {'script': 3}\n",
+                    ".<<3[]": [{"many": 4}],
+                    ".<<!4=": {"override": 5},
+                    "sum$": "direct + native + script + many + override",
+                    "nested_copy": "=$nested",
+                },
+                "override_target": {
+                    "x": 10,
+                    ".<<!=": {"x": 5, "internal": 100},
+                    "answer$": "x + internal",
+                },
+                "reexposed": {".<<=": {"x": 1, "y": 2}, "x": 10},
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "base": {"native": 1},
+                "target": {"sum": 14, "nested_copy": {"public": 2}},
+                "override_target": {"x": 10, "answer": 105},
+                "reexposed": {"x": 10},
+            },
+        )
+
+        # Every canonical hidden spelling shares the regular layer grammar.
+        valid = (".<<=", ".<<1=", ".<<$", ".<<1$", ".<<^", ".<<1^", ".<<[]", ".<<1[]", ".<<!=", ".<<!1=", ".<<!$", ".<<!1$", ".<<!^", ".<<!1^", ".<<![]", ".<<!1[]")
+        for key in valid:
+            if key.endswith("="):
+                body = {"x": 1}
+            elif key.endswith("$"):
+                body = "{'x': 1}"
+            elif key.endswith("^"):
+                body = "% return {'x': 1}\n"
+            else:
+                body = [{"x": 1}]
+            with self.subTest(key=key):
+                self.assertEqual(jinest.resolve({"target": {key: body}}, emit_messages=False), {"target": {}})
+
+    def test_hidden_and_public_channels_are_independent(self) -> None:
+        resolver = jinest.Resolver(
+            {".x": 1, "x": 2, "lookup$": "x"},
+            emit_messages=False,
+        )
+        # Normal lookup is hidden first, while materialization is public only.
+        self.assertEqual(resolver.root.x, 1)
+        self.assertEqual(resolver.resolve(), {"x": 2, "lookup": 1})
+
+        result = jinest.resolve(
+            {
+                "defaults": {".x": 1, "x": 2},
+                "hidden_override": {
+                    "<<$": "root.defaults",
+                    ".x": 3,
+                    "lookup$": "x",
+                },
+                "public_override": {
+                    "<<$": "root.defaults",
+                    "x": 4,
+                    "lookup$": "x",
+                },
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {
+                "defaults": {"x": 2},
+                "hidden_override": {"x": 2, "lookup": 3},
+                "public_override": {"x": 4, "lookup": 1},
+            },
+        )
+
+    def test_public_mask_and_publication_do_not_change_hidden_lookup(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "defaults": {".x": 10, "x": 42},
+                "masked": {"<<$": "root.defaults", "x.": None, "lookup$": "x"},
+                "published": {"<<$": "root.defaults", "x$": "x"},
+            },
+            emit_messages=False,
+        )
+        # Access hidden first: the separate public cache must still serialize
+        # the public value rather than reusing this normal-lookup result.
+        self.assertEqual(resolver.root.masked.x, 10)
+        self.assertEqual(
+            resolver.resolve(),
+            {
+                "defaults": {"x": 42},
+                "masked": {"lookup": 10},
+                "published": {"x": 10},
+            },
+        )
+
+    def test_hidden_self_reference_does_not_fall_through_to_public_channel(self) -> None:
+        resolver = jinest.Resolver(
+            {".x$": "x", "x": 123},
+            emit_messages=False,
+        )
+        # Jinest's established field-cycle contract is None. The important
+        # invariant is that it does not fall through to public x == 123.
+        self.assertIsNone(resolver.root.x)
+        self.assertEqual(resolver.resolve(), {"x": 123})
+
+    def test_channel_specific_tombstones_and_control_conflicts(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "defaults": {".x": "secret", "x": "public"},
+                "hidden_deleted": {
+                    "<<$": "root.defaults",
+                    ".x-": None,
+                    "lookup$": "x",
+                },
+                "public_deleted": {
+                    "<<$": "root.defaults",
+                    "x-": None,
+                    "lookup$": "x",
+                },
+                # A final backtick is the explicit escape for the literal key.
+                "literal": {".x-`": "not a hidden tombstone"},
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            resolver.resolve(),
+            {
+                "defaults": {"x": "public"},
+                "hidden_deleted": {"x": "public", "lookup": "public"},
+                "public_deleted": {"lookup": "secret"},
+                "literal": {".x-": "not a hidden tombstone"},
+            },
+        )
+        self.assertEqual(len(resolver.messages), 1)
+        self.assertEqual(resolver.messages[0].level, "hint")
+
+        for key, value in (
+            ("x-", False),
+            (".x-", 0),
+            ("x.", "no"),
+            ("x.", True),
+        ):
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                jinest.JinestError, "requires a null body"
+            ):
+                jinest.resolve({key: value}, emit_messages=False)
+
+        with self.assertRaisesRegex(
+            jinest.JinestError,
+            "Conflicting declarations for public field 'x': DELETE and HIDE",
+        ):
+            jinest.resolve({"x-": None, "x.": None}, emit_messages=False)
+
+    def test_nested_overlay_schema_errors_keep_mapping_location(self) -> None:
+        resolver = jinest.Resolver(
+            {"outer": {"target": {"<<=": 1}}},
+            emit_messages=False,
+        )
+        with self.assertRaisesRegex(jinest.JinestMergeError, "Direct merge") as caught:
+            resolver.resolve()
+        self.assertEqual(caught.exception.path, "root.outer.target")
+        self.assertIsNone(caught.exception.file)
+
+    def test_overlay_grammar_and_dynamic_results_remain_literal(self) -> None:
+        for key in ("<<1!=", "<<1!$", ".<<1!=", "<<.=", ".<<!1.=", "<<1.="):
+            with self.subTest(key=key), self.assertRaisesRegex(
+                jinest.JinestError, "Invalid merge declaration"
+            ):
+                jinest.resolve({"target": {key: {"x": 1}}}, emit_messages=False)
+
+        result = jinest.resolve(
+            {
+                "names": ["x-", "x.", ".x", "<<=", ".<<="],
+                "=$names[0]": 1,
+                "=$names[1]": 2,
+                "=$names[2]": 3,
+                "=$names[3]": 4,
+                "=$names[4]": 5,
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            result,
+            {"names": ["x-", "x.", ".x", "<<=", ".<<="], "x-": 1, "x.": 2, ".x": 3, "<<=": 4, ".<<=": 5},
+        )
 
 
 class JinestMessageTests(unittest.TestCase):

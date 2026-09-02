@@ -1,0 +1,44 @@
+# Run from the repository root:
+#   python jinest.py examples/15_overlay_controls/example.yml --output-format yaml
+#
+# Direct layers are ordinary mappings, so this syntax works in YAML, JSON,
+# and Python. DELETE is channel-specific: `name-` removes public and `.name-`
+# removes hidden. HIDE (`name.`) keeps the public value usable but omits output.
+
+service:
+  # Direct default layer: this mapping is not evaluated as an expression.
+  <<=:
+    host: localhost
+    port: 8080
+    debug: true
+    # The two channels of `audience` are independent.
+    .audience: internal
+    audience: public
+
+  # Hidden direct layer: its values are available locally but not emitted.
+  .<<1=:
+    internal_token: abc123
+
+  # Overlay controls require null bodies.
+  debug-:
+  port.:
+
+  # Remove only the inherited hidden audience. Lookup now falls back to its
+  # independent public channel, which is still emitted.
+  .audience-:
+  audience_seen@: '{{ audience }}'
+
+  # `.secret` and `secret` are separate channels: templates read the hidden
+  # value first, while final output retains the independent public value.
+  .secret: local-secret
+  secret: published-secret
+  endpoint@: 'http://{{ host }}:{{ port }}/{{ internal_token }}/{{ secret }}'
+
+  # A hidden override wins lookup but remains hidden in the output.
+  .<<!2=:
+    retries: 5
+  summary@: '{{ host }} retries={{ retries }}'
+
+# Raw keys always remain literal and never become controls.
+"literal-`": kept as a literal key
+"literal.`": also literal

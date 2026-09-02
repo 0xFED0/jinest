@@ -1,0 +1,25 @@
+defaults:
+  .x: 10
+  x: 42
+config:
+  <<$: root.defaults
+  .x: 30
+  x: 50
+  lookup$: x
+masked:
+  <<$: root.defaults
+  x.:
+  lookup$: x
+published:
+  <<$: root.defaults
+  x$: x
+hidden_deleted:
+  # `.x-` removes only the inherited hidden channel.
+  <<$: root.defaults
+  .x-:
+  lookup$: x
+public_deleted:
+  # `x-` leaves the hidden channel available to ordinary lookup.
+  <<$: root.defaults
+  x-:
+  lookup$: x

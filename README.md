@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.17.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.18.0` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -175,11 +175,12 @@ structural construct; a scalar prefix declares an inline evaluator.
 | `=$expr`, `=@text`, `=^script` | Inline evaluator in a scalar value or mapping key |
 | `<$`, `<@`, `<^`, `<(args)=`, `<[axis=source]=` | Declaration applied to the current slot |
 | `key\`` | Raw key: remove one final backtick and disable key parsing |
-| `.name`, `.name$`, `.name@`, `.name^` | Hidden field |
-| `<<$`, `<<N$`, `<<^`, `<<N^` | Default layer |
-| `<<!$`, `<<!N$`, `<<!^`, `<<!N^` | Override layer |
-| `<<[]`, `<<N[]` | Multiple default layers from one list |
-| `<<![]`, `<<!N[]` | Multiple override layers from one list |
+| `.name`, `.name$`, `.name@`, `.name^` | Hidden value declaration |
+| `name-: null`, `.name-: null`, `name.: null` | Delete public/hidden channel, or mask public output |
+| `<<=`, `<<N=`, `<<$`, `<<N$`, `<<^`, `<<N^` | Default direct/evaluated layer |
+| `<<!=`, `<<!N=`, `<<!$`, `<<!N$`, `<<!^`, `<<!N^` | Override direct/evaluated layer |
+| `<<[]`, `<<N[]`, `<<![]`, `<<!N[]` | Multiple default/override layers from one list |
+| `.<<...` | Hidden variant of any layer form |
 
 Local field priority inside one mapping is:
 
@@ -230,7 +231,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.17.1
+  version: 0.18.0
   label@: "{{ product }} v{{ version }}"
 ```
 
@@ -413,10 +414,20 @@ tax: public text
 total$: "price + tax"
 ```
 
-When both `.name` and `name` exist, ordinary Jinest lookup of `name` resolves
-the hidden declaration. The public declaration remains independent and is used
-for final materialization; it is not reachable through normal lookup while the
-hidden declaration is in scope.
+`.name` and `name` are independent channels. Ordinary lookup checks the
+hidden channel first and then the public channel, while materialization reads
+only the public channel. Thus `.name` can provide an intermediate value without
+removing a sibling public `name` from output. A hint records this potentially
+surprising pair:
+
+```yaml
+.name: internal
+name: published
+observed@: "{{ name }}"
+```
+
+This materializes `name: published` and `observed: internal`. A public field
+can intentionally copy/publish a hidden value with `name$: name`.
 
 Hidden behavior applies to static concrete, `$`, `@`, and `^` fields. A raw key
 such as ``".name`"``, or a dynamic key whose result is `.name`, is a visible
@@ -430,8 +441,8 @@ or `"hint"`), `msg`, `path`, and `file`.
 
 A concrete unsuffixed field suppresses lower-priority field modes with the same
 logical name; every suppressed declaration gets a warning. If both `key` and
-`.key` exist, Jinest adds a hint because hidden lookup differs from final
-materialization.
+`.key` exist, Jinest adds a hint because lookup and materialization deliberately
+use different channels.
 
 By default messages are printed to stderr after successful resolution:
 
@@ -594,40 +605,106 @@ also work under raw or dynamic destination keys.
 
 ## Lazy layers
 
-Mappings may inherit lazy default and override layers:
-
-```yaml
-defaults:
-  host: localhost
-  port: 8000
-overrides:
-  port: 443
-
-service:
-  <<$: root.defaults
-  port: 8080
-  <<!^: |
-    % if force_secure
-      % return root.overrides
-    % endif
-    % return null
-```
-
-Materialization order is:
+Mappings can inherit defaults and overrides without eagerly merging them. The
+ordinary precedence remains:
 
 ```text
 defaults -> local fields -> overrides
 ```
 
-Lookup runs from highest to lowest precedence:
+Lookup runs from highest to lowest: last override, local declarations, then
+last default. Larger numeric order has higher priority; at equal order, later
+source declarations win. `!` always precedes the numeric order (`<<!2=`, never
+`<<2!=`).
 
-```text
-last override -> first override -> local -> last default -> first default
+A layer source can be evaluated or direct:
+
+```yaml
+service:
+  # `=` takes this direct mapping as a lazy layer. This syntax is valid in
+  # YAML and JSON; Python callers can equivalently pass {"<<=": mapping}.
+  <<=:
+    host: localhost
+    port: 8000
+
+  # `$` / `^` compute a mapping (or null, which is an empty layer).
+  <<1$: root.runtime_defaults
+  <<!2^: |
+    % return root.force_overrides
 ```
 
-`$` and `^` select only how the layer source is computed. Their body
-validation follows ordinary evaluator rules; the result must be a mapping or
-`null`. `null` means an empty layer.
+The direct forms are `<<=`, `<<N=`, `<<!=`, and `<<!N=`. Their body must be a
+mapping; `=` is not an evaluator. The mapping remains a normal lazy Jinest
+node, so unrelated fields in it are not rendered merely because it is layered.
+The evaluated forms `<<$` and `<<^` still require an expression/script result
+that is a mapping or `null`.
+
+Prefix any layer declaration with `.` to make values contributed by that layer
+hidden:
+
+```yaml
+service:
+  .<<=:
+    internal_token: abc
+  .<<!1=:
+    timeout: 5
+  public_url@: "https://{{ internal_token }}"
+```
+
+A hidden layer contributes its VALUE declarations to the hidden channel. They
+therefore win ordinary lookup over public values, but do not replace an
+independent public channel during materialization. This applies only to the
+top-level candidates contributed by the layer: nested mappings are not
+recursively rewritten. Controls keep their own channel semantics: `.x-` deletes a
+hidden candidate, while `x-` and `x.` affect only the public channel.
+
+### Field overlay controls
+
+These controls operate on one logical field and must have a `null` body:
+
+| Declaration | Meaning |
+|---|---|
+| `x: value` | Define a public value. |
+| `.x: value` | Define the hidden channel. It wins ordinary lookup but is not itself emitted. |
+| `x-: null` | Delete the public channel and stop searching lower public candidates. |
+| `.x-: null` | Delete the hidden channel and fall back to the public channel for ordinary lookup. |
+| `x.: null` | Preserve the public value for lookup, but hide the public channel from output. |
+
+For example:
+
+```yaml
+service:
+  <<=:
+    host: localhost
+    port: 8080
+    debug: true
+  debug-:             # absent from public lookup and output
+  port.:              # usable in templates, omitted from output
+  endpoint@: "{{ host }}:{{ port }}"
+```
+
+`x-` and `.x-` are symmetric channel-specific tombstones. Given:
+
+```yaml
+defaults:
+  .x: secret
+  x: public
+cfg:
+  <<$: defaults
+  .x-:
+```
+
+ordinary lookup of `x` in `cfg` returns `public`, and output retains
+`x: public`. Conversely, `x-:` leaves a hidden `.x` available to ordinary
+lookup but removes the public output. `x-:` and `x.:` cannot be declared for
+the same public field in one mapping: Jinest raises `Conflicting declarations
+for public field 'x': DELETE and HIDE`.
+
+A hidden value never removes a public value by itself; `port.` explicitly masks
+only the public channel. Ordinary lookup remains hidden-first, then public.
+Raw keys still take precedence: `"x-`"`, `".x-`"`, and `"x.`"` are literal
+keys named `x-`, `.x-`, and `x.`. Dynamic-key results are likewise final
+literal keys and are never re-parsed as controls or layers.
 
 ### Multiple layer sources
 
@@ -642,24 +719,15 @@ service:
     - =$root.common
     - =^% return root.platform_defaults
     - timeout: 30
-  <<!1[]:
-    - =$root.force_overrides
+  .<<!1[]:
+    - =$root.internal_overrides
 ```
 
 When `service` first needs its layer stack, Jinest expands the list topology
-into flat, cached lazy layer specs. Each item itself is evaluated only when its
-layer is needed; fields inside its resulting mapping remain lazy as well. Item
-order is preserved. Existing numeric ordering and `!` override behavior are
-unchanged; at the same numeric order, an ordinary `<<N$`/`<<N^` layer has
-higher effective precedence than `<<N[]`.
-
-The override marker always precedes the numeric order: use `<<!N$`,
-`<<!N^`, or `<<!N[]`. The old `<<N!$`, `<<N!^`, and `<<N![]` spellings are
-invalid declarations.
-
-Numbered keys use `N` as order; omitted `N` is `0`. Default and override
-families are sorted independently. Larger `N` has higher lookup priority; at
-equal `N`, the later source declaration wins.
+into flat, cached lazy layer specs. Each item is evaluated only when its layer
+is needed; fields inside the resulting mapping remain lazy. At one numeric
+order, an ordinary single layer (`<<N=`, `<<N$`, or `<<N^`) has higher effective
+precedence than expanded `<<N[]` items.
 
 ## Lazy evaluations in arrays
 
@@ -1067,7 +1135,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The suite contains 143 Python regression tests and 47 implementation-neutral
+The suite contains 168 Python regression tests and 60 implementation-neutral
 portable CLI fixtures.
 
 ## Security

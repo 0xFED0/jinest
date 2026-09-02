@@ -1,0 +1,14 @@
+defaults:
+  x: 42
+config:
+  x: 50
+  lookup: 30
+masked:
+  lookup: 10
+published:
+  x: 10
+hidden_deleted:
+  x: 42
+  lookup: 42
+public_deleted:
+  lookup: 10

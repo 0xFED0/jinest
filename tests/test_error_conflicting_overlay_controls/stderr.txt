@@ -1,0 +1,1 @@
+jinest: Conflicting declarations for public field 'x': DELETE and HIDE

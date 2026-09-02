@@ -1,0 +1,9 @@
+service:
+  host: localhost
+  audience: public
+  audience_seen: public
+  secret: published-secret
+  endpoint: http://localhost:8080/abc123/local-secret
+  summary: localhost retries=5
+literal-: kept as a literal key
+literal.: also literal

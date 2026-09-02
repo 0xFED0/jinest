@@ -1,0 +1,22 @@
+service:
+  <<=:
+    host: localhost
+    port: 8080
+    debug: true
+  .<<1=:
+    internal: token
+  debug-:
+  port.:
+  label@: '{{ host }}:{{ port }}:{{ internal }}'
+  .<<!2=:
+    retries: 5
+  summary@: '{{ retries }}'
+same_mapping_mask:
+  # The mask hides the local public value but does not make it unavailable.
+  x: 1
+  x.:
+  seen$: x
+same_mapping_delete:
+  # The tombstone deletes even a public value from this same mapping.
+  x: 1
+  x-:

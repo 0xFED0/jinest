@@ -1,0 +1,7 @@
+service:
+  host: localhost
+  label: localhost:8080:token
+  summary: '5'
+same_mapping_mask:
+  seen: 1
+same_mapping_delete: {}

@@ -1,1 +1,1 @@
-jinest: Invalid merge declaration '<<1!$'; use '<<!N' before the mode
+jinest: Invalid merge declaration '<<1!$'; place '!' before the numeric order

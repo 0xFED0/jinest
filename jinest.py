@@ -16,8 +16,10 @@ Syntax
   body rebound at each call site.
 * ``name+``, ``name~``, ``name*``, and ``name%`` — strict array transforms:
   one-level flatten, string join, Cartesian product, and equal-length zip.
-* ``.name`` — a hidden field, available to Jinja as ``name`` but omitted from
-  the final resolved mapping.
+* ``.name`` — the hidden channel, available to Jinja as ``name`` while a
+  sibling public ``name`` remains independently materialized; ``name-: null``
+  deletes public, ``.name-: null`` deletes hidden, and ``name.: null`` hides
+  public output.
 * A key ending in a backtick is a raw literal key; all Jinest key parsing is
   disabled and the marker is removed.
 * ``=$expr``, ``=@text``, and ``=^script`` — inline scalar directives for
@@ -26,9 +28,12 @@ Syntax
 * ``<$``, ``<@``, ``<^``, ``<(args)=``, and ``<[axis=source]=`` — self-declaration
   wrappers that apply one declaration to the current value slot.
 * Local priority is ``name`` > ``name^`` > ``name$`` > ``name@``.
-* ``<<$`` / ``<<N$`` and ``<<^`` / ``<<N^`` add lazy default layers.
-* ``<<!$`` / ``<<!N$`` and ``<<!^`` / ``<<!N^`` add lazy override layers.
+* ``<<=`` / ``<<N=`` attach direct mapping default layers; ``<<!=`` /
+  ``<<!N=`` are their override variants.
+* ``<<$`` / ``<<N$`` and ``<<^`` / ``<<N^`` add evaluated default layers.
+* ``<<!$`` / ``<<!N$`` and ``<<!^`` / ``<<!N^`` add evaluated override layers.
 * ``<<[]`` / ``<<N[]`` and their ``!`` variants expand a list of lazy layers.
+* Prefixing any layer form with ``.`` makes the values it contributes hidden.
 * Lookup priority is last override, local, last default.
 * ``context`` is the destination node, ``origin`` is the source declaration
   node, ``root`` is the source tree root, and ``global_root`` is the top-level
@@ -93,7 +98,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.17.1"
+__version__ = "0.18.0"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -120,12 +125,12 @@ _RESERVED_NAMES = {
     "source_file",
 }
 _MERGE_RE = re.compile(
-    # ``!`` is always before the numeric order. ``[]`` is source multiplicity,
-    # not an evaluator mode.
-    r"^<<(?P<leading_override>!?)(?P<order>\d*)"
-    r"(?P<mode>[$^]|\[\])$"
+    # ``!`` is always before the numeric order. ``[]`` changes source
+    # multiplicity, while ``=`` accepts an already parsed mapping directly.
+    r"^(?P<hidden>\.)?<<(?P<leading_override>!?)(?P<order>\d*)"
+    r"(?P<mode>=|[$^]|\[\])$"
 )
-_INVALID_LEGACY_MERGE_RE = re.compile(r"^<<\d+!(?:[$^]|\[\])$")
+_INVALID_LEGACY_MERGE_RE = re.compile(r"^\.?<<\d+!(?:=|[$^]|\[\])$")
 _MISSING = object()
 _EMPTY_MAPPING: Mapping[Any, Any] = {}
 _NODE_META_NAMES = {"path", "source_path", "root", "file"}
@@ -283,7 +288,9 @@ class _LayerSpec:
     order: int
     position: int
     override: bool
-    mode: EvaluatorKind
+    mode: EvaluatorKind | None
+    direct: bool = False
+    hidden: bool = False
     multiple: bool = False
     item_sequence: "_SequenceProxy | None" = None
     item_index: int | None = None
@@ -296,6 +303,7 @@ class _LayerValue:
     source: _Source
     local_vars: Mapping[str, Any] | None = None
     context_origin_source: _Source | None = None
+    hidden: bool = False
 
 
 @dataclass(slots=True)
@@ -310,7 +318,26 @@ class _LayerStack:
 class _Candidate:
     source_key: Any
     template: Any
-    mode: str  # concrete, native, text
+    mode: str  # concrete, evaluator, compose, or function
+    behavior: str = "value"  # value, delete, hide
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateLocation:
+    """One field candidate together with its lazy source context."""
+
+    candidate: _Candidate
+    source: _Source
+    local_vars: Mapping[str, Any] | None = None
+    context_origin_source: _Source | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FieldMatch:
+    """The first effective VALUE candidate and its output visibility."""
+
+    location: _CandidateLocation
+    masked: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -569,6 +596,19 @@ def _literal_syntax_key(key: Any) -> bool:
         or _inline_directive(key) is not None
         or _escaped_inline_literal(key) is not None
     )
+
+
+def _field_control_key(key: Any) -> tuple[str, str, str] | None:
+    """Parse channel-specific DELETE/HIDE controls after key escaping."""
+    if not isinstance(key, str) or _literal_syntax_key(key):
+        return None
+    if key.endswith("-"):
+        if key.startswith("."):
+            return key[1:-1], "hidden", "delete"
+        return key[:-1], "public", "delete"
+    if key.endswith(".") and not key.startswith("."):
+        return key[:-1], "public", "hide"
+    return None
 
 
 def _parse_function_declaration(key: Any, template: Any = _MISSING) -> _FunctionSpec | None:
@@ -2234,11 +2274,15 @@ class Resolver:
         if not isinstance(key, str) or _literal_syntax_key(key):
             return None
         match = _MERGE_RE.fullmatch(key)
-        if match is None and _INVALID_LEGACY_MERGE_RE.fullmatch(key):
-            raise JinestError(
-                f"Invalid merge declaration {key!r}; use '<<!N' before the mode"
-            )
-        return match
+        if match is not None:
+            return match
+        if key.startswith("<<") or key.startswith(".<<"):
+            if _INVALID_LEGACY_MERGE_RE.fullmatch(key):
+                detail = "place '!' before the numeric order"
+            else:
+                detail = "use <<, <<!, <<N, or <<!N followed by $, ^, =, or []"
+            raise JinestError(f"Invalid merge declaration {key!r}; {detail}")
+        return None
 
     @classmethod
     def _template_key(cls, key: Any) -> tuple[Any, str] | None:
@@ -2288,6 +2332,7 @@ class Resolver:
                 return True
             return (
                 self._merge_key(entry.source_key) is None
+                and _field_control_key(entry.source_key) is None
                 and _parse_compose_declaration(
                     entry.source_key, source.raw[entry.source_key]
                 )
@@ -2399,6 +2444,8 @@ class Resolver:
 
         if not entry.raw and not entry.dynamic:
             if self._merge_key(source_key) is not None:
+                return None
+            if _field_control_key(source_key) is not None:
                 return None
             function = _parse_function_declaration(source_key)
             if function is not None:
@@ -2752,6 +2799,7 @@ class Resolver:
                 not isinstance(key, str)
                 or _literal_syntax_key(key)
                 or self._merge_key(key)
+                or _field_control_key(key) is not None
             ):
                 continue
             if (
@@ -2805,7 +2853,7 @@ class Resolver:
             self._record_message(
                 "hint",
                 f"Hidden field '.{logical}' takes priority over field {logical!r} "
-                "in template calculations; the public field remains in the final dump",
+                "in template calculations; the public field remains independently materialized",
                 dedupe_key=("hint", source.document_id, logical),
                 source=source,
             )
@@ -2814,9 +2862,14 @@ class Resolver:
         return self._syntax.compile(raw)
 
     def _schema_for_source(self, source: _Source) -> CompiledMapping:
-        schema = self._schema(source.raw)
-        self._record_schema_messages(source)
-        return schema
+        try:
+            schema = self._schema(source.raw)
+            self._record_schema_messages(source)
+            return schema
+        except Exception as exc:
+            path, file = self._source_location(source)
+            self._annotate_error(exc, path=path, file=file)
+            raise
 
     @staticmethod
     def _ordered_layers(layers: Sequence[_LayerSpec]) -> tuple[_LayerSpec, ...]:
@@ -2955,6 +3008,7 @@ class Resolver:
                     position=spec.position,
                     override=spec.override,
                     mode=EvaluatorKind.NATIVE,
+                    hidden=spec.hidden,
                     multiple=True,
                     item_sequence=sequence,
                     item_index=index,
@@ -2996,6 +3050,7 @@ class Resolver:
         composes: list[_ComposeSpec] = []
         function_names: set[str] = set()
         compose_names: set[str] = set()
+        public_controls: dict[str, str] = {}
         for position, (key, template) in enumerate(raw.items()):
             compose = _parse_compose_declaration(key, template)
             if compose is not None:
@@ -3018,12 +3073,35 @@ class Resolver:
                 functions.append(function)
                 continue
 
+            control = _field_control_key(key)
+            if control is not None:
+                logical, channel, behavior = control
+                if template is not None:
+                    raise JinestError(
+                        f"Field {key!r} is a {behavior} control and requires a null body"
+                    )
+                if channel == "public":
+                    previous = public_controls.get(logical)
+                    if previous is not None and previous != behavior:
+                        raise JinestError(
+                            f"Conflicting declarations for public field {logical!r}: "
+                            "DELETE and HIDE"
+                        )
+                    public_controls[logical] = behavior
+
             match = self._merge_key(key)
             if match is None:
                 continue
             order_text = match.group("order")
             order = int(order_text) if order_text else 0
-            multiple = match.group("mode") == "[]"
+            mode_text = match.group("mode")
+            multiple = mode_text == "[]"
+            direct = mode_text == "="
+            if direct and not isinstance(template, Mapping):
+                raise JinestMergeError(
+                    f"Direct merge {key!r} requires a mapping body, got "
+                    f"{type(template).__name__}"
+                )
             spec = _LayerSpec(
                 source_key=key,
                 template=template,
@@ -3032,9 +3110,11 @@ class Resolver:
                 override=bool(match.group("leading_override")),
                 mode=(
                     EvaluatorKind.SCRIPT
-                    if match.group("mode") == "^"
-                    else EvaluatorKind.NATIVE
+                    if mode_text == "^"
+                    else EvaluatorKind.NATIVE if not direct else None
                 ),
+                direct=direct,
+                hidden=bool(match.group("hidden")),
                 multiple=multiple,
             )
             (overrides if spec.override else defaults).append(spec)
@@ -3049,6 +3129,8 @@ class Resolver:
             ):
                 continue
             if self._merge_key(key):
+                continue
+            if _field_control_key(key) is not None:
                 continue
             template_info = self._template_key(key)
             logical = template_info[0] if template_info else key
@@ -3082,68 +3164,137 @@ class Resolver:
         )
         return schema
 
-    def _local_candidate(
+    def _local_candidates(
         self,
         source: _Source,
         bind: _MappingProxy,
         key: Any,
         *,
-        hidden: bool,
+        channel: str,
+        source_hidden: bool,
         local_vars: Mapping[str, Any] | None = None,
         context_origin_source: _Source | None = None,
-    ) -> _Candidate | None:
-        """Return one local declaration from the hidden or public namespace."""
-        source_key = f".{key}" if hidden and isinstance(key, str) else key
-        if not hidden and isinstance(source_key, str):
-            for compose in self._schema_for_source(source).composes:
-                if compose.name == source_key:
-                    return _Candidate(
-                        compose.source_key,
-                        compose.template,
-                        f"compose_{compose.mode}",
-                    )
+    ) -> tuple[_Candidate, ...]:
+        """Return value/control candidates for one independent field channel.
+
+        ``.x`` and ``x`` are distinct channels.  A hidden layer redirects
+        ordinary values from its source into the hidden channel, but never
+        redirects DELETE/HIDE controls: those operate on public output only.
+        """
         entries = self._mapping_entries(
             source,
             bind,
             local_vars=local_vars,
             context_origin_source=context_origin_source,
         )
-        for concrete in entries:
-            if concrete.key != source_key:
-                continue
-            if (
-                concrete.raw
-                or concrete.dynamic
-                or self._template_key(concrete.source_key) is None
-            ):
-                if (
-                    self._merge_key(concrete.source_key) is None
-                    and _parse_compose_declaration(
-                        concrete.source_key, source.raw[concrete.source_key]
-                    ) is None
-                    and _parse_function_declaration(concrete.source_key) is None
-                ):
-                    return _Candidate(
-                        concrete.source_key,
-                        source.raw[concrete.source_key],
-                        "concrete",
-                    )
 
-        if isinstance(source_key, str):
-            for suffix, mode in _FIELD_SUFFIX_MODES:
-                physical = f"{source_key}{suffix}"
-                for entry in entries:
-                    if entry.key == physical and not entry.raw and not entry.dynamic:
+        def value_candidate(
+            physical: Any,
+            *,
+            explicit_hidden: bool,
+        ) -> _Candidate | None:
+            for entry in entries:
+                if entry.key != physical:
+                    continue
+                if entry.raw or entry.dynamic:
+                    # A raw/dynamic leading dot remains a literal final key,
+                    # not an explicit hidden declaration.  A hidden *layer*
+                    # may still redirect a literal public key into hidden.
+                    if not explicit_hidden:
                         return _Candidate(
                             entry.source_key,
                             source.raw[entry.source_key],
-                            mode,
+                            "concrete",
                         )
-        return None
+                    continue
+                if (
+                    self._merge_key(entry.source_key) is not None
+                    or _field_control_key(entry.source_key) is not None
+                    or _parse_compose_declaration(
+                        entry.source_key, source.raw[entry.source_key]
+                    ) is not None
+                    or _parse_function_declaration(entry.source_key) is not None
+                ):
+                    continue
+                if self._template_key(entry.source_key) is None:
+                    return _Candidate(
+                        entry.source_key,
+                        source.raw[entry.source_key],
+                        "concrete",
+                    )
 
-    @staticmethod
-    def _hidden_name(key: Any) -> bool:
-        return isinstance(key, str) and not key.startswith(".")
+            if isinstance(physical, str):
+                for suffix, mode in _FIELD_SUFFIX_MODES:
+                    expected = f"{physical}{suffix}"
+                    for entry in entries:
+                        if (
+                            entry.key == expected
+                            and not entry.raw
+                            and not entry.dynamic
+                        ):
+                            return _Candidate(
+                                entry.source_key,
+                                source.raw[entry.source_key],
+                                mode,
+                            )
+            return None
+
+        candidates: list[_Candidate] = []
+        if not isinstance(key, str) or key.startswith("."):
+            # Explicit physical access remains compatible with the historical
+            # mapping protocol. It never activates hidden-channel fallback.
+            candidate = value_candidate(key, explicit_hidden=False)
+            return () if candidate is None else (candidate,)
+
+        if channel not in {"hidden", "public"}:  # defensive invariant
+            raise JinestError(f"Unsupported field channel {channel!r}")
+
+        # Controls precede values in their own channel. A tombstone stops
+        # lower candidates; a public HIDE preserves lookup but masks output.
+        for entry in entries:
+            if entry.raw or entry.dynamic:
+                continue
+            control = _field_control_key(entry.source_key)
+            if (
+                control is None
+                or control[0] != key
+                or control[1] != channel
+            ):
+                continue
+            candidates.append(
+                _Candidate(
+                    entry.source_key,
+                    source.raw[entry.source_key],
+                    "concrete",
+                    behavior=control[2],
+                )
+            )
+
+        if channel == "hidden":
+            explicit = value_candidate(f".{key}", explicit_hidden=True)
+            if explicit is not None:
+                candidates.append(explicit)
+            if source_hidden:
+                inherited_public = value_candidate(key, explicit_hidden=False)
+                if inherited_public is not None:
+                    candidates.append(inherited_public)
+            return tuple(candidates)
+
+        if not source_hidden:
+            for compose in self._schema_for_source(source).composes:
+                if compose.name == key:
+                    candidates.append(
+                        _Candidate(
+                            compose.source_key,
+                            compose.template,
+                            f"compose_{compose.mode}",
+                        )
+                    )
+                    break
+            public_value = value_candidate(key, explicit_hidden=False)
+            if public_value is not None:
+                candidates.append(public_value)
+        return tuple(candidates)
 
     def _local_function(self, source: _Source, key: Any) -> _FunctionSpec | None:
         if not isinstance(key, str) or key.startswith("."):
@@ -3157,69 +3308,34 @@ class Resolver:
     def _function_value(self, source: _Source, spec: _FunctionSpec) -> JinestFunction:
         return JinestFunction(self, spec, source)
 
-    def _scope_has_logical(self, scope: _MappingProxy, key: Any) -> bool:
-        resolved = object.__getattribute__(scope, "_jinest_resolved")
-        if key in resolved:
-            return True
-        source = object.__getattribute__(scope, "_jinest_source")
-        context_origin_source = object.__getattribute__(
-            scope, "_jinest_binding"
-        ).frame.context_origin_source
-        return self._contains(
-            source,
-            key,
-            bind=scope,
-            active=set(),
-            hidden=None,
-            context_origin_source=context_origin_source,
-        )
-
-    def _contains(
+    def _iter_field_candidates(
         self,
         source: _Source,
         key: Any,
         *,
         bind: _MappingProxy,
         active: set[tuple[Any, ...]],
-        hidden: bool | None,
+        channel: str,
+        source_hidden: bool = False,
         local_vars: Mapping[str, Any] | None = None,
         context_origin_source: _Source | None = None,
-    ) -> bool:
+    ) -> Iterator[_CandidateLocation]:
+        """Yield candidates in one channel from highest to lowest precedence."""
         if context_origin_source is None:
             context_origin_source = object.__getattribute__(
                 bind, "_jinest_binding"
             ).frame.context_origin_source
-        if hidden is None:
-            if self._hidden_name(key) and self._contains(
-                source,
-                key,
-                bind=bind,
-                active=active,
-                hidden=True,
-                local_vars=local_vars,
-                context_origin_source=context_origin_source,
-            ):
-                return True
-            return self._contains(
-                source,
-                key,
-                bind=bind,
-                active=active,
-                hidden=False,
-                local_vars=local_vars,
-                context_origin_source=context_origin_source,
-            )
-
         token = (
             id(source.resolver),
             id(source.raw),
             self._hashable_key(key),
-            hidden,
+            channel,
+            source_hidden,
             id(local_vars) if local_vars is not None else None,
             id(context_origin_source) if context_origin_source is not None else None,
         )
         if token in active:
-            return False
+            return
         active.add(token)
         try:
             defaults, overrides = self._layer_stack(
@@ -3228,7 +3344,6 @@ class Resolver:
                 local_vars=local_vars,
                 context_origin_source=context_origin_source,
             )
-
             for layer in reversed(overrides):
                 layer_value = self._evaluate_layer(
                     bind,
@@ -3237,30 +3352,46 @@ class Resolver:
                     local_vars=local_vars,
                     context_origin_source=context_origin_source,
                 )
-                if self._contains(
+                yield from self._iter_field_candidates(
                     layer_value.source,
                     key,
                     bind=bind,
                     active=active,
-                    hidden=hidden,
+                    channel=channel,
+                    source_hidden=source_hidden or layer_value.hidden,
                     local_vars=layer_value.local_vars,
                     context_origin_source=(
                         layer_value.context_origin_source or context_origin_source
                     ),
-                ):
-                    return True
+                )
 
-            if not hidden and self._local_function(source, key) is not None:
-                return True
-            if self._local_candidate(
+            # Functions are helpers, never materialized fields. They remain
+            # reachable through public lookup regardless of layer visibility.
+            if channel == "public":
+                function = self._local_function(source, key)
+                if function is not None:
+                    yield _CandidateLocation(
+                        _Candidate(function.source_key, function, "function"),
+                        source,
+                        local_vars,
+                        context_origin_source,
+                    )
+
+            for candidate in self._local_candidates(
                 source,
                 bind,
                 key,
-                hidden=hidden,
+                channel=channel,
+                source_hidden=source_hidden,
                 local_vars=local_vars,
                 context_origin_source=context_origin_source,
-            ) is not None:
-                return True
+            ):
+                yield _CandidateLocation(
+                    candidate,
+                    source,
+                    local_vars,
+                    context_origin_source,
+                )
 
             for layer in reversed(defaults):
                 layer_value = self._evaluate_layer(
@@ -3270,27 +3401,78 @@ class Resolver:
                     local_vars=local_vars,
                     context_origin_source=context_origin_source,
                 )
-                if self._contains(
+                yield from self._iter_field_candidates(
                     layer_value.source,
                     key,
                     bind=bind,
                     active=active,
-                    hidden=hidden,
+                    channel=channel,
+                    source_hidden=source_hidden or layer_value.hidden,
                     local_vars=layer_value.local_vars,
                     context_origin_source=(
                         layer_value.context_origin_source or context_origin_source
                     ),
-                ):
-                    return True
-            return False
+                )
         finally:
             active.remove(token)
+
+    def _find_field(
+        self,
+        source: _Source,
+        key: Any,
+        *,
+        bind: _MappingProxy,
+        channel: str,
+        local_vars: Mapping[str, Any] | None = None,
+        context_origin_source: _Source | None = None,
+    ) -> _FieldMatch | object:
+        """Select one candidate in the hidden or public field channel."""
+        masked = False
+        for location in self._iter_field_candidates(
+            source,
+            key,
+            bind=bind,
+            active=set(),
+            channel=channel,
+            local_vars=local_vars,
+            context_origin_source=context_origin_source,
+        ):
+            behavior = location.candidate.behavior
+            if channel == "public" and behavior == "hide":
+                masked = True
+                continue
+            if behavior == "delete":
+                return _MISSING
+            return _FieldMatch(location, masked)
+        return _MISSING
+
+    def _scope_has_logical(self, scope: _MappingProxy, key: Any) -> bool:
+        resolved = object.__getattribute__(scope, "_jinest_resolved")
+        if key in resolved:
+            return True
+        source = object.__getattribute__(scope, "_jinest_source")
+        context_origin_source = object.__getattribute__(
+            scope, "_jinest_binding"
+        ).frame.context_origin_source
+        return self._find_field(
+            source,
+            key,
+            bind=scope,
+            channel="hidden",
+            context_origin_source=context_origin_source,
+        ) is not _MISSING or self._find_field(
+            source,
+            key,
+            bind=scope,
+            channel="public",
+            context_origin_source=context_origin_source,
+        ) is not _MISSING
 
     def _get_field(self, scope: _MappingProxy, key: Any) -> Any:
         return self._get_cached_field(scope, key, public=False)
 
     def _get_public_field(self, scope: _MappingProxy, key: Any) -> Any:
-        """Resolve a key for serialization, ignoring its hidden declaration."""
+        """Resolve the public-channel candidate selected by ``_public_keys``."""
         return self._get_cached_field(scope, key, public=True)
 
     def _get_cached_field(
@@ -3305,13 +3487,7 @@ class Resolver:
         object.__getattribute__(scope, "_jinest_children").pop(key, None)
         try:
             source = object.__getattribute__(scope, "_jinest_source")
-            value = self._lookup(
-                source,
-                key,
-                bind=scope,
-                active=set(),
-                hidden=False if public else None,
-            )
+            value = self._lookup(source, key, bind=scope, public=public)
             if value is _MISSING:
                 raise KeyError(key)
         except Exception:
@@ -3328,125 +3504,35 @@ class Resolver:
         key: Any,
         *,
         bind: _MappingProxy,
-        active: set[tuple[Any, ...]],
-        hidden: bool | None,
+        public: bool = False,
         local_vars: Mapping[str, Any] | None = None,
         context_origin_source: _Source | None = None,
     ) -> Any:
-        """Look up a key, preferring the hidden namespace when requested."""
-        if context_origin_source is None:
-            context_origin_source = object.__getattribute__(
-                bind, "_jinest_binding"
-            ).frame.context_origin_source
-        if hidden is None:
-            if self._hidden_name(key):
-                value = self._lookup(
-                    source,
-                    key,
-                    bind=bind,
-                    active=active,
-                    hidden=True,
-                    local_vars=local_vars,
-                    context_origin_source=context_origin_source,
-                )
-                if value is not _MISSING:
-                    return value
-            return self._lookup(
+        """Resolve normal lookup (hidden then public) or public-only lookup."""
+        channels = ("public",) if public else ("hidden", "public")
+        for channel in channels:
+            match = self._find_field(
                 source,
                 key,
                 bind=bind,
-                active=active,
-                hidden=False,
+                channel=channel,
                 local_vars=local_vars,
                 context_origin_source=context_origin_source,
             )
-
-        token = (
-            id(source.resolver),
-            id(source.raw),
-            self._hashable_key(key),
-            hidden,
-            id(local_vars) if local_vars is not None else None,
-            id(context_origin_source) if context_origin_source is not None else None,
-        )
-        if token in active:
-            return _MISSING
-        active.add(token)
-        try:
-            defaults, overrides = self._layer_stack(
-                source,
+            if match is _MISSING:
+                continue
+            if not isinstance(match, _FieldMatch):  # defensive invariant
+                raise JinestError("Malformed field lookup result")
+            location = match.location
+            return self._resolve_candidate(
+                location.candidate,
+                location.source,
                 bind,
-                local_vars=local_vars,
-                context_origin_source=context_origin_source,
+                key,
+                local_vars=location.local_vars,
+                context_origin_source=location.context_origin_source,
             )
-
-            # Reverse lookup of: defaults -> local -> overrides.
-            for layer in reversed(overrides):
-                layer_value = self._evaluate_layer(
-                    bind,
-                    source,
-                    layer,
-                    local_vars=local_vars,
-                    context_origin_source=context_origin_source,
-                )
-                value = self._lookup(
-                    layer_value.source,
-                    key,
-                    bind=bind,
-                    active=active,
-                    hidden=hidden,
-                    local_vars=layer_value.local_vars,
-                    context_origin_source=(
-                        layer_value.context_origin_source or context_origin_source
-                    ),
-                )
-                if value is not _MISSING:
-                    return value
-
-            if not hidden:
-                function = self._local_function(source, key)
-                if function is not None:
-                    return self._function_value(source, function)
-
-            candidate = self._local_candidate(
-                source, bind, key, hidden=hidden, local_vars=local_vars,
-                context_origin_source=context_origin_source,
-            )
-            if candidate is not None:
-                return self._resolve_candidate(
-                    candidate,
-                    source,
-                    bind,
-                    key,
-                    local_vars=local_vars,
-                    context_origin_source=context_origin_source,
-                )
-
-            for layer in reversed(defaults):
-                layer_value = self._evaluate_layer(
-                    bind,
-                    source,
-                    layer,
-                    local_vars=local_vars,
-                    context_origin_source=context_origin_source,
-                )
-                value = self._lookup(
-                    layer_value.source,
-                    key,
-                    bind=bind,
-                    active=active,
-                    hidden=hidden,
-                    local_vars=layer_value.local_vars,
-                    context_origin_source=(
-                        layer_value.context_origin_source or context_origin_source
-                    ),
-                )
-                if value is not _MISSING:
-                    return value
-
-            return _MISSING
-        finally:
-            active.remove(token)
+        return _MISSING
 
     def _resolve_compose(
         self,
@@ -3600,6 +3686,11 @@ class Resolver:
         local_vars: Mapping[str, Any] | None = None,
         context_origin_source: _Source | None = None,
     ) -> Any:
+        if candidate.mode == "function":
+            if not isinstance(candidate.template, _FunctionSpec):
+                raise JinestError(f"Malformed function declaration {candidate.source_key!r}")
+            return self._function_value(source, candidate.template)
+
         if candidate.mode.startswith("compose_"):
             spec = _parse_compose_declaration(candidate.source_key, candidate.template)
             if spec is None:
@@ -3752,10 +3843,14 @@ class Resolver:
 
         cache[cache_key] = None
         try:
-            value = (
-                layer.item_sequence[layer.item_index]
-                if layer.item_sequence is not None and layer.item_index is not None
-                else self._render(
+            if layer.item_sequence is not None and layer.item_index is not None:
+                value = layer.item_sequence[layer.item_index]
+            elif layer.direct:
+                value = layer.template
+            else:
+                if layer.mode is None:  # defensive parser invariant
+                    raise JinestError(f"Merge {layer.source_key!r} has no evaluator")
+                value = self._render(
                     bind,
                     layer.template,
                     mode=layer.mode,
@@ -3764,7 +3859,6 @@ class Resolver:
                     local_vars=local_vars,
                     context_origin_source=context_origin_source,
                 )
-            )
 
             if value is None:
                 result = _LayerValue(
@@ -3772,7 +3866,8 @@ class Resolver:
                         owner_source.resolver,
                         _EMPTY_MAPPING,
                         owner_source.source_path + (layer.source_key,),
-                    )
+                    ),
+                    hidden=layer.hidden,
                 )
             elif isinstance(value, _MappingProxy):
                 frame = object.__getattribute__(value, "_jinest_binding").frame
@@ -3795,6 +3890,7 @@ class Resolver:
                     value_source,
                     frame.local_vars,
                     value_context_origin,
+                    layer.hidden,
                 )
             elif isinstance(value, Mapping):
                 result = _LayerValue(
@@ -3802,7 +3898,8 @@ class Resolver:
                         owner_source.resolver,
                         value,
                         owner_source.source_path + (layer.source_key,),
-                    )
+                    ),
+                    hidden=layer.hidden,
                 )
             else:
                 self._raise_merge_type_error(
@@ -4761,7 +4858,23 @@ class Resolver:
             local_vars=None,
             context_origin_source=context_origin_source,
         )
-        return result
+        # Key collection discovers possible names without forcing their values.
+        # The unified lookup then applies tombstones and visibility masks.
+        return [
+            key
+            for key in result
+            if (
+                match := self._find_field(
+                    source,
+                    key,
+                    bind=scope,
+                    channel="public",
+                    context_origin_source=context_origin_source,
+                )
+            ) is not _MISSING
+            and isinstance(match, _FieldMatch)
+            and not match.masked
+        ]
 
     def _collect_keys(
         self,
@@ -4822,6 +4935,8 @@ class Resolver:
                     logical = entry.key
                 elif not entry.raw and not entry.dynamic:
                     if self._merge_key(source_key):
+                        continue
+                    if _field_control_key(source_key) is not None:
                         continue
                     if _parse_function_declaration(source_key) is not None:
                         continue
