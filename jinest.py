@@ -104,7 +104,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.19.0"
+__version__ = "0.19.1"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -2087,7 +2087,9 @@ class _MathStdlib(_StdlibNamespace):
 
 
 def _regex_flags(ignorecase: bool = False, multiline: bool = False, dotall: bool = False) -> re.RegexFlag:
-    flags = re.NOFLAG
+    # ``re.NOFLAG`` was added in Python 3.11.  The zero-valued RegexFlag
+    # is the same neutral value and keeps Jinest's documented 3.10 support.
+    flags = re.RegexFlag(0)
     if ignorecase:
         flags |= re.IGNORECASE
     if multiline:
