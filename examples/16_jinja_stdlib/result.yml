@@ -10,6 +10,10 @@ runtime_render: Hello Ada
 runtime_script: 7
 runtime_literal: literal data
 
+# Lexical loop context and source-relative file access are preserved.
+loop_runtime: 1,2,3
+file_text: source-relative text
+
 # Parsing, loading, importing, and virtual documents stay distinct.
 json_text: '{"from_text": 4}'
 from_text: 4

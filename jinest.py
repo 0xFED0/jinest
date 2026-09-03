@@ -68,7 +68,7 @@ import re
 import sys
 import tempfile
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from types import MappingProxyType, SimpleNamespace
 from enum import Enum
 from itertools import product
@@ -79,7 +79,7 @@ from typing import Any, Iterator, MutableMapping, MutableSequence, NoReturn
 
 from jinja2 import ChainableUndefined, StrictUndefined, Undefined, nodes, pass_context
 from jinja2.exceptions import UndefinedError
-from jinja2.compiler import CodeGenerator, find_undeclared
+from jinja2.compiler import CodeGenerator
 from jinja2.ext import Extension
 from jinja2.nativetypes import NativeEnvironment
 from jinja2.runtime import Context, missing
@@ -104,22 +104,30 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.19.1"
+__version__ = "0.19.2"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
+_INTERNAL_EVALUATOR_CONTEXT = "__jinest_evaluator_context__"
+_INTERNAL_LEXICAL_VARS = "__jinest_lexical_vars__"
 _RESERVED_NAMES = {
     # Context values are intrinsic to every Jinest evaluator. Stdlib globals
     # are intentionally *not* listed here: each Resolver derives them from its
     # enabled namespace selection.
     _INTERNAL_SCOPE,
     _INTERNAL_FUNCTION_LOCALS,
+    _INTERNAL_EVALUATOR_CONTEXT,
+    _INTERNAL_LEXICAL_VARS,
     "root",
     "global_root",
     "context",
     "origin",
     "_",
     "path",
+    "keyname",
+    "effective_key",
+    "keymode",
+    "keypath",
 }
 _MERGE_RE = re.compile(
     # ``!`` is always before the numeric order. ``[]`` changes source
@@ -188,19 +196,39 @@ class JinestPathError(JinestError):
     """A Jinest path could not be parsed or resolved."""
 
 
+@dataclass(slots=True, eq=False)
+class _SourceDocument:
+    """One source-root identity hosted by a Resolver runtime.
+
+    Most resolvers host their ordinary parsed document. Synthetic nodes may
+    host an additional ephemeral document without paying for another Resolver
+    or registering it in the persistent DocumentStore.
+    """
+
+    raw: Any
+    identity: object
+    source_label: str | None = None
+    root: "_ContainerProxy | None" = None
+
+
 @dataclass(frozen=True, slots=True)
 class _Source:
-    """Raw template container together with the resolver that owns its root."""
+    """One raw container and its source-document location."""
 
     resolver: "Resolver"
     raw: Any
     source_path: tuple[Any, ...] = ()
+    document: _SourceDocument | None = None
 
     @property
     def document_id(self) -> "_DocumentNodeId":
         """Stable identity of the declaration location in its document."""
         return _DocumentNodeId(
-            self.resolver._document_identity,
+            (
+                self.resolver._document_identity
+                if self.document is None
+                else self.document.identity
+            ),
             self.source_path,
         )
 
@@ -869,13 +897,15 @@ class JinestFunction:
         source = object.__getattribute__(self, "_jinest_source")
         locals_map = dict(object.__getattribute__(scope, "_jinest_binding").frame.local_vars or {})
         if vars is not None:
+            if not isinstance(vars, Mapping):
+                raise TypeError("vars must be a mapping")
             locals_map.update(vars)
         return owner._invoke_python_function(self, scope, source, args, kwargs, locals_map)
 
     def call(self, *args: Any, **kwargs: Any) -> Any:
         """Invoke this declaration immediately in the context that exposed it."""
         owner = object.__getattribute__(self, "_jinest_owner")
-        scope = owner._coerce_api_scope(
+        scope = owner._coerce_destination_scope(
             default=object.__getattribute__(self, "_jinest_scope")
         )
         return self._python_call(scope, args, kwargs)
@@ -889,12 +919,15 @@ class JinestFunction:
         """Return a Python callable adapter, optionally rebound with locals."""
         owner = object.__getattribute__(self, "_jinest_owner")
         spec = object.__getattribute__(self, "_jinest_spec")
-        scope = owner._coerce_api_scope(
+        scope = owner._coerce_destination_scope(
             context, default=object.__getattribute__(self, "_jinest_scope")
         )
+        if vars is not None and not isinstance(vars, Mapping):
+            raise TypeError("vars must be a mapping")
+        bound_vars = None if vars is None else MappingProxyType(dict(vars))
 
         def adapter(*args: Any, **kwargs: Any) -> Any:
-            return self._python_call(scope, args, kwargs, vars)
+            return self._python_call(scope, args, kwargs, bound_vars)
 
         adapter.__name__ = spec.name
         adapter.__qualname__ = spec.name
@@ -966,6 +999,15 @@ class PathRef:
             tuple(anchor_segments or ()),
         )
         object.__setattr__(self, "_jinest_up", up)
+
+    def __setattr__(self, name: str, value: Any) -> NoReturn:
+        """Keep path references immutable after construction.
+
+        Construction and internal derivation deliberately use
+        :func:`object.__setattr__`; ordinary callers must never be able to
+        mutate a path that may already be used as a cache key.
+        """
+        raise AttributeError("PathRef objects are immutable")
 
     def __getattribute__(self, name: str) -> Any:
         if name.startswith("_jinest_") or name.startswith("__"):
@@ -1156,124 +1198,50 @@ class _JinestContext(Context):
 
 
 class _JinestCodeGenerator(CodeGenerator):
-    """Jinja 3.1 code generator that carries loop targets to pass_context.
+    """Carry visible Jinja lexical variables into context-aware operations.
 
-    Jinja's stock generator creates ``_loop_vars`` for context callables but
-    only fills it for assignments, not for the loop target itself. Dynamic
-    Jinest evaluators must inherit normally visible lexical loop values, so we
-    extend that one point while preserving the upstream generation algorithm.
+    Jinja normally derives a context with assignments made *inside* a loop,
+    but the loop target, macro parameters and macro-local assignments only
+    exist as generated Python locals. ``Symbols.dump_stores`` is the compiler
+    abstraction for those locals. Passing them through Jinja's own
+    ``_loop_vars`` channel keeps ordinary callable dispatch untouched, while a
+    private keyword lets Jinest's filter/test adapters derive the same frame.
+
+    Keeping this hook in ``signature`` avoids copying Jinja's sizeable
+    ``visit_For`` implementation and therefore reduces version coupling.
     """
 
-    def visit_For(self, node: nodes.For, frame: Any) -> None:
-        loop_frame = frame.inner()
-        loop_frame.loop_frame = True
-        test_frame = frame.inner()
-        else_frame = frame.inner()
-        extended_loop = (
-            node.recursive
-            or "loop" in find_undeclared(node.iter_child_nodes(only=("body",)), ("loop",))
-            or any(block.scoped for block in node.find_all(nodes.Block))
-        )
-        loop_ref = None
-        if extended_loop:
-            loop_ref = loop_frame.symbols.declare_parameter("loop")
-        loop_frame.symbols.analyze_node(node, for_branch="body")
-        if node.else_:
-            else_frame.symbols.analyze_node(node, for_branch="else")
-        if node.test:
-            loop_filter_func = self.temporary_identifier()
-            test_frame.symbols.analyze_node(node, for_branch="test")
-            self.writeline(f"{self.func(loop_filter_func)}(fiter):", node.test)
-            self.indent()
-            self.enter_frame(test_frame)
-            self.writeline(self.choose_async("async for ", "for "))
-            self.visit(node.target, loop_frame)
-            self.write(" in ")
-            self.write(self.choose_async("auto_aiter(fiter)", "fiter"))
-            self.write(":")
-            self.indent()
-            self.writeline("if ", node.test)
-            self.visit(node.test, test_frame)
-            self.write(":")
-            self.indent()
-            self.writeline("yield ")
-            self.visit(node.target, loop_frame)
-            self.outdent(3)
-            self.leave_frame(test_frame, with_python_scope=True)
-        if node.recursive:
-            self.writeline(f"{self.func('loop')}(reciter, loop_render_func, depth=0):", node)
-            self.indent()
-            self.buffer(loop_frame)
-            else_frame.buffer = loop_frame.buffer
-        if extended_loop:
-            self.writeline(f"{loop_ref} = missing")
-        for name in node.find_all(nodes.Name):
-            if name.ctx == "store" and name.name == "loop":
-                self.fail("Can't assign to special loop variable in for-loop target", name.lineno)
-        if node.else_:
-            iteration_indicator = self.temporary_identifier()
-            self.writeline(f"{iteration_indicator} = 1")
-        self.writeline(self.choose_async("async for ", "for "), node)
-        self.visit(node.target, loop_frame)
-        if extended_loop:
-            self.write(f", {loop_ref} in {self.choose_async('Async')}LoopContext(")
-        else:
-            self.write(" in ")
-        if node.test:
-            self.write(f"{loop_filter_func}(")
-        if node.recursive:
-            self.write("reciter")
-        else:
-            if self.environment.is_async and not extended_loop:
-                self.write("auto_aiter(")
-            self.visit(node.iter, frame)
-            if self.environment.is_async and not extended_loop:
-                self.write(")")
-        if node.test:
-            self.write(")")
-        if node.recursive:
-            self.write(", undefined, loop_render_func, depth):")
-        else:
-            self.write(", undefined):" if extended_loop else ":")
-        self.indent()
-        self.enter_frame(loop_frame)
-        self.writeline("_loop_vars = {}")
-        target_names = {
-            name.name for name in node.target.find_all(nodes.Name)
-            if name.ctx == "store"
-        }
-        if isinstance(node.target, nodes.Name) and node.target.ctx == "store":
-            target_names.add(node.target.name)
-        for name in sorted(target_names):
-            self.writeline(f"_loop_vars[{name!r}] = {loop_frame.symbols.ref(name)}")
-        if extended_loop and loop_ref is not None:
-            self.writeline(f"_loop_vars['loop'] = {loop_ref}")
-        self.blockvisit(node.body, loop_frame)
-        if node.else_:
-            self.writeline(f"{iteration_indicator} = 0")
-        self.outdent()
-        self.leave_frame(loop_frame, with_python_scope=node.recursive and not node.else_)
-        if node.else_:
-            self.writeline(f"if {iteration_indicator}:")
-            self.indent()
-            self.enter_frame(else_frame)
-            self.blockvisit(node.else_, else_frame)
-            self.leave_frame(else_frame)
-            self.outdent()
-        if node.recursive:
-            self.return_buffer_contents(loop_frame)
-            self.outdent()
-            self.start_write(frame, node)
-            self.write(f"{self.choose_async('await ')}loop(")
-            if self.environment.is_async:
-                self.write("auto_aiter(")
-            self.visit(node.iter, frame)
-            if self.environment.is_async:
-                self.write(")")
-            self.write(", loop)")
-            self.end_write(frame)
-        if self._assign_stack:
-            self._assign_stack[-1].difference_update(loop_frame.symbols.stores)
+    @staticmethod
+    def _jinest_lexical_vars(frame: Any) -> str | None:
+        stores = frame.symbols.dump_stores()
+        if not stores:
+            return None
+        return "{" + ", ".join(
+            f"{name!r}: {reference}" for name, reference in stores.items()
+        ) + "}"
+
+    def signature(
+        self,
+        node: nodes.Call | nodes.Filter | nodes.Test,
+        frame: Any,
+        extra_kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
+        additions = dict(extra_kwargs or {})
+        lexical_vars = self._jinest_lexical_vars(frame)
+        if isinstance(node, nodes.Call) and lexical_vars is not None:
+            # Context.call consumes this internal argument before invoking the
+            # callable, so normal Python/Jinja callables are unaffected.
+            additions["_loop_vars"] = lexical_vars
+        elif not isinstance(node, nodes.Call):
+            surface = (
+                self.environment.filters
+                if isinstance(node, nodes.Filter)
+                else self.environment.tests
+            )
+            function = surface.get(node.name)
+            if getattr(function, "_jinest_contextual", False):
+                additions[_INTERNAL_LEXICAL_VARS] = lexical_vars
+        super().signature(node, frame, additions or None)
 
 
 class _SandboxedNativeEnvironment(SandboxedEnvironment, NativeEnvironment):
@@ -1349,7 +1317,7 @@ class _ContainerProxy:
             root = (
                 owner._global_owner.root
                 if kind == "global"
-                else source.resolver._source_root
+                else owner._source_root_for(source)
             )
             return PathRef(
                 owner,
@@ -1361,16 +1329,16 @@ class _ContainerProxy:
             source = object.__getattribute__(self, "_jinest_source")
             return PathRef(
                 source.resolver,
-                source.resolver._source_root,
+                source.resolver._source_root_for(source),
                 "source",
                 source.source_path,
             )
         if name == "root":
             source = object.__getattribute__(self, "_jinest_source")
-            return source.resolver._source_root
+            return source.resolver._source_root_for(source)
         if name == "file":
             source = object.__getattribute__(self, "_jinest_source")
-            return source.resolver._source_label
+            return source.resolver._source_label_for(source)
         return object.__getattribute__(self, name)
 
     def __repr__(self) -> str:
@@ -1619,10 +1587,20 @@ class DiagnosticSink:
 
 @dataclass(frozen=True, slots=True)
 class _ImportedDocument:
-    """Parsed import payload reused by independent lazy resolvers."""
+    """Parsed filesystem import reused by independent lazy resolvers."""
 
     data: Any
     identity: tuple[str, Path, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _TreeDocument:
+    """Snapshotted in-memory source shared by ancestry-specific runtimes."""
+
+    data: Any
+    identity: str
+    source_path: Path | None
+    base_dir: Path
 
 
 @dataclass(slots=True)
@@ -1633,7 +1611,10 @@ class DocumentStore:
     runtimes: dict[tuple[Path, str, tuple[Path, ...]], "Resolver"] = field(
         default_factory=dict
     )
-    tree_runtimes: dict[str, "Resolver"] = field(default_factory=dict)
+    tree_documents: dict[str, _TreeDocument] = field(default_factory=dict)
+    tree_runtimes: dict[
+        tuple[str, tuple[str, ...], tuple[Path, ...]], "Resolver"
+    ] = field(default_factory=dict)
 
     def get(self, path: Path, format: str) -> _ImportedDocument | None:
         return self.cache.get((path, format))
@@ -1646,6 +1627,7 @@ class DocumentStore:
     def clear(self) -> None:
         self.cache.clear()
         self.runtimes.clear()
+        self.tree_documents.clear()
         self.tree_runtimes.clear()
 
 
@@ -1654,7 +1636,13 @@ class _MaterializationState:
     """Active identities while converting lazy nodes to plain Python values."""
 
     bindings: set[_BindingId] = field(default_factory=set)
-    proxy_raw: dict[int, list["_ContainerProxy"]] = field(default_factory=dict)
+    # A physical raw object may occur at several paths in one document. Its
+    # active occurrence is a cycle, but the same object in an independent
+    # source document is not. This guard is therefore deliberately narrower
+    # than declaration identity: document identity plus raw object identity.
+    proxy_raw: dict[tuple[object, int], list["_ContainerProxy"]] = field(
+        default_factory=dict
+    )
     plain_raw: set[int] = field(default_factory=set)
 
 
@@ -1734,8 +1722,26 @@ class _StdlibCallFrame:
         # lexical ``set``/loop bindings plus Jinest's own call-frame locals.
         local_vars = dict(object.__getattribute__(scope, "_jinest_binding").frame.local_vars or {})
         environment_globals = context.environment.globals
+        base_context = context.vars.get(
+            _INTERNAL_EVALUATOR_CONTEXT,
+            context.parent.get(_INTERNAL_EVALUATOR_CONTEXT, {}),
+        )
         for name, value in context.get_all().items():
-            if name in _RESERVED_NAMES:
+            if name in {
+                _INTERNAL_SCOPE,
+                _INTERNAL_FUNCTION_LOCALS,
+                _INTERNAL_EVALUATOR_CONTEXT,
+            }:
+                continue
+            # Do not feed unmodified service variables back as locals: doing
+            # so would override an explicit context/origin/root on the nested
+            # runtime call. A lexical set/loop binding remains visible because
+            # it either lives in vars or differs from the base evaluator value.
+            if (
+                name in _RESERVED_NAMES
+                and name not in context.vars
+                and base_context.get(name, _MISSING) is value
+            ):
                 continue
             if name in environment_globals and value is environment_globals[name]:
                 continue
@@ -1747,7 +1753,7 @@ class _StdlibCallFrame:
         return self.context.environment.call(self.context, function, *args, **kwargs)
 
     def _scope(self, context: Any = _MISSING) -> "_ContainerProxy":
-        return self.resolver._coerce_api_scope(context, default=self.scope)
+        return self.resolver._coerce_destination_scope(context, default=self.scope)
 
     def _origin_source(self, origin: Any = _MISSING, root: Any = _MISSING) -> _Source:
         origin_node = self.resolver._coerce_api_scope(origin, default=self.origin)
@@ -1755,7 +1761,7 @@ class _StdlibCallFrame:
         if root is not _MISSING:
             root_node = self.resolver._coerce_api_scope(root)
             root_source = object.__getattribute__(root_node, "_jinest_source")
-            if root_source.resolver is not source.resolver:
+            if not self.resolver._same_source_tree(root_source, source):
                 raise JinestError("origin and root must belong to the same source tree")
         return source
 
@@ -1805,7 +1811,11 @@ class _StdlibNamespace:
     def contextual(self, handler: Any) -> Any:
         @pass_context
         def wrapper(context: Context, *args: Any, **kwargs: Any) -> Any:
+            lexical_vars = kwargs.pop(_INTERNAL_LEXICAL_VARS, None)
+            if lexical_vars:
+                context = context.derived(lexical_vars)
             return handler(_StdlibCallFrame.from_jinja(context), *args, **kwargs)
+        wrapper._jinest_contextual = True
         return wrapper
 
 
@@ -1858,8 +1868,16 @@ class _FilesStdlib(_StdlibNamespace):
     name = "files"
 
     def exports(self) -> _StdlibExports:
-        def file_path(frame: _StdlibCallFrame, path: Any, anchor: Any = _MISSING) -> Path:
-            return _api_file_path(path, anchor=frame.origin if anchor is _MISSING else anchor)
+        def file_path(frame: _StdlibCallFrame, path: Any, anchor: Any = _MISSING) -> str:
+            # Never expose pathlib.Path as a template capability: its public
+            # read/write methods would bypass the read-only stdlib boundary and
+            # could traverse outside import_roots after this policy check.
+            return str(
+                _api_file_path(
+                    path,
+                    anchor=frame.origin if anchor is _MISSING else anchor,
+                )
+            )
         def read_text(frame: _StdlibCallFrame, path: Any, encoding: str = "utf-8", anchor: Any = _MISSING) -> str:
             return _api_read_text(path, encoding=encoding, anchor=frame.origin if anchor is _MISSING else anchor)
         def read_lines(frame: _StdlibCallFrame, path: Any, encoding: str = "utf-8", keepends: bool = False, anchor: Any = _MISSING) -> list[str]:
@@ -1949,7 +1967,9 @@ class _DocumentsStdlib(_StdlibNamespace):
             "load_yaml": lambda frame, path, encoding="utf-8", anchor=_MISSING: load(frame, path, "yaml", encoding, anchor),
             "import_json": lambda frame, path, anchor=_MISSING: import_document(frame, path, "json", anchor),
             "import_yaml": lambda frame, path, anchor=_MISSING: import_document(frame, path, "yaml", anchor),
-            "import_tree": lambda frame, value, source="memory://tree", base_dir=None: _api_owner(frame.origin).import_tree(value, source=source, base_dir=base_dir),
+            "import_tree": lambda frame, value, source, base_dir=None: _api_owner(
+                frame.origin
+            ).import_tree(value, source=source, base_dir=base_dir),
         }
         wrapped = {name: self.contextual(handler) for name, handler in handlers.items()}
         globals_map = dict(wrapped)
@@ -1980,20 +2000,42 @@ class _SerializationStdlib(_StdlibNamespace):
 
 
 def _stdlib_flatten(value: Any, levels: int | None = None) -> list[Any]:
-    if levels is not None and (not isinstance(levels, int) or isinstance(levels, bool) or levels < 0):
+    if levels is not None and (
+        not isinstance(levels, int) or isinstance(levels, bool) or levels < 0
+    ):
         raise TypeError("flatten levels must be a non-negative integer or None")
+
+    def is_nested(item: Any) -> bool:
+        return isinstance(item, Iterable) and not isinstance(
+            item, (str, bytes, bytearray, Mapping)
+        )
+
     result: list[Any] = []
+    active: set[int] = set()
+
     def append(item: Any, depth: int | None) -> None:
-        is_nested = isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray))
-        if is_nested and (depth is None or depth > 0):
+        if not is_nested(item) or depth == 0:
+            result.append(item)
+            return
+        identity = id(item)
+        if identity in active:
+            raise JinestError("Cyclic iterable cannot be flattened")
+        active.add(identity)
+        try:
             next_depth = None if depth is None else depth - 1
             for nested in item:
                 append(nested, next_depth)
-        else:
-            result.append(item)
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        for item in value:
-            append(item, levels)
+        finally:
+            active.remove(identity)
+
+    if is_nested(value):
+        identity = id(value)
+        active.add(identity)
+        try:
+            for item in value:
+                append(item, levels)
+        finally:
+            active.remove(identity)
     else:
         result.append(value)
     return result
@@ -2234,6 +2276,7 @@ class Resolver:
         stdlib: bool | Sequence[str] = True,
         stdlib_exclude: Sequence[str] = (),
         _import_chain: tuple[Path, ...] | None = None,
+        _tree_import_chain: tuple[str, ...] = (),
         _global_owner: "Resolver | None" = None,
         _documents: DocumentStore | None = None,
         _document_identity: object | None = None,
@@ -2343,6 +2386,7 @@ class Resolver:
             self._import_chain = (self.source_path,)
         else:
             self._import_chain = ()
+        self._tree_import_chain = _tree_import_chain
 
         environment_type = _SandboxedNativeEnvironment if sandboxed else NativeEnvironment
         undefined_type = StrictUndefined if strict else ChainableUndefined
@@ -2389,7 +2433,7 @@ class Resolver:
         source_path = source.source_path if path is None else path
         return (
             _format_path_segments("root", source_path),
-            str(source.resolver.source_path) if source.resolver.source_path else None,
+            self._source_label_for(source),
         )
 
     def _record_message(
@@ -2466,6 +2510,47 @@ class Resolver:
             owner._emit_debug_error(error)
             raise error
         self._flush_messages()
+
+    @staticmethod
+    def _source_label_for(source: _Source) -> str | None:
+        if source.document is not None:
+            return source.document.source_label
+        return source.resolver._source_label
+
+    @staticmethod
+    def _source_tree_identity(source: _Source) -> object:
+        if source.document is not None:
+            return source.document.identity
+        return source.resolver._document_identity
+
+    @classmethod
+    def _same_source_tree(cls, left: _Source, right: _Source) -> bool:
+        return cls._source_tree_identity(left) == cls._source_tree_identity(right)
+
+
+
+    @staticmethod
+    def _source_root_for(source: _Source) -> "_ContainerProxy":
+        """Return the root of the exact document containing source."""
+        document = source.document
+        if document is None:
+            root = source.resolver._source_root
+        else:
+            root = document.root
+            if root is None:
+                root = source.resolver._wrap(
+                    document.raw,
+                    parent=None,
+                    path=(),
+                    origin=source.resolver,
+                    source_path=(),
+                    source_document=document,
+                    path_kind="source",
+                )
+                document.root = root
+        if not isinstance(root, _ContainerProxy):
+            raise JinestPathError("Source root must be a mapping or sequence")
+        return root
 
     def _reset_root_views(self) -> None:
         """Rebuild destination/source roots after initialization or in-place resolve."""
@@ -2685,6 +2770,15 @@ class Resolver:
             raise TypeError("context must resolve to a Jinest mapping or list node")
         return context
 
+    def _coerce_destination_scope(
+        self, context: Any = _MISSING, *, default: _ContainerProxy | None = None
+    ) -> _ContainerProxy:
+        scope = self._coerce_api_scope(context, default=default)
+        owner = object.__getattribute__(scope, "_jinest_owner")
+        if owner._global_owner is not self._global_owner:
+            raise JinestError("context must belong to the same Jinest resolver tree")
+        return scope
+
     def _api_locals(self, scope: _ContainerProxy, vars: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
         if vars is None:
             return object.__getattribute__(scope, "_jinest_binding").frame.local_vars
@@ -2700,8 +2794,17 @@ class Resolver:
     ) -> Any:
         if isinstance(target, PathRef):
             owner = object.__getattribute__(target, "_jinest_owner")
+            if owner._global_owner is not self._global_owner:
+                raise JinestError(
+                    "target must belong to the same Jinest resolver tree"
+                )
             target = owner._at_path(target)
         if isinstance(target, _ContainerProxy):
+            owner = object.__getattribute__(target, "_jinest_owner")
+            if owner._global_owner is not self._global_owner:
+                raise JinestError(
+                    "target must belong to the same Jinest resolver tree"
+                )
             if context is origin is root is _MISSING and vars is None:
                 return target
             return self.node(target, context=context, origin=origin, root=root, vars=vars)
@@ -2721,45 +2824,80 @@ class Resolver:
         """Bind a mapping/list as a lazy Jinest node without materializing it."""
         if not self._is_container(value):
             raise TypeError("node() requires a mapping or non-string sequence")
-        if isinstance(value, _ContainerProxy) and context is origin is root is _MISSING and vars is None:
+        if isinstance(value, _ContainerProxy):
+            owner = object.__getattribute__(value, "_jinest_owner")
+            if owner._global_owner is not self._global_owner:
+                raise JinestError(
+                    "value must belong to the same Jinest resolver tree"
+                )
+        if (
+            isinstance(value, _ContainerProxy)
+            and context is origin is root is _MISSING
+            and vars is None
+        ):
             return value
+
+        existing_node = isinstance(value, _ContainerProxy)
         default_parent = (
             object.__getattribute__(value, "_jinest_parent")
-            if isinstance(value, _ContainerProxy) else None
+            if existing_node else None
         )
-        parent = self._coerce_api_scope(context, default=default_parent)
+        parent = self._coerce_destination_scope(context, default=default_parent)
         locals_map = self._api_locals(parent, vars)
-        existing_node = isinstance(value, _ContainerProxy)
+
         if existing_node:
             source = object.__getattribute__(value, "_jinest_source")
             source_origin = source.resolver
             source_path = source.source_path
-            context_origin_source = object.__getattribute__(value, "_jinest_binding").frame.context_origin_source
+            source_document = source.document
+            context_origin_source = object.__getattribute__(
+                value, "_jinest_binding"
+            ).frame.context_origin_source
         else:
             source_origin = self
             source_path = ("<synthetic>", id(value))
+            source_document = None
             context_origin_source = None
+
         if origin is not _MISSING:
             origin_node = self._coerce_api_scope(origin)
-            context_origin_source = object.__getattribute__(origin_node, "_jinest_source")
+            context_origin_source = object.__getattribute__(
+                origin_node, "_jinest_source"
+            )
             source_origin = context_origin_source.resolver
+
         if root is not _MISSING:
             root_node = self._coerce_api_scope(root)
             root_source = object.__getattribute__(root_node, "_jinest_source")
-            root_origin = root_source.resolver
-            # A synthetic node has no intrinsic declaration root, so an
-            # explicit root may establish it. Existing sources instead retain
-            # their source identity and may only be rebound inside that tree.
+            # A plain node may explicitly adopt a source root. Existing nodes
+            # retain their own source and only accept a compatible override.
             if origin is _MISSING and not existing_node:
-                source_origin = root_origin
+                source_origin = root_source.resolver
                 context_origin_source = root_source
-            elif root_origin is not source_origin:
+            elif not self._same_source_tree(
+                context_origin_source if context_origin_source is not None else source,
+                root_source,
+            ):
                 raise JinestError("origin and root must belong to the same source tree")
+
+        if not existing_node and origin is _MISSING and root is _MISSING:
+            # Host an independent, ephemeral source document in this runtime.
+            # It is intentionally absent from DocumentStore: global_root and
+            # all environment/import services still belong to this Resolver.
+            source_document = _SourceDocument(value, object())
+            source_path = ()
+
         path = object.__getattribute__(parent, "_jinest_path") + ("<node>",)
         bound = self._wrap(
-            value, parent=parent, path=path, origin=source_origin,
-            source_path=source_path, path_kind=object.__getattribute__(parent, "_jinest_path_kind"),
-            local_vars=locals_map, function_scope=_lookup_scope,
+            value,
+            parent=parent,
+            path=path,
+            origin=source_origin,
+            source_path=source_path,
+            source_document=source_document,
+            path_kind=object.__getattribute__(parent, "_jinest_path_kind"),
+            local_vars=locals_map,
+            function_scope=_lookup_scope,
             context_origin_source=context_origin_source,
         )
         if not isinstance(bound, _ContainerProxy):
@@ -2810,6 +2948,10 @@ class Resolver:
             return
         if isinstance(target, PathRef):
             owner = object.__getattribute__(target, "_jinest_owner")
+            if owner._global_owner is not self._global_owner:
+                raise JinestError(
+                    "target must belong to the same Jinest resolver tree"
+                )
             absolute = target._jinest_absolute()
             segments = object.__getattribute__(absolute, "_jinest_segments")
             if not segments:
@@ -2828,7 +2970,10 @@ class Resolver:
             raise JinestPathError(f"Path {target} has no container parent")
         if not isinstance(target, _ContainerProxy):
             raise TypeError("clear_cache() target must be a Jinest node or PathRef")
-        object.__getattribute__(target, "_jinest_owner")._clear_binding_cache(target, set())
+        owner = object.__getattribute__(target, "_jinest_owner")
+        if owner._global_owner is not self._global_owner:
+            raise JinestError("target must belong to the same Jinest resolver tree")
+        owner._clear_binding_cache(target, set())
 
     def _apply_globals(self, mapping: Mapping[str, Any]) -> None:
         self._user_globals.update(mapping)
@@ -2847,7 +2992,16 @@ class Resolver:
         self._user_filters.update(mapping)
         for environment in (self.environment, self.script_environment):
             environment.filters.update(mapping)
-        self.config = replace(self.config, filters=MappingProxyType(self._user_filters.copy()))
+        # Jinja compiles filter lookup and pass-context calling conventions into
+        # each artifact, and it may constant-fold a filter applied to literals.
+        # Keep lazy field values intact, but discard only compiled artifacts so
+        # future uncached evaluations observe the updated filter contract.
+        self._jinja.compilation_cache.clear()
+        self._jinja.template_cache.clear()
+        self.config = replace(
+            self.config,
+            filters=MappingProxyType(self._user_filters.copy()),
+        )
 
     def update_filters(self, mapping: Mapping[str, Any]) -> None:
         """Update filters for future evaluations throughout this resolver graph."""
@@ -2857,7 +3011,7 @@ class Resolver:
             runtime._apply_filters(mapping)
 
     def _api_render(self, template: Any, mode: str, *, context: Any = _MISSING, vars: Mapping[str, Any] | None = None) -> Any:
-        scope = self._coerce_api_scope(context)
+        scope = self._coerce_destination_scope(context)
         source = object.__getattribute__(scope, "_jinest_source")
         return self._render(scope, template, mode=mode, origin_source=source,
                             source_key=None, local_vars=self._api_locals(scope, vars))
@@ -2889,37 +3043,95 @@ class Resolver:
         except (KeyError, IndexError, TypeError, JinestPathError, UndefinedError):
             return default
 
-    def import_tree(self, value: Any, *, source: str | os.PathLike[str] = "memory://tree", base_dir: str | os.PathLike[str] | None = None) -> Any:
+    def import_tree(
+        self,
+        value: Any,
+        *,
+        source: str | os.PathLike[str],
+        base_dir: str | os.PathLike[str] | None = None,
+    ) -> Any:
         """Create/reuse an independent lazy document from a Python tree."""
         if not self._is_container(value):
             raise TypeError("import_tree() requires a mapping or non-string sequence")
-        identity = str(source)
-        source_path = None
+        if isinstance(value, _ContainerProxy):
+            # A document imports declarations, never a destination binding or
+            # its caches/context. The new source identity is authoritative.
+            value = object.__getattribute__(value, "_jinest_source").raw
         try:
-            candidate = Path(source).expanduser()
+            source_text = os.fspath(source)
+        except TypeError as exc:
+            raise TypeError("import_tree source must be a string or path-like value") from exc
+        if not isinstance(source_text, str):
+            raise TypeError("import_tree source must be a string or path-like value")
+        if not source_text:
+            raise ValueError("import_tree source must not be empty")
+
+        is_virtual = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", source_text)
+        source_path: Path | None = None
+        identity = source_text
+        if not is_virtual:
+            candidate = Path(source_text).expanduser()
             if (
                 isinstance(source, os.PathLike)
                 or candidate.is_absolute()
-                or os.fspath(source).endswith((".json", ".yaml", ".yml"))
+                or candidate.suffix.lower() in {".json", ".yaml", ".yml"}
             ):
                 source_path = candidate.resolve()
                 identity = str(source_path)
-        except TypeError:
-            pass
-        cache = self._documents.tree_runtimes
-        cached = cache.get(identity)
+
+        if identity in self._tree_import_chain:
+            return None
+        tree_chain = self._tree_import_chain + (identity,)
+
+        document = self._documents.tree_documents.get(identity)
+        if document is None:
+            try:
+                snapshot = copy.deepcopy(value)
+            except Exception as exc:
+                raise JinestImportError(
+                    f"Could not snapshot import_tree source {source_text!r}"
+                ) from exc
+            resolved_base = Path(
+                base_dir
+                if base_dir is not None
+                else source_path.parent if source_path is not None else self.base_dir
+            ).expanduser().resolve()
+            document = _TreeDocument(
+                snapshot,
+                identity,
+                source_path,
+                resolved_base,
+            )
+            self._documents.tree_documents[identity] = document
+
+        runtime_key = (identity, tree_chain, self._import_chain)
+        cached = self._documents.tree_runtimes.get(runtime_key)
         if cached is not None:
             return cached.root
-        child = Resolver(value, strict=self.strict, sandboxed=self.sandboxed,
-            globals=self._user_globals, filters=self._user_filters,
-            source_path=source_path, base_dir=base_dir or (source_path.parent if source_path else self.base_dir),
-            import_roots=self.import_roots, function_max_depth=self.function_max_depth,
-            emit_messages=False, treat_warnings_as_errors=False, debug=self.debug,
-            stdlib=self.config.stdlib, stdlib_exclude=self.config.stdlib_exclude,
-            _global_owner=self._global_owner, _documents=self._documents,
-            _document_identity=("tree", identity), _copy_input=False,
-            _source_label=identity)
-        cache[identity] = child
+        child = Resolver(
+            document.data,
+            strict=self.strict,
+            sandboxed=self.sandboxed,
+            globals=self._user_globals,
+            filters=self._user_filters,
+            source_path=document.source_path,
+            base_dir=document.base_dir,
+            import_roots=self.import_roots,
+            function_max_depth=self.function_max_depth,
+            emit_messages=False,
+            treat_warnings_as_errors=False,
+            debug=self.debug,
+            stdlib=self.config.stdlib,
+            stdlib_exclude=self.config.stdlib_exclude,
+            _import_chain=self._import_chain,
+            _tree_import_chain=tree_chain,
+            _global_owner=self._global_owner,
+            _documents=self._documents,
+            _document_identity=("tree", identity),
+            _copy_input=False,
+            _source_label=identity,
+        )
+        self._documents.tree_runtimes[runtime_key] = child
         return child.root
 
 
@@ -2953,6 +3165,7 @@ class Resolver:
         *,
         origin: "Resolver | None" = None,
         source_path: tuple[Any, ...] | None = None,
+        source_document: _SourceDocument | None = None,
         sequence_key_context: tuple[Any, Any] | None = None,
         path_kind: str = "global",
         local_vars: Mapping[str, Any] | None = None,
@@ -2974,9 +3187,9 @@ class Resolver:
             if context_origin_source is None:
                 context_origin_source = object.__getattribute__(value, "_jinest_binding").frame.context_origin_source
         elif isinstance(value, Mapping):
-            source = _Source(origin or self, value, tuple(source_path or ()))
+            source = _Source(origin or self, value, tuple(source_path or ()), source_document)
         elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            source = _Source(origin or self, value, tuple(source_path or ()))
+            source = _Source(origin or self, value, tuple(source_path or ()), source_document)
         else:
             return self._copy_scalar(value)
 
@@ -3047,6 +3260,7 @@ class Resolver:
 
         if isinstance(value, _ContainerProxy):
             source = object.__getattribute__(value, "_jinest_source")
+            source_document = source.document
             raw = source.raw
             source_origin = source.resolver
             value_frame = object.__getattribute__(value, "_jinest_binding").frame
@@ -3058,7 +3272,7 @@ class Resolver:
                 in_function_body = (
                     function_origin is not None
                     and value_body_source_path is not None
-                    and source.resolver is function_origin.resolver
+                    and self._same_source_tree(source, function_origin)
                     and source.source_path[: len(value_body_source_path)]
                     == value_body_source_path
                 )
@@ -3104,6 +3318,12 @@ class Resolver:
             raw = value
             source_origin = origin or self
             source_origin_path = tuple(source_path or ())
+            parent_source = object.__getattribute__(parent, "_jinest_source")
+            source_document = (
+                parent_source.document
+                if source_origin is parent_source.resolver
+                else None
+            )
 
         if isinstance(value, _ContainerProxy):
             source_origin_path = source.source_path
@@ -3114,6 +3334,7 @@ class Resolver:
             id(source_origin),
             source_origin_path,
             sequence_key_context,
+            id(source_document) if source_document is not None else None,
             id(local_vars) if local_vars is not None else None,
             id(function_scope) if function_scope is not None else None,
             id(function_origin_source) if function_origin_source is not None else None,
@@ -3133,6 +3354,7 @@ class Resolver:
             origin=source_origin,
             source_path=source_origin_path,
             sequence_key_context=sequence_key_context,
+            source_document=source_document,
             path_kind=path_kind,
             local_vars=local_vars,
             function_scope=function_scope,
@@ -3340,11 +3562,7 @@ class Resolver:
                     "root",
                     object.__getattribute__(bind, "_jinest_path"),
                 ),
-                file=(
-                    str(source.resolver.source_path)
-                    if source.resolver.source_path
-                    else None
-                ),
+                file=self._source_label_for(source),
             )
             raise
 
@@ -3486,9 +3704,7 @@ class Resolver:
                 f"{_evaluator_body_requirement(mode)}, "
                 f"got {type(value).__name__}",
                 path=_format_path_segments("global_root", path),
-                file=str(origin_source.resolver.source_path)
-                if origin_source.resolver.source_path
-                else None,
+                file=self._source_label_for(origin_source),
             )
         return self._evaluators.apply(
             self,
@@ -3958,11 +4174,7 @@ class Resolver:
             f"Merge {_format_path_segments('global_root', path)} produced "
             f"{type(value).__name__}, expected {expected}",
             path=_format_path_segments("root", path),
-            file=(
-                str(error_source.resolver.source_path)
-                if error_source.resolver.source_path
-                else None
-            ),
+            file=self._source_label_for(error_source),
         )
 
     def _compile_mapping(self, raw: Mapping[Any, Any]) -> CompiledMapping:
@@ -4254,13 +4466,16 @@ class Resolver:
                 bind, "_jinest_binding"
             ).frame.context_origin_source
         token = (
-            id(source.resolver),
-            id(source.raw),
+            source.instance_id,
             self._hashable_key(key),
             channel,
             source_hidden,
             id(local_vars) if local_vars is not None else None,
-            id(context_origin_source) if context_origin_source is not None else None,
+            (
+                context_origin_source.instance_id
+                if context_origin_source is not None
+                else None
+            ),
         )
         if token in active:
             return
@@ -4566,6 +4781,7 @@ class Resolver:
                 path=destination_path,
                 origin=source.resolver,
                 source_path=declaration_path,
+                source_document=source.document,
                 path_kind=path_kind,
                 local_vars=frame,
                 function_scope=bind,
@@ -4765,6 +4981,7 @@ class Resolver:
                         owner_source.resolver,
                         _EMPTY_MAPPING,
                         owner_source.source_path + (layer.source_key,),
+                        owner_source.document,
                     )
                 )
             return cached
@@ -4794,6 +5011,7 @@ class Resolver:
                         owner_source.resolver,
                         _EMPTY_MAPPING,
                         owner_source.source_path + (layer.source_key,),
+                        owner_source.document,
                     ),
                     hidden=layer.hidden,
                 )
@@ -4807,7 +5025,7 @@ class Resolver:
                     in_function_body = (
                         function_origin is not None
                         and function_body_path is not None
-                        and value_source.resolver is function_origin.resolver
+                        and self._same_source_tree(value_source, function_origin)
                         and value_source.source_path[: len(function_body_path)]
                         == function_body_path
                     )
@@ -4826,6 +5044,7 @@ class Resolver:
                         owner_source.resolver,
                         value,
                         owner_source.source_path + (layer.source_key,),
+                        owner_source.document,
                     ),
                     hidden=layer.hidden,
                 )
@@ -4844,8 +5063,12 @@ class Resolver:
     # Source views, node metadata, and path operations
     # ------------------------------------------------------------------
 
-    def _raw_source_at(self, path: tuple[Any, ...]) -> Any:
-        value = self.data
+    def _raw_source_at(
+        self,
+        path: tuple[Any, ...],
+        document: _SourceDocument | None = None,
+    ) -> Any:
+        value = self.data if document is None else document.raw
         for part in path:
             if isinstance(value, Mapping):
                 value = value[part]
@@ -4861,6 +5084,8 @@ class Resolver:
         return value
 
     def _source_view(self, source: _Source) -> _ContainerProxy:
+        if source.document is not None and not source.source_path:
+            return source.resolver._source_root_for(source)
         cache_key = source.instance_id
         cached = source.resolver._source_view_cache.get(cache_key)
         if cached is not None:
@@ -4870,12 +5095,12 @@ class Resolver:
         if source.source_path:
             parent_path = source.source_path[:-1]
             try:
-                parent_raw = source.resolver._raw_source_at(parent_path)
+                parent_raw = source.resolver._raw_source_at(parent_path, source.document)
             except (KeyError, IndexError, TypeError, JinestPathError):
                 parent_raw = None
             if source.resolver._is_container(parent_raw):
                 parent = source.resolver._source_view(
-                    _Source(source.resolver, parent_raw, parent_path)
+                    _Source(source.resolver, parent_raw, parent_path, source.document)
                 )
 
         proxy = source.resolver._wrap(
@@ -4885,6 +5110,7 @@ class Resolver:
             origin=source.resolver,
             source_path=source.source_path,
             path_kind="source",
+            source_document=source.document,
         )
         if not isinstance(proxy, _ContainerProxy):
             raise JinestPathError("Origin context must be a mapping or sequence")
@@ -5285,6 +5511,13 @@ class Resolver:
                 )
             bound[name] = value
 
+        inherited_locals = jinja_context.vars.get(
+            _INTERNAL_FUNCTION_LOCALS,
+            jinja_context.parent.get(_INTERNAL_FUNCTION_LOCALS),
+        )
+        call_locals = dict(inherited_locals or {})
+        call_locals.update(bound)
+
         marker = "=" if spec.mode == "structural" else _FUNCTION_MODE_MARKERS[spec.mode]
         metadata = {
             "keyname": spec.name,
@@ -5316,8 +5549,9 @@ class Resolver:
                         keyname=metadata["keyname"],
                         effective_key=metadata["effective_key"],
                         keymode=metadata["keymode"],
-                        local_vars=bound,
+                        local_vars=call_locals,
                     )
+                    call_locals[parameter.name] = bound[parameter.name]
                 except JinestError as exc:
                     raise JinestFunctionError(
                         f"Failed to evaluate default for function {spec.name!r} "
@@ -5334,8 +5568,9 @@ class Resolver:
                     path=binding_path,
                     origin=source.resolver,
                     source_path=declaration_path,
+                    source_document=source.document,
                     path_kind=object.__getattribute__(call_scope, "_jinest_path_kind"),
-                    local_vars=bound,
+                    local_vars=call_locals,
                     function_scope=call_scope,
                     function_origin_source=source,
                     function_body_source_path=declaration_path,
@@ -5352,7 +5587,7 @@ class Resolver:
                     keyname=metadata["keyname"],
                     effective_key=metadata["effective_key"],
                     keymode=metadata["keymode"],
-                    local_vars=bound,
+                    local_vars=call_locals,
                 )
             except JinestFunctionError:
                 raise
@@ -5380,16 +5615,18 @@ class Resolver:
         """Whether a structural call targets an active structural ancestor."""
         current: _ContainerProxy | None = scope
         while isinstance(current, _ContainerProxy):
+            active_origin = object.__getattribute__(
+                current, "_jinest_binding"
+            ).frame.function_origin_source
             if (
-                object.__getattribute__(current, "_jinest_binding").frame.function_origin_source
-                is source
+                active_origin is not None
+                and active_origin.document_id == source.document_id
                 and object.__getattribute__(current, "_jinest_binding").frame.function_body_source_path
                 == declaration_path
             ):
                 return True
             current = object.__getattribute__(current, "_jinest_parent")
         return False
-
 
     @staticmethod
     def _normalize_multiline_returns(template: str) -> str:
@@ -5504,7 +5741,7 @@ class Resolver:
         in_function_body = (
             function_origin_source is not None
             and function_body_source_path is not None
-            and origin_source.resolver is function_origin_source.resolver
+            and self._same_source_tree(origin_source, function_origin_source)
             and origin_source.source_path[: len(function_body_source_path)]
             == function_body_source_path
         )
@@ -5529,9 +5766,7 @@ class Resolver:
                 f"{_evaluator_body_requirement(mode)}, "
                 f"got {type(template).__name__}",
                 path=display_path,
-                file=str(origin_source.resolver.source_path)
-                if origin_source.resolver.source_path
-                else None,
+                file=self._source_label_for(origin_source),
             )
         if not isinstance(template, str):
             return self._prepare_native(template)
@@ -5540,7 +5775,7 @@ class Resolver:
         path_root = (
             self._global_owner.root
             if path_kind == "global"
-            else context_origin_source.resolver._source_root
+            else self._source_root_for(context_origin_source)
         )
         path_owner = self if path_kind == "global" else context_origin_source.resolver
         context_path_ref = PathRef(
@@ -5563,7 +5798,7 @@ class Resolver:
             _INTERNAL_SCOPE: scope,
             "context": context_scope,
             "origin": origin_context,
-            "root": context_origin_source.resolver._source_root,
+            "root": self._source_root_for(context_origin_source),
             "global_root": self._global_owner.root,
             "_": object.__getattribute__(context_scope, "_jinest_parent"),
             "path": context_path_ref,
@@ -5572,6 +5807,7 @@ class Resolver:
             "keymode": keymode,
             "keypath": keypath,
         }
+        context[_INTERNAL_EVALUATOR_CONTEXT] = MappingProxyType(context.copy())
         if local_vars is not None:
             context[_INTERNAL_FUNCTION_LOCALS] = local_vars
             context.update(local_vars)
@@ -5640,9 +5876,7 @@ class Resolver:
             self._annotate_error(
                 exc,
                 path=display_path,
-                file=str(origin_source.resolver.source_path)
-                if origin_source.resolver.source_path
-                else None,
+                file=self._source_label_for(origin_source),
             )
             raise
         except UndefinedError as exc:
@@ -5651,18 +5885,14 @@ class Resolver:
             error = JinestTemplateError(
                 f"Failed to render {display_path}: {exc}",
                 path=display_path,
-                file=str(origin_source.resolver.source_path)
-                if origin_source.resolver.source_path
-                else None,
+                file=self._source_label_for(origin_source),
             )
             raise error from exc
         except Exception as exc:
             error = JinestTemplateError(
                 f"Failed to render {display_path}: {exc}",
                 path=display_path,
-                file=str(origin_source.resolver.source_path)
-                if origin_source.resolver.source_path
-                else None,
+                file=self._source_label_for(origin_source),
             )
             raise error from exc
 
@@ -5774,6 +6004,7 @@ class Resolver:
                 stdlib=self.config.stdlib,
                 stdlib_exclude=self.config.stdlib_exclude,
                 _import_chain=import_chain,
+                _tree_import_chain=self._tree_import_chain,
                 _global_owner=self._global_owner,
                 _documents=self._documents,
                 _document_identity=document.identity,
@@ -5838,10 +6069,13 @@ class Resolver:
         context_origin_source: _Source | None = None,
     ) -> None:
         token = (
-            id(source.resolver),
-            id(source.raw),
+            source.instance_id,
             id(local_vars) if local_vars is not None else None,
-            id(context_origin_source) if context_origin_source is not None else None,
+            (
+                context_origin_source.instance_id
+                if context_origin_source is not None
+                else None
+            ),
         )
         if token in active:
             return
@@ -5982,8 +6216,11 @@ class Resolver:
         if isinstance(value, _ContainerProxy):
             source = object.__getattribute__(value, "_jinest_source")
             binding = object.__getattribute__(value, "_jinest_binding")
-            raw_id = id(source.raw)
-            ancestors = state.proxy_raw.get(raw_id, [])
+            source_raw_identity = (
+                source.document_id.document_identity,
+                id(source.raw),
+            )
+            ancestors = state.proxy_raw.get(source_raw_identity, [])
             if binding.identity in state.bindings or (
                 ancestors
                 and not self._allows_structural_materialization(value, ancestors)
@@ -5993,7 +6230,7 @@ class Resolver:
                     f"{_format_path(object.__getattribute__(value, '_jinest_path'))}"
                 )
             state.bindings.add(binding.identity)
-            state.proxy_raw.setdefault(raw_id, []).append(value)
+            state.proxy_raw.setdefault(source_raw_identity, []).append(value)
             try:
                 if isinstance(value, _MappingProxy):
                     result: dict[Any, Any] = {}
@@ -6013,9 +6250,9 @@ class Resolver:
                 ]
             finally:
                 state.bindings.remove(binding.identity)
-                state.proxy_raw[raw_id].pop()
-                if not state.proxy_raw[raw_id]:
-                    del state.proxy_raw[raw_id]
+                state.proxy_raw[source_raw_identity].pop()
+                if not state.proxy_raw[source_raw_identity]:
+                    del state.proxy_raw[source_raw_identity]
 
         if isinstance(value, Mapping):
             raw_id = id(value)
@@ -6079,26 +6316,42 @@ class Resolver:
 
 
 def _api_owner(value: Any = _MISSING, resolver: Resolver | None = None) -> Resolver:
-    """Get the owning runtime from one public node/path or an explicit resolver."""
+    """Get and validate the runtime for one public node/path operation."""
+    inferred: Resolver | None = None
+    if isinstance(value, PathRef):
+        inferred = object.__getattribute__(value, "_jinest_owner")
+    elif isinstance(value, _ContainerProxy):
+        inferred = object.__getattribute__(value, "_jinest_owner")
+
     if resolver is not None:
         if not isinstance(resolver, Resolver):
             raise TypeError("resolver must be a Resolver")
+        if inferred is not None and inferred._global_owner is not resolver._global_owner:
+            raise JinestError("value and resolver must belong to the same Jinest tree")
         return resolver
-    if isinstance(value, PathRef):
-        return object.__getattribute__(value, "_jinest_owner")
-    if isinstance(value, _ContainerProxy):
-        return object.__getattribute__(value, "_jinest_owner")
-    raise TypeError("resolver is required when it cannot be inferred from a Jinest node or PathRef")
+    if inferred is not None:
+        return inferred
+    raise TypeError(
+        "resolver is required when it cannot be inferred from a Jinest node or PathRef"
+    )
 
 
 def _api_owner_from(*values: Any, resolver: Resolver | None = None) -> Resolver:
-    """Infer a resolver from the first public node/path among ``values``."""
+    """Infer a resolver and reject contradictory explicit ownership."""
     if resolver is not None:
-        return _api_owner(resolver=resolver)
+        owner = _api_owner(resolver=resolver)
+        for value in values:
+            if value is not _MISSING and isinstance(
+                value, (PathRef, _ContainerProxy)
+            ):
+                _api_owner(value, owner)
+        return owner
     for value in values:
         if value is not _MISSING and isinstance(value, (PathRef, _ContainerProxy)):
             return _api_owner(value)
-    raise TypeError("resolver is required when it cannot be inferred from a Jinest node or PathRef")
+    raise TypeError(
+        "resolver is required when it cannot be inferred from a Jinest node or PathRef"
+    )
 
 def _api_materialize(value: Any, resolver: Resolver | None = None) -> Any:
     if isinstance(value, (PathRef, _ContainerProxy)):
@@ -6145,19 +6398,62 @@ def _api_path_of(value: Any, *, source: bool = False) -> PathRef:
     return owner._path_of(value, source=source)
 
 
+def _api_metadata_node(value: Any) -> _ContainerProxy | None:
+    """Find the nearest node carrying source metadata for a public value."""
+    if isinstance(value, _ContainerProxy):
+        return value
+    if not isinstance(value, PathRef):
+        return None
+
+    owner = _api_owner(value)
+    current = value._jinest_absolute()
+    while True:
+        try:
+            target = owner._at_path(current)
+        except Exception:
+            # Metadata is anchored to a source container. A final lazy scalar
+            # need not be resolved merely to discover that anchor; if it fails,
+            # walk to its nearest already-addressable parent instead.
+            target = _MISSING
+        if isinstance(target, _ContainerProxy):
+            return target
+        segments = object.__getattribute__(current, "_jinest_segments")
+        if not segments:
+            return None
+        current = PathRef(
+            owner,
+            object.__getattribute__(current, "_jinest_root"),
+            object.__getattribute__(current, "_jinest_kind"),
+            segments[:-1],
+        )
+
+
+def _api_source_runtime(value: Any, resolver: Resolver | None = None) -> Resolver:
+    node = _api_metadata_node(value)
+    if node is not None:
+        source_owner = object.__getattribute__(node, "_jinest_source").resolver
+        if (
+            resolver is not None
+            and source_owner._global_owner is not resolver._global_owner
+        ):
+            raise JinestError("value and resolver must belong to the same Jinest tree")
+        return source_owner
+    return _api_owner(value, resolver)
+
+
 def _api_source_dir(value: Any, *, resolver: Resolver | None = None) -> str | None:
-    owner = _api_owner(value, resolver)
-    if isinstance(value, PathRef):
-        return str(owner.base_dir)
-    file = owner._source_file(value)
-    return str(Path(file).parent) if file else str(owner.base_dir)
+    return str(_api_source_runtime(value, resolver).base_dir)
 
 
 def _api_file_path(value: Any, *, anchor: Any = _MISSING, resolver: Resolver | None = None) -> Path:
-    owner = _api_owner_from(anchor, value, resolver=resolver)
-    # A document resolver's base_dir already follows its source (including
-    # import_tree's explicit virtual-source fallback), so path helpers and
-    # Jinest imports share the same canonical policy.
+    if anchor is _MISSING:
+        owner = _api_owner_from(value, resolver=resolver)
+    else:
+        owner = _api_source_runtime(anchor, resolver)
+        if resolver is not None and owner._global_owner is not resolver._global_owner:
+            raise JinestPathError("anchor and resolver belong to different Jinest trees")
+    # A source resolver's base_dir follows its real source, including the
+    # documented base_dir fallback for virtual import_tree identities.
     base = owner.base_dir
     path = Path(os.fspath(value)).expanduser()
     path = path if path.is_absolute() else base / path
@@ -6212,13 +6508,21 @@ def _api_load_document(
 
 
 def _api_import(path: Any, format: str, *, resolver: Resolver | None = None, anchor: Any = _MISSING) -> Any:
-    return _api_owner_from(anchor, resolver=resolver)._import_tree(path, format)
+    if anchor is _MISSING:
+        owner = _api_owner(resolver=resolver)
+    else:
+        owner = _api_source_runtime(anchor, resolver)
+        if resolver is not None and owner._global_owner is not resolver._global_owner:
+            raise JinestPathError("anchor and resolver belong to different Jinest trees")
+    return owner._import_tree(path, format)
 
 
 def _api_serialize(value: Any, *, format: str = "json", file: str | os.PathLike[str] | None = None, resolver: Resolver | None = None) -> str:
     text = SerializationCodecs.serialize(_api_materialize(value, resolver), format.lower())
     if file is not None:
-        Path(file).write_text(text + ("" if text.endswith("\n") else "\n"), encoding="utf-8")
+        # The file is exactly the serialized representation returned below.
+        # This makes serialization byte-for-byte reproducible.
+        Path(file).write_text(text, encoding="utf-8")
     return text
 
 
@@ -6246,12 +6550,31 @@ def _ordered_filter(first: Any, rest: Any, *, include: bool) -> list[Any]:
     return result
 
 
-def _combine(a: Mapping[Any, Any], b: Mapping[Any, Any], recursive: bool = False) -> dict[Any, Any]:
-    result = dict(a)
+def _combine(
+    a: Mapping[Any, Any],
+    b: Mapping[Any, Any],
+    recursive: bool = False,
+) -> dict[Any, Any]:
+    if not isinstance(a, Mapping) or not isinstance(b, Mapping):
+        raise TypeError("combine() requires two mappings")
+    if not isinstance(recursive, bool):
+        raise TypeError("combine recursive must be a boolean")
+
+    # Establish deterministic first-mapping key order without resolving its
+    # values. Values shadowed by ``b`` must remain lazy and untouched.
+    result = {key: _MISSING for key in a}
     for key, value in b.items():
-        if recursive and isinstance(result.get(key), Mapping) and isinstance(value, Mapping):
-            result[key] = _combine(result[key], value, recursive=True)
-        else: result[key] = value
+        # A non-mapping value from ``b`` replaces the old value outright.
+        # Do not touch the shadowed lazy value merely because recursive mode
+        # is enabled: it cannot participate in a recursive mapping merge.
+        if recursive and key in result and isinstance(value, Mapping):
+            previous = a[key]
+            if isinstance(previous, Mapping):
+                value = _combine(previous, value, recursive=True)
+        result[key] = value
+    for key, value in tuple(result.items()):
+        if value is _MISSING:
+            result[key] = a[key]
     return result
 
 
@@ -6263,10 +6586,11 @@ def _api_root_of(value: Any) -> Any:
 
 
 def _api_source_file(value: Any) -> str | None:
-    owner = _api_owner(value)
-    if isinstance(value, PathRef):
-        return owner._source_label
-    return owner._source_file(value)
+    node = _api_metadata_node(value)
+    if node is not None:
+        source = object.__getattribute__(node, "_jinest_source")
+        return source.resolver._source_label_for(source)
+    return _api_owner(value)._source_label
 
 
 def _runtime_owner(resolver: Resolver | None, kwargs: Mapping[str, Any]) -> Resolver:

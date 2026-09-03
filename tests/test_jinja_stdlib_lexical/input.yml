@@ -1,0 +1,15 @@
+# Dynamic stdlib evaluators inherit every Jinja lexical scope in which they
+# are called: destructured/nested/filter loops, macros, and call blocks.
+destructured@: "{% for left, right in [(1, 'a'), (2, 'b')] %}{{ render('{{left}}:{{right}}') }};{% endfor %}"
+nested@: "{% for outer in [1, 2] %}{% for inner in ['a', 'b'] %}{{ render('{{outer}}:{{inner}}') }};{% endfor %}{% endfor %}"
+filtered@: "{% for item in [1, 2, 3] if eval('item > 1') %}{{item}};{% endfor %}"
+
+# Filter surfaces receive the same frame as global calls.
+filter_form@: "{% for item in [1, 2] %}{{ '{{item}}' | render }}{% endfor %}"
+
+# Macro parameters and macro-local assignments remain visible to nested
+# runtime evaluation.
+macro@: "{% macro show(value) %}{% set suffix = '!' %}{{ render('{{value}}{{suffix}}') }}|{{ '{{value}}' | render }}{% endmacro %}{{ show(3) }}"
+
+# A caller block retains the loop scope in which it was declared.
+call_block@: "{% macro invoke() %}{{ caller() }}{% endmacro %}{% for item in [4] %}{% call invoke() %}{{ render('{{item}}') }}{% endcall %}{% endfor %}"

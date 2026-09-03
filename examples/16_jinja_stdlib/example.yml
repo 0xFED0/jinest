@@ -16,6 +16,12 @@ runtime_render@: '{{ render("Hello {{ name }}") }}'
 runtime_script$: "script('% return base + 2')"
 runtime_literal$: "resolve(literal({'x$': 'literal data'}))['x$']"
 
+# Dynamic evaluation keeps Jinja lexical locals, including loop targets.
+loop_runtime@: "{% for item in values %}{{ render('{{item}}') }}{% if not loop.last %},{% endif %}{% endfor %}"
+
+# File helpers are source-relative and checked against import_roots.
+file_text@: "{{ read_text('note.txt') | trim }}"
+
 # documents and serialization have deliberately different roles. `from_json`
 # parses text, `load_json` reads plain data, and `import_json` creates a lazy
 # source document with its own root.

@@ -95,6 +95,77 @@ class JinestPythonApiTests(unittest.TestCase):
         self.assertEqual(node.value, 10)  # sibling stays unevaluated
         self.assertEqual(resolver.resolve({"value$": "input * factor"}, vars={"input": 5, "factor": 2}), {"value": 10})
 
+    def test_targeted_resolution_is_non_destructive_and_rebinding_isolated(self) -> None:
+        data = {
+            "branch": {"value$": "factor"},
+            "items": ["=$factor", {"value$": "factor + 1"}],
+            "unrelated$": "missing.value",
+        }
+        resolver = jinest.Resolver(
+            data,
+            globals={"factor": 2},
+            in_place=True,
+            emit_messages=False,
+        )
+
+        self.assertEqual(resolver.resolve(resolver.root.path.branch), {"value": 2})
+        self.assertEqual(resolver.resolve(resolver.root.path.items), [2, {"value": 3}])
+        self.assertEqual(data, {
+            "branch": {"value$": "factor"},
+            "items": ["=$factor", {"value$": "factor + 1"}],
+            "unrelated$": "missing.value",
+        })
+
+        original = resolver.node({"value$": "factor"}, vars={"factor": 3})
+        self.assertEqual(original.value, 3)
+        rebound = resolver.node(
+            original,
+            context=resolver.root.branch,
+            vars={"factor": 7},
+        )
+        self.assertEqual(rebound.value, 7)
+        self.assertEqual(original.value, 3)
+        self.assertIsNot(rebound, original)
+
+    def test_synthetic_node_has_its_own_coherent_source_root(self) -> None:
+        resolver = jinest.Resolver({"outer": 10}, emit_messages=False)
+        node = resolver.node(
+            {
+                "x": 2,
+                "via_root$": "root.x",
+                "via_global$": "global_root.outer",
+                "items": [1],
+                "make()=": {
+                    "seen$": "root.x",
+                    "nested": {"seen$": "root.x"},
+                },
+                "made_by_function$": "make()",
+                "made_by_compose[i=items]=": [{"seen$": "root.x"}],
+                "nested": {
+                    "via_root$": "root.x",
+                    "origin_path@": "{{ origin.path }}",
+                    "context_path@": "{{ path }}",
+                },
+            }
+        )
+
+        self.assertEqual(node.via_root, 2)
+        self.assertEqual(node.via_global, 10)
+        self.assertEqual(str(node.source_path), "root")
+        self.assertIs(node.root, node.nested.root)
+        self.assertEqual(node.nested.via_root, 2)
+        self.assertEqual(node.made_by_function.seen, 2)
+        self.assertEqual(node.made_by_function.nested.seen, 2)
+        self.assertEqual(node.made_by_compose[0].seen, 2)
+        self.assertIs(node.root, node.made_by_function.root)
+        self.assertIs(node.root, node.made_by_compose[0].root)
+        self.assertEqual(node.nested.origin_path, "root.nested")
+        self.assertEqual(node.nested.context_path, "global_root['<node>'].nested")
+        self.assertIsNone(node.file)
+
+        second = resolver.node({"x": 2})
+        self.assertNotEqual(node.source_path, second.source_path)
+
     def test_cache_updates_and_python_function_adapter(self) -> None:
         resolver = jinest.Resolver(
             {"a$": "factor", "b$": "factor", "double(x)$": "x * factor"},
@@ -108,6 +179,44 @@ class JinestPythonApiTests(unittest.TestCase):
         self.assertEqual(resolver.root.a, 3)
         self.assertEqual(resolver.root.double.call(4), 12)
         self.assertEqual(resolver.root.double.fn()(4), 12)
+
+    def test_python_function_adapters_cover_all_modes_and_validate_bindings(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "factor": 3,
+                "scope": {"factor": 5, "x": 99},
+                "native(x, y=2)$": "x * y + factor",
+                "text(x)@": "{{ x }}/{{ factor }}/{{ extra }}",
+                "script(x)^": "% return x + factor",
+                "factory(x)=": {
+                    "value$": "x * factor",
+                    "unrelated$": "missing.value",
+                },
+            },
+            emit_messages=False,
+        )
+
+        self.assertEqual(resolver.root.native.call(2), 7)
+        self.assertEqual(resolver.root.native.fn(context=resolver.root.scope)(2), 9)
+        self.assertEqual(
+            resolver.root.text.fn(
+                context=resolver.root.scope, vars={"extra": "ok"}
+            )(2),
+            "2/5/ok",
+        )
+        self.assertEqual(resolver.root.script.fn(context="global_root.scope")(2), 7)
+
+        structural = resolver.root.factory.fn(context=resolver.root.scope)(2)
+        self.assertEqual(structural.value, 10)
+        self.assertEqual(str(structural.path), "global_root.scope")
+
+        with self.assertRaisesRegex(TypeError, "vars must be a mapping"):
+            resolver.root.native.fn(vars=1)
+        external = jinest.Resolver({}, emit_messages=False)
+        with self.assertRaisesRegex(jinest.JinestError, "same Jinest resolver tree"):
+            resolver.root.native.fn(context=external.root)
+        with self.assertRaisesRegex(jinest.JinestError, "same Jinest resolver tree"):
+            resolver.node({"value": 1}, context=external.root)
 
     def test_api_helpers_infer_owners_and_hide_python_pathref_info_from_jinja(self) -> None:
         resolver = jinest.Resolver(
@@ -155,6 +264,60 @@ class JinestPythonApiTests(unittest.TestCase):
         resolver.clear_cache()
         self.assertEqual(synthetic.value, 2)
 
+    def test_import_tree_from_node_creates_an_independent_source_snapshot(self) -> None:
+        source = {"branch": {"x": 1, "value$": "root.x"}}
+        resolver = jinest.Resolver(source, emit_messages=False)
+        imported = resolver.import_tree(
+            resolver.root.branch,
+            source="plugin://independent",
+        )
+
+        self.assertEqual(imported.value, 1)
+        self.assertEqual(imported.file, "plugin://independent")
+        self.assertIs(imported.root, imported)
+        self.assertEqual(str(imported.source_path), "root")
+        self.assertIsNot(imported.root, resolver.root.branch.root)
+
+        plain = {"x": 2, "value$": "root.x"}
+        copied = resolver.import_tree(plain, source="plugin://plain-snapshot")
+        plain["x"] = 99
+        self.assertEqual(copied.value, 2)
+
+    def test_import_tree_requires_identity_and_tracks_virtual_cycles(self) -> None:
+        resolver = jinest.Resolver({}, emit_messages=False)
+        with self.assertRaisesRegex(TypeError, "source"):
+            resolver.import_tree({"value": 1})
+        with self.assertRaisesRegex(TypeError, "source"):
+            jinest.helpers.documents.import_tree({"value": 1}, resolver=resolver)
+
+        virtual = resolver.import_tree(
+            {"value": 1},
+            source="plugin://documents/defaults.json",
+        )
+        self.assertEqual(virtual.file, "plugin://documents/defaults.json")
+
+        recursive = resolver.import_tree(
+            {"again$": "import_tree({'ignored': true}, 'plugin://cycle/self')"},
+            source="plugin://cycle/self",
+        )
+        self.assertIsNone(recursive.again)
+
+        second_tree = {
+            "back$": "import_tree({'ignored': true}, 'plugin://cycle/first')"
+        }
+        resolver.update_globals({"second_tree": second_tree})
+        first = resolver.import_tree(
+            {"second$": "import_tree(second_tree, 'plugin://cycle/second')"},
+            source="plugin://cycle/first",
+        )
+        self.assertIsNone(first.second.back)
+
+        with self.assertRaisesRegex(jinest.JinestTemplateError, "required positional"):
+            jinest.resolve(
+                {"bad$": "import_tree({'value': 1})"},
+                emit_messages=False,
+            )
+
     def test_source_aware_file_helpers_use_anchor_document_base_dir(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -166,6 +329,51 @@ class JinestPythonApiTests(unittest.TestCase):
             self.assertEqual(jinest.helpers.files.read_text("schema.txt", anchor=document), "schema")
             self.assertEqual(jinest.helpers.files.file_path("schema.txt", anchor=document), text)
 
+    def test_source_helpers_follow_attached_imported_pathrefs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            main_dir = folder / "main"
+            imported_dir = folder / "imported"
+            main_dir.mkdir()
+            imported_dir.mkdir()
+            (imported_dir / "adjacent.txt").write_text("source", encoding="utf-8")
+            (imported_dir / "child.json").write_text(
+                '{"answer": 42}', encoding="utf-8"
+            )
+
+            resolver = jinest.Resolver(
+                {
+                    "attached$": (
+                        "import_tree({'nested': {'value': 1}}, "
+                        "'plugin://attached', base_dir=imported_dir)"
+                    )
+                },
+                globals={"imported_dir": str(imported_dir)},
+                source_path=main_dir / "main.yml",
+                emit_messages=False,
+            )
+            attached = resolver.root.attached
+            attached_path = resolver.root.path.attached.nested
+
+            self.assertEqual(
+                jinest.helpers.path.source_file(attached_path),
+                "plugin://attached",
+            )
+            self.assertEqual(
+                jinest.helpers.path.source_dir(attached_path),
+                str(imported_dir),
+            )
+            self.assertEqual(
+                jinest.helpers.files.read_text("adjacent.txt", anchor=attached_path),
+                "source",
+            )
+            imported_child = jinest.helpers.documents.import_json(
+                "child.json", anchor=attached_path
+            )
+            self.assertEqual(imported_child.answer, 42)
+            self.assertEqual(imported_child.file, str(imported_dir / "child.json"))
+            self.assertEqual(attached.nested.value, 1)
+
     def test_literal_helpers_serialization_and_collections(self) -> None:
         value = {"x$": "literal", "nested": {"value": "=$not_code"}}
         escaped = jinest.helpers.runtime.literal(value)
@@ -173,6 +381,157 @@ class JinestPythonApiTests(unittest.TestCase):
         self.assertEqual(resolver.resolve(escaped), value)
         self.assertEqual(jinest.helpers.serialization.to_json({"data": b"\xff"}), '{\n  "data": "ÿ"\n}')
         self.assertEqual(jinest.helpers.collections.union([{ "x": 1 }], [{ "x": 1 }, {"x": 2}]), [{"x": 1}, {"x": 2}])
+
+    def test_pathrefs_are_immutable(self) -> None:
+        path = jinest.Resolver({"value": 1}, emit_messages=False).root.path.value
+        with self.assertRaisesRegex(AttributeError, "immutable"):
+            path._jinest_segments = ("other",)
+        self.assertEqual(path.info.segments, ("value",))
+
+    def test_serialize_file_is_byte_exact_with_returned_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "value.json"
+            rendered = jinest.helpers.serialization.serialize(
+                {"value": 1}, format="json", file=target
+            )
+            self.assertEqual(target.read_bytes(), rendered.encode("utf-8"))
+
+    def test_helper_ownership_rejects_unrelated_resolver_trees(self) -> None:
+        first = jinest.Resolver({"value": 1}, emit_messages=False)
+        second = jinest.Resolver({"value": 2}, emit_messages=False)
+        with self.assertRaisesRegex(jinest.JinestError, "same Jinest tree"):
+            jinest.helpers.path.at(second.root.path.value, resolver=first)
+        with self.assertRaisesRegex(jinest.JinestError, "same Jinest tree"):
+            jinest.helpers.runtime.resolve(second.root.path.value, resolver=first)
+        with self.assertRaisesRegex(jinest.JinestError, "same Jinest tree"):
+            jinest.helpers.serialization.to_json(
+                second.root.path.value,
+                resolver=first,
+            )
+        with self.assertRaisesRegex(jinest.JinestError, "same Jinest tree"):
+            jinest.helpers.path.source_dir(second.root, resolver=first)
+
+    def test_direct_resolver_methods_reject_foreign_lazy_values(self) -> None:
+        first = jinest.Resolver({"value": 1}, emit_messages=False)
+        second = jinest.Resolver({"value": 2}, emit_messages=False)
+        for action in (
+            lambda: first.resolve(second.root),
+            lambda: first.resolve(second.root.path.value),
+            lambda: first.node(second.root),
+            lambda: first.clear_cache(second.root),
+            lambda: first.clear_cache(second.root.path.value),
+        ):
+            with self.assertRaisesRegex(jinest.JinestError, "same Jinest resolver tree"):
+                action()
+
+    def test_import_tree_rejects_empty_identity_and_unsafe_snapshot(self) -> None:
+        class Uncopyable:
+            def __deepcopy__(self, memo: dict[int, Any]) -> Any:
+                raise RuntimeError("no snapshot")
+
+        resolver = jinest.Resolver({}, emit_messages=False)
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            resolver.import_tree({}, source="")
+        with self.assertRaisesRegex(jinest.JinestImportError, "Could not snapshot"):
+            resolver.import_tree({"payload": Uncopyable()}, source="plugin://uncopyable")
+
+    def test_pathref_source_metadata_does_not_force_broken_scalar(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.yml"
+            resolver = jinest.Resolver(
+                {"broken$": "missing.value"},
+                source_path=config,
+                emit_messages=False,
+            )
+            broken_path = resolver.root.path.broken
+            self.assertEqual(
+                jinest.helpers.path.source_dir(broken_path), str(config.parent)
+            )
+            self.assertEqual(
+                jinest.helpers.path.source_file(broken_path), str(config)
+            )
+            with self.assertRaises(jinest.JinestTemplateError):
+                resolver.resolve(broken_path)
+
+    def test_equal_raw_containers_in_distinct_synthetic_documents_do_not_cycle(self) -> None:
+        resolver = jinest.Resolver({}, emit_messages=False)
+        shared = {"value": 1}
+        left = resolver.node(shared)
+        right = resolver.node(shared)
+        tree = resolver.node([left, right])
+        self.assertEqual(resolver.resolve(tree), [{"value": 1}, {"value": 1}])
+
+    def test_flatten_accepts_generic_iterables_but_keeps_mappings_atomic(self) -> None:
+        values = (item for item in ([1, 2], (value for value in (3, 4))))
+        mapping = {"value": [1, 2]}
+        self.assertEqual(
+            jinest.resolve(
+                {
+                    "flattened$": "flatten(values)",
+                    "atomic$": "flatten(mapping)",
+                },
+                globals={"values": values, "mapping": mapping},
+                emit_messages=False,
+            ),
+            {"flattened": [1, 2, 3, 4], "atomic": [mapping]},
+        )
+
+    def test_cache_invalidation_covers_descendants_keys_layers_and_documents(self) -> None:
+        state = {"value": 1}
+        resolver = jinest.Resolver(
+            {
+                "branch": {
+                    "nested": {"value$": "current()"},
+                    "sibling$": "current()",
+                },
+                "outside$": "current()",
+            },
+            globals={"current": lambda: state["value"]},
+            emit_messages=False,
+        )
+        child = resolver.root.branch.nested
+        self.assertEqual(child.value, 1)
+        self.assertEqual(resolver.root.branch.sibling, 1)
+        self.assertEqual(resolver.root.outside, 1)
+        state["value"] = 2
+        resolver.clear_cache(resolver.root.path.branch)
+        self.assertEqual(child.value, 2)
+        self.assertEqual(resolver.root.branch.sibling, 2)
+        self.assertEqual(resolver.root.outside, 1)
+
+        dynamic = jinest.Resolver(
+            {"=$dynamic_key": "value"},
+            globals={"dynamic_key": "before"},
+            emit_messages=False,
+        )
+        self.assertEqual(dynamic.resolve(), {"before": "value"})
+        dynamic.update_globals({"dynamic_key": "after"})
+        dynamic.clear_cache()
+        self.assertEqual(dynamic.resolve(), {"after": "value"})
+
+        layered = jinest.Resolver(
+            {"<<$": "layer"},
+            globals={"layer": {"value": 1}},
+            emit_messages=False,
+        )
+        self.assertEqual(layered.root.value, 1)
+        layered.update_globals({"layer": {"value": 2}})
+        layered.clear_cache(layered.root)
+        self.assertEqual(layered.root.value, 2)
+
+        document = resolver.import_tree(
+            {"value$": "current()"},
+            source="plugin://cache/preserved",
+        )
+        self.assertIs(
+            document,
+            resolver.import_tree({}, source="plugin://cache/preserved"),
+        )
+        resolver.clear_cache()
+        self.assertIs(
+            document,
+            resolver.import_tree({}, source="plugin://cache/preserved"),
+        )
 
     def test_every_helper_namespace_uses_shared_runtime_primitives(self) -> None:
         resolver = jinest.Resolver(
@@ -293,6 +652,40 @@ class JinestStdlibTests(unittest.TestCase):
         )
         self.assertEqual(standard_map.resolve(), {"text": "a,b"})
 
+    def test_registry_has_exact_deterministic_export_surfaces(self) -> None:
+        resolver = jinest.Resolver({}, emit_messages=False)
+        global_only = {"map", "filter"}
+        compatibility_filters = {"import"}
+        tests = {"regex_match", "regex_fullmatch", "regex_search"}
+        globals_expected = {
+            "normalize_path", "absolute_path", "relative_path", "path_of",
+            "source_path_of", "at", "get", "root_of", "source_file",
+            "source_dir", "file_path", "read_text", "read_lines",
+            "read_bytes", "file_exists", "node", "resolve", "eval",
+            "render", "script", "literal", "load_json", "load_yaml",
+            "import_json", "import_yaml", "import", "import_tree",
+            "from_json", "from_yaml", "to_json", "to_yaml",
+            "json_normalize", "yaml_normalize", "flatten", "zip",
+            "enumerate", "product", "combine", "map", "filter", "apply",
+            "any", "all", "union", "intersect", "difference",
+            "symmetric_difference", "clamp", "ceil", "floor", "sqrt",
+            "log", "split", "regex_match", "regex_fullmatch",
+            "regex_search", "regex_findall", "regex_replace", "regex_split",
+            "regex_escape",
+        }
+        filters_expected = (globals_expected - global_only) | compatibility_filters
+        self.assertEqual(set(resolver.stdlib.globals), globals_expected)
+        self.assertEqual(set(resolver.stdlib.filters), filters_expected)
+        self.assertEqual(set(resolver.stdlib.tests), tests)
+        self.assertEqual(
+            tuple(resolver.stdlib.globals),
+            tuple(jinest.Resolver({}, emit_messages=False).stdlib.globals),
+        )
+        for environment in (resolver.environment, resolver.script_environment):
+            self.assertTrue(globals_expected <= set(environment.globals))
+            self.assertTrue(filters_expected <= set(environment.filters))
+            self.assertTrue(tests <= set(environment.tests))
+
     def test_runtime_stdlib_inherits_context_lexical_function_and_compose_locals(self) -> None:
         resolver = jinest.Resolver(
             {
@@ -336,6 +729,99 @@ class JinestStdlibTests(unittest.TestCase):
                 "composed": [5, 6],
             },
         )
+
+    def test_intrinsic_key_metadata_and_lexical_reserved_locals(self) -> None:
+        intrinsic = jinest.Resolver(
+            {
+                "keyname": "field-keyname",
+                "effective_key": "field-effective-key",
+                "keymode": "field-keymode",
+                "keypath": "field-keypath",
+                "value$": "[keyname, effective_key, keymode, keypath]",
+            },
+            emit_messages=False,
+        ).resolve()
+        self.assertEqual(intrinsic["value"][:3], ["value", "value$", "$"])
+        self.assertEqual(str(intrinsic["value"][3]), "global_root.value")
+
+        lexical = jinest.Resolver(
+            {
+                "items": ["a", "b"],
+                "set_value@": (
+                    "{% set path = 'local-path' %}"
+                    "{% set keyname = 'local-key' %}"
+                    "{{ eval('path ~ keyname') }}"
+                ),
+                "loop_value@": (
+                    "{% for path in items %}{{ render('{{ path }}') }}{% endfor %}"
+                ),
+            },
+            emit_messages=False,
+        ).resolve()
+        self.assertEqual(lexical["set_value"], "local-pathlocal-key")
+        self.assertEqual(lexical["loop_value"], "ab")
+
+    def test_dynamic_helpers_inherit_all_visible_jinja_lexical_scopes(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "destructured@": (
+                    "{% for left, right in [(1, 'a'), (2, 'b')] %}"
+                    "{{ render('{{left}}:{{right}}') }};{% endfor %}"
+                ),
+                "nested@": (
+                    "{% for outer in [1, 2] %}{% for inner in ['a', 'b'] %}"
+                    "{{ render('{{outer}}:{{inner}}') }};"
+                    "{% endfor %}{% endfor %}"
+                ),
+                "filtered@": (
+                    "{% for item in [1, 2, 3] if eval('item > 1') %}"
+                    "{{item}};{% endfor %}"
+                ),
+                "filter_form@": (
+                    "{% for item in [1, 2] %}{{ '{{item}}' | render }}"
+                    "{% endfor %}"
+                ),
+                "macro@": (
+                    "{% macro show(value) %}{% set suffix = '!' %}"
+                    "{{ render('{{value}}{{suffix}}') }}|"
+                    "{{ '{{value}}' | render }}{% endmacro %}{{ show(3) }}"
+                ),
+                "call_block@": (
+                    "{% macro invoke() %}{{ caller() }}{% endmacro %}"
+                    "{% for item in [4] %}{% call invoke() %}"
+                    "{{ render('{{item}}') }}{% endcall %}{% endfor %}"
+                ),
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            resolver.resolve(),
+            {
+                "destructured": "1:a;2:b;",
+                "nested": "1:a;1:b;2:a;2:b;",
+                "filtered": "2;3;",
+                "filter_form": "12",
+                "macro": "3!|3",
+                "call_block": "4",
+            },
+        )
+
+    def test_filter_updates_invalidate_only_compiled_artifacts(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "cached$": "4 | sqrt",
+                "future$": "4 | sqrt",
+                "future_script^": "% return 4 | sqrt",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(resolver.root.cached, 2)
+        resolver.update_filters({"sqrt": lambda value: value + 1})
+        self.assertEqual(resolver.root.cached, 2)
+        self.assertEqual(resolver.root.future, 5)
+        self.assertEqual(resolver.root.future_script, 5)
+        resolver.clear_cache(resolver.root.path.cached)
+        self.assertEqual(resolver.root.cached, 5)
 
     def test_collections_math_and_callable_dispatch(self) -> None:
         def double(value: int) -> int:
@@ -389,6 +875,31 @@ class JinestStdlibTests(unittest.TestCase):
         unsafe.unsafe_callable = True
         with self.assertRaisesRegex(jinest.JinestTemplateError, "not safely callable"):
             jinest.Resolver({"value$": "map(unsafe, [1])"}, globals={"unsafe": unsafe}, emit_messages=False).resolve()
+
+    def test_collection_helpers_preserve_laziness_and_reject_cycles(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "base": {"unused$": "missing.value", "kept": 1},
+                "combined$": "combine(base, {'unused': 2})",
+                "recursive_combined$": "combine(base, {'unused': 3}, recursive=true)",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(resolver.root.combined, {"unused": 2, "kept": 1})
+        self.assertEqual(resolver.root.recursive_combined, {"unused": 3, "kept": 1})
+
+        cycle: list[object] = []
+        cycle.append(cycle)
+        with self.assertRaisesRegex(jinest.JinestError, "Cyclic iterable"):
+            jinest.Resolver(
+                {"value$": "flatten(cycle)"},
+                globals={"cycle": cycle},
+                emit_messages=False,
+            ).resolve()
+        for expression in ("combine([], {})", "combine({}, [])"):
+            with self.subTest(expression=expression):
+                with self.assertRaisesRegex(jinest.JinestTemplateError, "two mappings"):
+                    jinest.resolve({"value$": expression}, emit_messages=False)
 
     def test_stdlib_collection_and_math_edge_contracts(self) -> None:
         calls: list[int] = []
@@ -460,6 +971,30 @@ class JinestStdlibTests(unittest.TestCase):
         with self.assertRaisesRegex(jinest.JinestTemplateError, "Invalid regular expression"):
             jinest.resolve({"bad$": "regex_search('x', '[')"}, emit_messages=False)
 
+    def test_jinja_file_path_does_not_expose_pathlib_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            allowed = folder / "allowed"
+            allowed.mkdir()
+            outside = folder / "outside.txt"
+            outside.write_text("secret", encoding="utf-8")
+            resolver = jinest.Resolver(
+                {
+                    "path$": "file_path('inside.txt')",
+                    "escape$": (
+                        "file_path('.').parent.joinpath('outside.txt').read_text()"
+                    ),
+                },
+                base_dir=allowed,
+                import_roots=[allowed],
+                emit_messages=False,
+            )
+            self.assertEqual(resolver.root["path"], str(allowed / "inside.txt"))
+            with self.assertRaises(jinest.JinestTemplateError):
+                resolver.root.escape
+            self.assertEqual(outside.read_text(encoding="utf-8"), "secret")
+            self.assertFalse((allowed / "inside.txt").exists())
+
     def test_files_documents_and_serialization_use_source_aware_python_primitives(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -509,7 +1044,7 @@ class JinestStdlibTests(unittest.TestCase):
 
 class JinestCoreTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(jinest.__version__, "0.19.1")
+        self.assertEqual(jinest.__version__, "0.19.2")
 
     def test_scalar_roots_and_extended_scalars(self) -> None:
         values = [None, True, 42, 3.5, "text", b"\x00A\xff", date(2026, 8, 2)]

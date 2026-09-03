@@ -9,3 +9,7 @@ zip_value$: zip(values, ['a', 'b'])
 product_value$: product(values, ['x', 'y'])
 regex$: "'jinest' is regex_fullmatch('[a-z]+')"
 json@: '{{ {"value": base} | to_json }}'
+
+# import_tree uses an explicit stable identity and participates in cycle tracking.
+tree_cycle$: >-
+  import_tree({'again$': "import_tree({'x': 1}, 'plugin://portable-cycle')"}, 'plugin://portable-cycle').again

@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.19.1` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.19.2` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -234,7 +234,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.19.1
+  version: 0.19.2
   label@: "{{ product }} v{{ version }}"
 ```
 
@@ -1029,7 +1029,10 @@ plain tree for a later Jinest parse.
 
 File helpers default to the current declaration's source directory and use the
 same canonical-path and `import_roots` checks as `import_json`/`import_yaml`.
-A forbidden path raises an error even for `file_exists()`.
+A forbidden path raises an error even for `file_exists()`. In Jinja,
+`file_path()` returns the canonical path as a string, so it does not leak
+`pathlib.Path` read/write methods through the sandbox; the Python helper returns
+a normal `Path` object.
 
 ```jinja
 {% set parsed = text | from_json %}             {# text -> plain data #}
@@ -1039,7 +1042,15 @@ A forbidden path raises an error even for `file_exists()`.
 ```
 
 `import_tree(value, "plugin://name/defaults")` creates the same independent,
-lazy source-document model from an in-memory tree. `to_json`, `to_yaml`, and
+lazy source-document model from an in-memory tree. Its non-empty `source`
+argument is required because it is the stable cache, metadata, and
+cycle-detection identity; the first import takes an independent snapshot and
+fails rather than retaining a caller-owned mutable tree if that snapshot cannot
+be made. A string with a URI scheme (for example `plugin://...`) is always a
+virtual identity, even when it ends in `.json` or `.yaml`. A `PathLike`, an
+absolute string path, or a relative string ending in `.json`, `.yaml`, or
+`.yml` is canonicalized as a filesystem identity; other strings are virtual
+identities. `to_json`, `to_yaml`, and
 normalization helpers materialize a selected lazy node/`PathRef` when needed;
 ordinary mappings remain ordinary data and are never reparsed as declarations.
 
@@ -1134,6 +1145,12 @@ resolver.update_globals({"factor": 3}) # existing cached fields stay cached
 resolver.clear_cache(resolver.root.path.answer)
 ```
 
+A `Resolver` accepts a lazy node or `PathRef` target only from its own resolver
+tree; use the value's owner (or a helper without an explicit `resolver=`) for a
+foreign target. A plain synthetic `node(..., root=foreign_root)` remains the
+explicit source-root override described above. This distinction prevents a
+materializer from silently crossing an unrelated runtime boundary.
+
 `update_globals()` and `update_filters()` update both native/text and script
 environments, including independent documents already cached by
 `import_json`, `import_yaml`, or `import_tree`. They intentionally do not clear
@@ -1171,15 +1188,18 @@ therefore recovers literal external data without treating it as syntax.
 ### Helper namespaces
 
 All helpers are available after `import jinest` as `jinest.helpers`, including
-when only `jinest.py` is copied into an application. They are Python facades;
-none of these names are added to the Jinja environment.
+when only `jinest.py` is copied into an application. They are Python facades
+over the same runtime primitives used by the Jinja standard library. The
+namespace objects themselves are Python-only; enabled stdlib namespaces expose
+the corresponding functions as global Jinja names and filters as documented
+above.
 
 | Namespace | Public functions | Purpose |
 |---|---|---|
 | `helpers.path` | `normalize_path`, `absolute_path`, `relative_path`, `path_of`, `source_path_of`, `at`, `get`, `root_of`, `source_file`, `source_dir` | Navigate and inspect Jinest node paths. A node or `PathRef` supplies its owner automatically; bare string paths require `resolver=` or an `anchor=`. |
-| `helpers.files` | `file_path`, `read_text`, `read_lines`, `read_bytes`, `file_exists` | Read-only source-aware filesystem access. With a resolver/node anchor it uses the same base-directory and `import_roots` policy as imports. |
+| `helpers.files` | `file_path`, `read_text`, `read_lines`, `read_bytes`, `file_exists` | Read-only source-aware filesystem access. With a resolver/node anchor it uses the same base-directory and `import_roots` policy as imports; Python `file_path` returns `pathlib.Path`. |
 | `helpers.runtime` | `node`, `resolve`, `eval`, `render`, `script`, `literal` | Lazy binding, explicit materialization, and the three normal evaluator modes. `literal` is recursive source escaping, not an opaque wrapper. |
-| `helpers.documents` | `load_json`, `load_yaml`, `import_json`, `import_yaml`, `import_tree`, `export_json`, `export_yaml` | Separate plain parsing/loading, lazy independent documents, and normalized export. `import_tree(..., source="plugin://...")` preserves a virtual source identity. |
+| `helpers.documents` | `load_json`, `load_yaml`, `import_json`, `import_yaml`, `import_tree`, `export_json`, `export_yaml` | Separate plain parsing/loading, lazy independent documents, and normalized export. `import_tree(..., source="plugin://...")` requires and preserves a stable source identity. |
 | `helpers.serialization` | `from_json`, `from_yaml`, `to_json`, `to_yaml`, `json_normalize`, `yaml_normalize`, `serialize` | Parse/normalize/serialize without reinterpreting ordinary mappings as Jinest source. `serialize(..., file=...)` also writes and returns the text. |
 | `helpers.collections` | `combine`, `union`, `intersect`, `difference`, `symmetric_difference` | Jinest-specific deterministic mapping merge and order-preserving equality-based list set operations, including unhashable items. |
 
@@ -1350,7 +1370,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The suite contains 182 Python regression tests and 62 implementation-neutral
+The suite contains 203 Python regression tests and 63 implementation-neutral
 portable CLI fixtures.
 
 ## Security
