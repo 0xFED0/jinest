@@ -1,0 +1,45 @@
+# Run from the repository root:
+#   python examples/16_jinja_stdlib/run.py
+#
+# Jinest stdlib functions are globally visible in Jinja. Internally they are
+# organised into configurable namespaces; the Python runner below also shows
+# how to remove the filesystem namespaces for a restricted resolver.
+
+base: 5
+name: Ada
+values: [1, 2, 3]
+
+# runtime: dynamic evaluators inherit the current Jinest lookup scope.
+runtime_node$: "resolve(node({'x$': 'base * 2'})).x"
+runtime_eval$: "eval('base + 1')"
+runtime_render@: '{{ render("Hello {{ name }}") }}'
+runtime_script$: "script('% return base + 2')"
+runtime_literal$: "resolve(literal({'x$': 'literal data'}))['x$']"
+
+# documents and serialization have deliberately different roles. `from_json`
+# parses text, `load_json` reads plain data, and `import_json` creates a lazy
+# source document with its own root.
+json_text: '{"from_text": 4}'
+from_text$: from_json(json_text).from_text
+from_file$: load_json('data.json').from_file
+from_import$: import_json('prototype.json').result
+virtual_tree$: "import_tree({'value$': '3'}, 'plugin://example/stdlib').value"
+serialized@: '{{ {"name": name} | to_json }}'
+
+# collections call actual Jinest/Python callables. Unlike this global `map`,
+# standard Jinja `values | map("string")` remains unchanged.
+double(x)$: x * 2
+is_large(x)$: x > 1
+doubled$: map(double, values)
+selected$: filter(is_large, values)
+indexed$: values | enumerate
+matrix$: product(['a', 'b'], [1, 2])
+flat$: flatten([[1, [2]], [3]])
+
+# math and strings include focused helpers without replacing Jinja's common
+# lower/replace/map filters. Regex tests are also usable after `is`.
+limited$: clamp(12, 0, 10)
+words$: "'a,b,c' | split(',', 1)"
+slug: jinest
+slug_ok$: "slug is regex_fullmatch('[a-z]+')"
+slug_parts$: "regex_findall('jiNEST jinest', 'jinest', ignorecase=true)"

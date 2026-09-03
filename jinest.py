@@ -42,8 +42,8 @@ Syntax
 * ``path`` is an immutable PathRef for the destination context. Nodes expose
   ``path``, ``source_path``, ``root``, and ``file`` metadata attributes.
 * Path helpers: ``normalize_path``, ``absolute_path``, ``relative_path``,
-  ``path_of``, ``source_path_of``, ``at``, ``get``, ``root_of``, and
-  ``source_file``.
+  ``path_of``, ``source_path_of``, ``at``, ``get``, ``root_of``,
+  ``source_file``, and ``source_dir``.
 * Lists are ordinary lazy nodes; explicit ``=$``, ``=@``, ``=^``, or self
   wrappers select evaluation for individual items.
 * ``import_yaml`` (alias ``import``) and ``import_json`` load lazy trees whose
@@ -79,6 +79,7 @@ from typing import Any, Iterator, MutableMapping, MutableSequence, NoReturn
 
 from jinja2 import ChainableUndefined, StrictUndefined, Undefined, nodes, pass_context
 from jinja2.exceptions import UndefinedError
+from jinja2.compiler import CodeGenerator, find_undeclared
 from jinja2.ext import Extension
 from jinja2.nativetypes import NativeEnvironment
 from jinja2.runtime import Context, missing
@@ -108,6 +109,9 @@ __version__ = "0.19.0"
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
 _RESERVED_NAMES = {
+    # Context values are intrinsic to every Jinest evaluator. Stdlib globals
+    # are intentionally *not* listed here: each Resolver derives them from its
+    # enabled namespace selection.
     _INTERNAL_SCOPE,
     _INTERNAL_FUNCTION_LOCALS,
     "root",
@@ -116,18 +120,6 @@ _RESERVED_NAMES = {
     "origin",
     "_",
     "path",
-    "import_yaml",
-    "import",
-    "import_json",
-    "normalize_path",
-    "absolute_path",
-    "relative_path",
-    "path_of",
-    "source_path_of",
-    "at",
-    "get",
-    "root_of",
-    "source_file",
 }
 _MERGE_RE = re.compile(
     # ``!`` is always before the numeric order. ``[]`` changes source
@@ -1147,7 +1139,12 @@ class _JinestContext(Context):
         if function_locals is not None and key in function_locals:
             return function_locals[key]
 
-        if key not in _RESERVED_NAMES and isinstance(scope, _ContainerProxy):
+        reserved_names = (
+            object.__getattribute__(scope, "_jinest_owner")._reserved_names
+            if isinstance(scope, _ContainerProxy)
+            else _RESERVED_NAMES
+        )
+        if key not in reserved_names and isinstance(scope, _ContainerProxy):
             value = scope._jinest_resolve_name(key)
             if value is not _MISSING:
                 return value
@@ -1156,6 +1153,127 @@ class _JinestContext(Context):
         if value is not missing:
             return value
         return missing
+
+
+class _JinestCodeGenerator(CodeGenerator):
+    """Jinja 3.1 code generator that carries loop targets to pass_context.
+
+    Jinja's stock generator creates ``_loop_vars`` for context callables but
+    only fills it for assignments, not for the loop target itself. Dynamic
+    Jinest evaluators must inherit normally visible lexical loop values, so we
+    extend that one point while preserving the upstream generation algorithm.
+    """
+
+    def visit_For(self, node: nodes.For, frame: Any) -> None:
+        loop_frame = frame.inner()
+        loop_frame.loop_frame = True
+        test_frame = frame.inner()
+        else_frame = frame.inner()
+        extended_loop = (
+            node.recursive
+            or "loop" in find_undeclared(node.iter_child_nodes(only=("body",)), ("loop",))
+            or any(block.scoped for block in node.find_all(nodes.Block))
+        )
+        loop_ref = None
+        if extended_loop:
+            loop_ref = loop_frame.symbols.declare_parameter("loop")
+        loop_frame.symbols.analyze_node(node, for_branch="body")
+        if node.else_:
+            else_frame.symbols.analyze_node(node, for_branch="else")
+        if node.test:
+            loop_filter_func = self.temporary_identifier()
+            test_frame.symbols.analyze_node(node, for_branch="test")
+            self.writeline(f"{self.func(loop_filter_func)}(fiter):", node.test)
+            self.indent()
+            self.enter_frame(test_frame)
+            self.writeline(self.choose_async("async for ", "for "))
+            self.visit(node.target, loop_frame)
+            self.write(" in ")
+            self.write(self.choose_async("auto_aiter(fiter)", "fiter"))
+            self.write(":")
+            self.indent()
+            self.writeline("if ", node.test)
+            self.visit(node.test, test_frame)
+            self.write(":")
+            self.indent()
+            self.writeline("yield ")
+            self.visit(node.target, loop_frame)
+            self.outdent(3)
+            self.leave_frame(test_frame, with_python_scope=True)
+        if node.recursive:
+            self.writeline(f"{self.func('loop')}(reciter, loop_render_func, depth=0):", node)
+            self.indent()
+            self.buffer(loop_frame)
+            else_frame.buffer = loop_frame.buffer
+        if extended_loop:
+            self.writeline(f"{loop_ref} = missing")
+        for name in node.find_all(nodes.Name):
+            if name.ctx == "store" and name.name == "loop":
+                self.fail("Can't assign to special loop variable in for-loop target", name.lineno)
+        if node.else_:
+            iteration_indicator = self.temporary_identifier()
+            self.writeline(f"{iteration_indicator} = 1")
+        self.writeline(self.choose_async("async for ", "for "), node)
+        self.visit(node.target, loop_frame)
+        if extended_loop:
+            self.write(f", {loop_ref} in {self.choose_async('Async')}LoopContext(")
+        else:
+            self.write(" in ")
+        if node.test:
+            self.write(f"{loop_filter_func}(")
+        if node.recursive:
+            self.write("reciter")
+        else:
+            if self.environment.is_async and not extended_loop:
+                self.write("auto_aiter(")
+            self.visit(node.iter, frame)
+            if self.environment.is_async and not extended_loop:
+                self.write(")")
+        if node.test:
+            self.write(")")
+        if node.recursive:
+            self.write(", undefined, loop_render_func, depth):")
+        else:
+            self.write(", undefined):" if extended_loop else ":")
+        self.indent()
+        self.enter_frame(loop_frame)
+        self.writeline("_loop_vars = {}")
+        target_names = {
+            name.name for name in node.target.find_all(nodes.Name)
+            if name.ctx == "store"
+        }
+        if isinstance(node.target, nodes.Name) and node.target.ctx == "store":
+            target_names.add(node.target.name)
+        for name in sorted(target_names):
+            self.writeline(f"_loop_vars[{name!r}] = {loop_frame.symbols.ref(name)}")
+        if extended_loop and loop_ref is not None:
+            self.writeline(f"_loop_vars['loop'] = {loop_ref}")
+        self.blockvisit(node.body, loop_frame)
+        if node.else_:
+            self.writeline(f"{iteration_indicator} = 0")
+        self.outdent()
+        self.leave_frame(loop_frame, with_python_scope=node.recursive and not node.else_)
+        if node.else_:
+            self.writeline(f"if {iteration_indicator}:")
+            self.indent()
+            self.enter_frame(else_frame)
+            self.blockvisit(node.else_, else_frame)
+            self.leave_frame(else_frame)
+            self.outdent()
+        if node.recursive:
+            self.return_buffer_contents(loop_frame)
+            self.outdent()
+            self.start_write(frame, node)
+            self.write(f"{self.choose_async('await ')}loop(")
+            if self.environment.is_async:
+                self.write("auto_aiter(")
+            self.visit(node.iter, frame)
+            if self.environment.is_async:
+                self.write(")")
+            self.write(", loop)")
+            self.end_write(frame)
+        if self._assign_stack:
+            self._assign_stack[-1].difference_update(loop_frame.symbols.stores)
 
 
 class _SandboxedNativeEnvironment(SandboxedEnvironment, NativeEnvironment):
@@ -1473,6 +1591,8 @@ class ResolverConfig:
     emit_messages: bool
     treat_warnings_as_errors: bool
     debug: bool
+    stdlib: frozenset[str]
+    stdlib_exclude: frozenset[str]
 
 
 @dataclass(slots=True)
@@ -1572,6 +1692,520 @@ class SerializationCodecs:
         return _serialize(value, format)
 
 
+
+@dataclass(frozen=True, slots=True)
+class _StdlibExports:
+    """Explicit Jinja export surfaces for one stdlib namespace."""
+
+    globals: Mapping[str, Any] = field(default_factory=dict)
+    filters: Mapping[str, Any] = field(default_factory=dict)
+    tests: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _StdlibCallFrame:
+    """The current Jinest/Jinja call frame shared by stdlib adapters."""
+
+    resolver: "Resolver"
+    context: Context
+    scope: "_ContainerProxy"
+    origin: "_ContainerProxy"
+    root: "_ContainerProxy"
+    local_vars: Mapping[str, Any]
+
+    @classmethod
+    def from_jinja(cls, context: Context) -> "_StdlibCallFrame":
+        scope = context.vars.get(_INTERNAL_SCOPE, context.parent.get(_INTERNAL_SCOPE))
+        if not isinstance(scope, _ContainerProxy):
+            raise JinestTemplateError("Jinest stdlib is unavailable outside a Jinest evaluation frame")
+        resolver = object.__getattribute__(scope, "_jinest_owner")
+        origin = context.resolve_or_missing("origin")
+        if origin is missing or not isinstance(origin, _ContainerProxy):
+            origin = object.__getattribute__(scope, "_jinest_source").resolver._source_view(
+                object.__getattribute__(scope, "_jinest_source")
+            )
+        root = context.resolve_or_missing("root")
+        if root is missing or not isinstance(root, _ContainerProxy):
+            root = origin.root
+        # A derived Context places loop locals in ``parent`` rather than
+        # ``vars``. Start with every visible value, then remove the exact
+        # environment-global bindings; keeping those would incorrectly shadow
+        # ordinary Jinest fields in a nested eval. The remaining values are
+        # lexical ``set``/loop bindings plus Jinest's own call-frame locals.
+        local_vars = dict(object.__getattribute__(scope, "_jinest_binding").frame.local_vars or {})
+        environment_globals = context.environment.globals
+        for name, value in context.get_all().items():
+            if name in _RESERVED_NAMES:
+                continue
+            if name in environment_globals and value is environment_globals[name]:
+                continue
+            local_vars[name] = value
+        return cls(resolver, context, scope, origin, root, MappingProxyType(local_vars))
+
+    def call(self, function: Any, *args: Any, **kwargs: Any) -> Any:
+        """Invoke one template callable through Jinja's sandbox call path."""
+        return self.context.environment.call(self.context, function, *args, **kwargs)
+
+    def _scope(self, context: Any = _MISSING) -> "_ContainerProxy":
+        return self.resolver._coerce_api_scope(context, default=self.scope)
+
+    def _origin_source(self, origin: Any = _MISSING, root: Any = _MISSING) -> _Source:
+        origin_node = self.resolver._coerce_api_scope(origin, default=self.origin)
+        source = object.__getattribute__(origin_node, "_jinest_source")
+        if root is not _MISSING:
+            root_node = self.resolver._coerce_api_scope(root)
+            root_source = object.__getattribute__(root_node, "_jinest_source")
+            if root_source.resolver is not source.resolver:
+                raise JinestError("origin and root must belong to the same source tree")
+        return source
+
+    def merged_vars(self, vars: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        if vars is None:
+            return self.local_vars
+        if not isinstance(vars, Mapping):
+            raise TypeError("vars must be a mapping")
+        result = dict(self.local_vars)
+        result.update(vars)
+        return result
+
+    def render(
+        self,
+        template: Any,
+        mode: str,
+        *,
+        context: Any = _MISSING,
+        origin: Any = _MISSING,
+        root: Any = _MISSING,
+        vars: Mapping[str, Any] | None = None,
+    ) -> Any:
+        scope = self._scope(context)
+        source = self._origin_source(origin, root)
+        return self.resolver._render(
+            scope,
+            template,
+            mode=mode,
+            origin_source=source,
+            source_key=None,
+            local_vars=self.merged_vars(vars),
+            context_origin_source=source,
+        )
+
+
+class _StdlibNamespace:
+    """Base class for declarative, side-effect-free stdlib namespaces."""
+
+    name: str
+
+    def __init__(self, resolver: "Resolver") -> None:
+        self.resolver = resolver
+
+    def exports(self) -> _StdlibExports:
+        raise NotImplementedError
+
+    def contextual(self, handler: Any) -> Any:
+        @pass_context
+        def wrapper(context: Context, *args: Any, **kwargs: Any) -> Any:
+            return handler(_StdlibCallFrame.from_jinja(context), *args, **kwargs)
+        return wrapper
+
+
+class _PathStdlib(_StdlibNamespace):
+    name = "path"
+
+    def exports(self) -> _StdlibExports:
+        def normalize(frame: _StdlibCallFrame, value: Any, anchor: Any = _MISSING) -> PathRef:
+            return frame.resolver._normalize_path(value, frame=frame.context, anchor=anchor)
+        def absolute(frame: _StdlibCallFrame, value: Any, anchor: Any = _MISSING, **kwargs: Any) -> PathRef:
+            if "root" in kwargs and anchor is _MISSING:
+                anchor = kwargs.pop("root")
+            if kwargs:
+                raise TypeError(f"Unexpected arguments: {', '.join(kwargs)}")
+            return frame.resolver._absolute_path(value, frame=frame.context, anchor=anchor)
+        def relative(frame: _StdlibCallFrame, target: Any, base: Any = _MISSING, **kwargs: Any) -> PathRef:
+            if "path" in kwargs and base is _MISSING:
+                base = kwargs.pop("path")
+            if kwargs:
+                raise TypeError(f"Unexpected arguments: {', '.join(kwargs)}")
+            return frame.resolver._relative_path(target, frame=frame.context, base=base)
+        def at(frame: _StdlibCallFrame, target: Any, anchor: Any = _MISSING) -> Any:
+            return frame.resolver._at(target, anchor=anchor, frame=frame.context)
+        def get(frame: _StdlibCallFrame, target: Any, default: Any = None, anchor: Any = _MISSING) -> Any:
+            try:
+                return at(frame, target, anchor)
+            except (KeyError, IndexError, TypeError, JinestPathError, UndefinedError):
+                return default
+        def path_of(frame: _StdlibCallFrame, value: Any) -> PathRef:
+            return _api_path_of(value)
+        def source_path_of(frame: _StdlibCallFrame, value: Any) -> PathRef:
+            return _api_path_of(value, source=True)
+        def root_of(frame: _StdlibCallFrame, value: Any) -> Any:
+            return _api_root_of(value)
+        def source_file(frame: _StdlibCallFrame, value: Any) -> str | None:
+            return _api_source_file(value)
+        def source_dir(frame: _StdlibCallFrame, value: Any = _MISSING) -> str | None:
+            return _api_source_dir(frame.origin if value is _MISSING else value)
+        handlers = {
+            "normalize_path": normalize, "absolute_path": absolute,
+            "relative_path": relative, "path_of": path_of,
+            "source_path_of": source_path_of, "at": at, "get": get,
+            "root_of": root_of, "source_file": source_file, "source_dir": source_dir,
+        }
+        wrapped = {name: self.contextual(handler) for name, handler in handlers.items()}
+        return _StdlibExports(wrapped, wrapped)
+
+
+class _FilesStdlib(_StdlibNamespace):
+    name = "files"
+
+    def exports(self) -> _StdlibExports:
+        def file_path(frame: _StdlibCallFrame, path: Any, anchor: Any = _MISSING) -> Path:
+            return _api_file_path(path, anchor=frame.origin if anchor is _MISSING else anchor)
+        def read_text(frame: _StdlibCallFrame, path: Any, encoding: str = "utf-8", anchor: Any = _MISSING) -> str:
+            return _api_read_text(path, encoding=encoding, anchor=frame.origin if anchor is _MISSING else anchor)
+        def read_lines(frame: _StdlibCallFrame, path: Any, encoding: str = "utf-8", keepends: bool = False, anchor: Any = _MISSING) -> list[str]:
+            return _api_read_lines(
+                path,
+                encoding=encoding,
+                keepends=keepends,
+                anchor=frame.origin if anchor is _MISSING else anchor,
+            )
+        def read_bytes(frame: _StdlibCallFrame, path: Any, anchor: Any = _MISSING) -> bytes:
+            return _api_read_bytes(path, anchor=frame.origin if anchor is _MISSING else anchor)
+        def file_exists(frame: _StdlibCallFrame, path: Any, anchor: Any = _MISSING) -> bool:
+            return _api_file_path(path, anchor=frame.origin if anchor is _MISSING else anchor).exists()
+        handlers = {"file_path": file_path, "read_text": read_text, "read_lines": read_lines, "read_bytes": read_bytes, "file_exists": file_exists}
+        wrapped = {name: self.contextual(handler) for name, handler in handlers.items()}
+        return _StdlibExports(wrapped, wrapped)
+
+
+class _RuntimeStdlib(_StdlibNamespace):
+    name = "runtime"
+
+    def exports(self) -> _StdlibExports:
+        def node(frame: _StdlibCallFrame, value: Any, context: Any = _MISSING, origin: Any = _MISSING, root: Any = _MISSING, vars: Mapping[str, Any] | None = None) -> Any:
+            if isinstance(value, _ContainerProxy):
+                if context is origin is root is _MISSING and vars is None:
+                    return value
+                # Rebinding an existing node changes its destination attachment,
+                # not its source document.  Leave origin/root unset unless the
+                # caller explicitly requested an override; otherwise a node
+                # returned by import_tree/import_json would be forced into the
+                # caller's unrelated source tree.
+                return frame.resolver.node(
+                    value,
+                    context=frame.scope if context is _MISSING else context,
+                    origin=origin,
+                    root=root,
+                    vars=frame.merged_vars(vars),
+                    _lookup_scope=frame.scope,
+                )
+            return frame.resolver.node(
+                value,
+                context=frame.scope if context is _MISSING else context,
+                origin=frame.origin if origin is _MISSING else origin,
+                root=frame.root if root is _MISSING else root,
+                vars=frame.merged_vars(vars),
+                _lookup_scope=frame.scope,
+            )
+        def resolve(frame: _StdlibCallFrame, value: Any, context: Any = _MISSING, origin: Any = _MISSING, root: Any = _MISSING, vars: Mapping[str, Any] | None = None) -> Any:
+            if isinstance(value, (PathRef, _ContainerProxy)) and context is origin is root is _MISSING and vars is None:
+                return _api_owner(value).resolve(value)
+            if isinstance(value, PathRef):
+                value = _api_owner(value)._at_path(value)
+            if not frame.resolver._is_container(value):
+                if any(item is not _MISSING for item in (context, origin, root)) or vars is not None:
+                    raise TypeError("binding overrides require a mapping/list/node target")
+                return value
+            node_value = node(frame, value, context=context, origin=origin, root=root, vars=vars)
+            return _api_owner(node_value).resolve(node_value)
+        def dynamic(mode: str) -> Any:
+            def call(frame: _StdlibCallFrame, source: Any, context: Any = _MISSING, origin: Any = _MISSING, root: Any = _MISSING, vars: Mapping[str, Any] | None = None) -> Any:
+                return frame.render(source, mode, context=context, origin=origin, root=root, vars=vars)
+            return call
+        handlers = {
+            "node": node, "resolve": resolve, "eval": dynamic("native"),
+            "render": dynamic("text"), "script": dynamic("script"),
+            "literal": lambda frame, value: _literal_tree(value),
+        }
+        wrapped = {name: self.contextual(handler) for name, handler in handlers.items()}
+        return _StdlibExports(wrapped, wrapped)
+
+
+class _DocumentsStdlib(_StdlibNamespace):
+    name = "documents"
+
+    def exports(self) -> _StdlibExports:
+        def load(frame: _StdlibCallFrame, path: Any, format: str, encoding: str = "utf-8", anchor: Any = _MISSING) -> Any:
+            return _api_load_document(
+                path,
+                format,
+                encoding=encoding,
+                anchor=frame.origin if anchor is _MISSING else anchor,
+            )
+        def import_document(frame: _StdlibCallFrame, path: Any, format: str, anchor: Any = _MISSING) -> Any:
+            return _api_import(path, format, anchor=frame.origin if anchor is _MISSING else anchor)
+        handlers = {
+            "load_json": lambda frame, path, encoding="utf-8", anchor=_MISSING: load(frame, path, "json", encoding, anchor),
+            "load_yaml": lambda frame, path, encoding="utf-8", anchor=_MISSING: load(frame, path, "yaml", encoding, anchor),
+            "import_json": lambda frame, path, anchor=_MISSING: import_document(frame, path, "json", anchor),
+            "import_yaml": lambda frame, path, anchor=_MISSING: import_document(frame, path, "yaml", anchor),
+            "import_tree": lambda frame, value, source="memory://tree", base_dir=None: _api_owner(frame.origin).import_tree(value, source=source, base_dir=base_dir),
+        }
+        wrapped = {name: self.contextual(handler) for name, handler in handlers.items()}
+        globals_map = dict(wrapped)
+        globals_map["import"] = wrapped["import_yaml"]
+        # ``import`` as a filter predates namespace registration. Keep this
+        # documented compatibility alias while all new exports stay explicit.
+        filters_map = dict(wrapped)
+        filters_map["import"] = wrapped["import_yaml"]
+        return _StdlibExports(globals_map, filters_map)
+
+
+class _SerializationStdlib(_StdlibNamespace):
+    name = "serialization"
+
+    def exports(self) -> _StdlibExports:
+        def materialize(frame: _StdlibCallFrame, value: Any) -> Any:
+            return _api_materialize(value)
+        handlers = {
+            "from_json": lambda frame, text: SerializationCodecs.parse(text, "json"),
+            "from_yaml": lambda frame, text: SerializationCodecs.parse(text, "yaml"),
+            "to_json": lambda frame, value: SerializationCodecs.serialize(materialize(frame, value), "json"),
+            "to_yaml": lambda frame, value: SerializationCodecs.serialize(materialize(frame, value), "yaml"),
+            "json_normalize": lambda frame, value: _normalize_json_value(materialize(frame, value), active=set()),
+            "yaml_normalize": lambda frame, value: _normalize_yaml_value(materialize(frame, value), active=set()),
+        }
+        wrapped = {name: self.contextual(handler) for name, handler in handlers.items()}
+        return _StdlibExports(wrapped, wrapped)
+
+
+def _stdlib_flatten(value: Any, levels: int | None = None) -> list[Any]:
+    if levels is not None and (not isinstance(levels, int) or isinstance(levels, bool) or levels < 0):
+        raise TypeError("flatten levels must be a non-negative integer or None")
+    result: list[Any] = []
+    def append(item: Any, depth: int | None) -> None:
+        is_nested = isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray))
+        if is_nested and (depth is None or depth > 0):
+            next_depth = None if depth is None else depth - 1
+            for nested in item:
+                append(nested, next_depth)
+        else:
+            result.append(item)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            append(item, levels)
+    else:
+        result.append(value)
+    return result
+
+
+def _stdlib_zip(*values: Any, strict: bool = False) -> list[list[Any]]:
+    if not values:
+        return []
+    iterators = [iter(value) for value in values]
+    result: list[list[Any]] = []
+    while True:
+        row: list[Any] = []
+        exhausted = 0
+        for iterator in iterators:
+            try:
+                row.append(next(iterator))
+            except StopIteration:
+                exhausted += 1
+        if exhausted:
+            if strict and exhausted != len(iterators):
+                raise JinestError("zip(strict=True) requires iterables of equal length")
+            return result
+        result.append(row)
+
+
+def _stdlib_product(*values: Any) -> list[list[Any]]:
+    return [list(row) for row in product(*values)]
+
+
+class _CollectionsStdlib(_StdlibNamespace):
+    name = "collections"
+
+    def exports(self) -> _StdlibExports:
+        def enumerate_values(frame: _StdlibCallFrame, values: Any, start: int = 0) -> list[list[Any]]:
+            return [[index, value] for index, value in enumerate(values, start)]
+        def map_values(frame: _StdlibCallFrame, function: Any, *iterables: Any) -> list[Any]:
+            if not iterables:
+                raise TypeError("map() requires at least one iterable")
+            return [frame.call(function, *values) for values in zip(*iterables)]
+        def filter_values(frame: _StdlibCallFrame, predicate: Any, values: Any) -> list[Any]:
+            return [value for value in values if frame.call(predicate, value)]
+        def apply(frame: _StdlibCallFrame, value: Any, function: Any, *args: Any, **kwargs: Any) -> Any:
+            return frame.call(function, value, *args, **kwargs)
+        def any_values(frame: _StdlibCallFrame, values: Any, predicate: Any = _MISSING) -> bool:
+            for value in values:
+                candidate = value if predicate is _MISSING else frame.call(predicate, value)
+                if candidate:
+                    return True
+            return False
+        def all_values(frame: _StdlibCallFrame, values: Any, predicate: Any = _MISSING) -> bool:
+            for value in values:
+                candidate = value if predicate is _MISSING else frame.call(predicate, value)
+                if not candidate:
+                    return False
+            return True
+        handlers = {
+            "flatten": lambda frame, value, levels=None: _stdlib_flatten(value, levels),
+            "zip": lambda frame, *values, strict=False: _stdlib_zip(*values, strict=strict),
+            "enumerate": enumerate_values,
+            "product": lambda frame, *values: _stdlib_product(*values),
+            "combine": lambda frame, first, second, recursive=False: _combine(first, second, recursive),
+            "apply": apply,
+            "any": any_values, "all": all_values,
+            "union": lambda frame, *values: _ordered_union(*values),
+            "intersect": lambda frame, first, *rest: _ordered_intersect(first, *rest),
+            "difference": lambda frame, first, *rest: _ordered_filter(first, _ordered_union(*rest), include=False),
+            "symmetric_difference": lambda frame, first, second: _ordered_union(_ordered_filter(first, second, include=False), _ordered_filter(second, first, include=False)),
+        }
+        wrapped = {name: self.contextual(handler) for name, handler in handlers.items()}
+        globals_map = dict(wrapped)
+        globals_map["map"] = self.contextual(map_values)
+        globals_map["filter"] = self.contextual(filter_values)
+        return _StdlibExports(globals_map, wrapped)
+
+
+class _MathStdlib(_StdlibNamespace):
+    name = "math"
+
+    def exports(self) -> _StdlibExports:
+        def clamp(frame: _StdlibCallFrame, value: Any, minimum: Any, maximum: Any) -> Any:
+            if minimum > maximum:
+                raise JinestError("clamp minimum must not exceed maximum")
+            return min(max(value, minimum), maximum)
+        handlers = {
+            "clamp": clamp, "ceil": lambda frame, value: math.ceil(value),
+            "floor": lambda frame, value: math.floor(value), "sqrt": lambda frame, value: math.sqrt(value),
+            "log": lambda frame, value, base=None: math.log(value) if base is None else math.log(value, base),
+        }
+        wrapped = {name: self.contextual(handler) for name, handler in handlers.items()}
+        return _StdlibExports(wrapped, wrapped)
+
+
+def _regex_flags(ignorecase: bool = False, multiline: bool = False, dotall: bool = False) -> re.RegexFlag:
+    flags = re.NOFLAG
+    if ignorecase:
+        flags |= re.IGNORECASE
+    if multiline:
+        flags |= re.MULTILINE
+    if dotall:
+        flags |= re.DOTALL
+    return flags
+
+
+def _regex_compile(pattern: Any, **kwargs: Any) -> re.Pattern[str]:
+    try:
+        return re.compile(str(pattern), _regex_flags(**kwargs))
+    except re.error as exc:
+        raise JinestTemplateError(f"Invalid regular expression {pattern!r}: {exc}") from exc
+
+
+class _StringsStdlib(_StdlibNamespace):
+    name = "strings"
+
+    def exports(self) -> _StdlibExports:
+        def regex(operation: str) -> Any:
+            def call(frame: _StdlibCallFrame, value: Any, pattern: Any, **kwargs: Any) -> Any:
+                compiled = _regex_compile(pattern, **kwargs)
+                return bool(getattr(compiled, operation)(str(value)))
+            return call
+        def findall(frame: _StdlibCallFrame, value: Any, pattern: Any, **kwargs: Any) -> list[Any]:
+            return _regex_compile(pattern, **kwargs).findall(str(value))
+        def replace(frame: _StdlibCallFrame, value: Any, pattern: Any, replacement: Any, count: int = 0, **kwargs: Any) -> str:
+            return _regex_compile(pattern, **kwargs).sub(str(replacement), str(value), count=count)
+        def split(frame: _StdlibCallFrame, value: Any, pattern: Any, maxsplit: int = 0, **kwargs: Any) -> list[str]:
+            return _regex_compile(pattern, **kwargs).split(str(value), maxsplit=maxsplit)
+        handlers = {
+            "split": lambda frame, value, sep=None, maxsplit=-1: str(value).split(sep, maxsplit),
+            "regex_match": regex("match"), "regex_fullmatch": regex("fullmatch"),
+            "regex_search": regex("search"), "regex_findall": findall,
+            "regex_replace": replace, "regex_split": split,
+            "regex_escape": lambda frame, value: re.escape(str(value)),
+        }
+        wrapped = {name: self.contextual(handler) for name, handler in handlers.items()}
+        tests = {name: wrapped[name] for name in ("regex_match", "regex_fullmatch", "regex_search")}
+        return _StdlibExports(wrapped, wrapped, tests)
+
+
+class _StdlibRegistry:
+    """Collect and install deterministic Jinest Jinja stdlib exports."""
+
+    _types = (_PathStdlib, _FilesStdlib, _RuntimeStdlib, _DocumentsStdlib,
+              _SerializationStdlib, _CollectionsStdlib, _MathStdlib, _StringsStdlib)
+    names = tuple(namespace.name for namespace in _types)
+
+    def __init__(self, resolver: "Resolver", selection: bool | Sequence[str] = True, exclude: Sequence[str] = ()) -> None:
+        available = set(self.names)
+
+        def normalize_names(value: Any, option: str) -> set[str]:
+            if isinstance(value, (str, bytes)):
+                raise TypeError(f"{option} must be a collection of namespace names")
+            try:
+                names = set(value)
+            except TypeError as exc:
+                raise TypeError(f"{option} must be a collection of namespace names") from exc
+            invalid = [name for name in names if not isinstance(name, str)]
+            if invalid:
+                rendered = ", ".join(repr(name) for name in invalid)
+                raise TypeError(f"{option} namespace names must be strings, got {rendered}")
+            unknown = names - available
+            if unknown:
+                raise ValueError(
+                    f"Unknown Jinest stdlib namespace(s): {', '.join(sorted(unknown))}"
+                )
+            return names
+
+        if isinstance(selection, bool):
+            selected = set(available) if selection else set()
+        else:
+            selected = normalize_names(selection, "stdlib")
+        excluded = normalize_names(exclude, "stdlib_exclude")
+        selected -= excluded
+        self.enabled = tuple(name for name in self.names if name in selected)
+        self.excluded = frozenset(excluded)
+        globals_map: dict[str, Any] = {}
+        filters_map: dict[str, Any] = {}
+        tests_map: dict[str, Any] = {}
+        for namespace_type in self._types:
+            if namespace_type.name not in selected:
+                continue
+            exports = namespace_type(resolver).exports()
+            self._merge(globals_map, exports.globals, "global", namespace_type.name)
+            self._merge(filters_map, exports.filters, "filter", namespace_type.name)
+            self._merge(tests_map, exports.tests, "test", namespace_type.name)
+        self.globals = MappingProxyType(globals_map)
+        self.filters = MappingProxyType(filters_map)
+        self.tests = MappingProxyType(tests_map)
+
+    @staticmethod
+    def _merge(destination: dict[str, Any], exports: Mapping[str, Any], surface: str, namespace: str) -> None:
+        for name, value in exports.items():
+            if name in destination:
+                raise JinestError(f"Jinest stdlib {surface} collision for {name!r} while installing {namespace!r}")
+            destination[name] = value
+
+    def install(self, *environments: Any) -> None:
+        for environment in environments:
+            for surface, exports, existing in (
+                ("global", self.globals, environment.globals),
+                ("filter", self.filters, environment.filters),
+                ("test", self.tests, environment.tests),
+            ):
+                collisions = set(exports) & set(existing)
+                if collisions:
+                    raise JinestError(
+                        f"Jinest stdlib {surface} collides with standard Jinja name(s): "
+                        f"{', '.join(sorted(collisions))}"
+                    )
+            environment.globals.update(self.globals)
+            environment.filters.update(self.filters)
+            environment.tests.update(self.tests)
+
+
 class Resolver:
     """Resolve a structured Python tree containing lazy Jinja fields.
 
@@ -1595,6 +2229,8 @@ class Resolver:
         emit_messages: bool = True,
         treat_warnings_as_errors: bool = False,
         debug: bool = False,
+        stdlib: bool | Sequence[str] = True,
+        stdlib_exclude: Sequence[str] = (),
         _import_chain: tuple[Path, ...] | None = None,
         _global_owner: "Resolver | None" = None,
         _documents: DocumentStore | None = None,
@@ -1633,6 +2269,8 @@ class Resolver:
         self._function_stack: list[str] = []
         self._user_globals = dict(globals or {})
         self._user_filters = dict(filters or {})
+        self.stdlib = _StdlibRegistry(self, stdlib, stdlib_exclude)
+        self._reserved_names = frozenset(_RESERVED_NAMES | set(self.stdlib.globals))
         self._original = data
         self._in_place_snapshot: Any = _MISSING
         if in_place:
@@ -1693,6 +2331,8 @@ class Resolver:
             emit_messages,
             treat_warnings_as_errors,
             debug,
+            frozenset(self.stdlib.enabled),
+            self.stdlib.excluded,
         )
 
         if _import_chain is not None:
@@ -1712,97 +2352,17 @@ class Resolver:
         )
         self.environment.context_class = _JinestContext
         self.script_environment.context_class = _JinestContext
+        self.environment.code_generator_class = _JinestCodeGenerator
+        self.script_environment.code_generator_class = _JinestCodeGenerator
         self._jinja = JinjaBridge(self.environment, self.script_environment)
         self._jinja_compilation_cache = self._jinja.compilation_cache
 
-        import_yaml_fn = lambda path: self._import_tree(path, "yaml")
-        import_json_fn = lambda path: self._import_tree(path, "json")
-        @pass_context
-        def normalize_path_fn(jinja_context: Context, value: Any) -> PathRef:
-            return self._normalize_path(value, frame=jinja_context)
-
-        @pass_context
-        def absolute_path_fn(
-            jinja_context: Context,
-            value: Any,
-            anchor: Any = _MISSING,
-            **kwargs: Any,
-        ) -> PathRef:
-            if "root" in kwargs and anchor is _MISSING:
-                anchor = kwargs.pop("root")
-            if kwargs:
-                raise TypeError(f"Unexpected arguments: {', '.join(kwargs)}")
-            return self._absolute_path(value, anchor=anchor, frame=jinja_context)
-
-        @pass_context
-        def relative_path_fn(
-            jinja_context: Context,
-            target: Any,
-            base: Any = _MISSING,
-            **kwargs: Any,
-        ) -> PathRef:
-            if "path" in kwargs and base is _MISSING:
-                base = kwargs.pop("path")
-            if kwargs:
-                raise TypeError(f"Unexpected arguments: {', '.join(kwargs)}")
-            return self._relative_path(target, base=base, frame=jinja_context)
-
-        @pass_context
-        def path_of_fn(jinja_context: Context, node: Any) -> PathRef:
-            return self._path_of(node, source=False)
-
-        @pass_context
-        def source_path_of_fn(jinja_context: Context, node: Any) -> PathRef:
-            return self._path_of(node, source=True)
-
-        @pass_context
-        def at_fn(
-            jinja_context: Context,
-            target: Any,
-            anchor: Any = _MISSING,
-        ) -> Any:
-            return self._at(target, anchor=anchor, frame=jinja_context)
-
-        @pass_context
-        def get_fn(
-            jinja_context: Context,
-            target: Any,
-            default: Any = None,
-            anchor: Any = _MISSING,
-        ) -> Any:
-            try:
-                return self._at(target, anchor=anchor, frame=jinja_context)
-            except (KeyError, IndexError, TypeError, JinestPathError, UndefinedError):
-                return default
-
-        @pass_context
-        def root_of_fn(jinja_context: Context, node: Any) -> Any:
-            return self._root_of(node)
-
-        @pass_context
-        def source_file_fn(jinja_context: Context, node: Any) -> Any:
-            return self._source_file(node)
-
-        builtins = {
-            "import_yaml": import_yaml_fn,
-            "import": import_yaml_fn,
-            "import_json": import_json_fn,
-            "normalize_path": normalize_path_fn,
-            "absolute_path": absolute_path_fn,
-            "relative_path": relative_path_fn,
-            "path_of": path_of_fn,
-            "source_path_of": source_path_of_fn,
-            "at": at_fn,
-            "get": get_fn,
-            "root_of": root_of_fn,
-            "source_file": source_file_fn,
-        }
-        self.environment.globals.update(builtins)
-        self.environment.filters.update(builtins)
+        # The registry owns all Jinest-added Jinja exports. User additions are
+        # intentionally applied afterwards, so they can deliberately override
+        # a selected stdlib name without rebuilding the registry.
+        self.stdlib.install(self.environment, self.script_environment)
         self.environment.globals.update(self._user_globals)
         self.environment.filters.update(self._user_filters)
-        self.script_environment.globals.update(builtins)
-        self.script_environment.filters.update(builtins)
         self.script_environment.globals.update(self._user_globals)
         self.script_environment.filters.update(self._user_filters)
 
@@ -2154,6 +2714,7 @@ class Resolver:
     def node(
         self, value: Any, *, context: Any = _MISSING, origin: Any = _MISSING,
         root: Any = _MISSING, vars: Mapping[str, Any] | None = None,
+        _lookup_scope: _ContainerProxy | None = None,
     ) -> _ContainerProxy:
         """Bind a mapping/list as a lazy Jinest node without materializing it."""
         if not self._is_container(value):
@@ -2196,7 +2757,8 @@ class Resolver:
         bound = self._wrap(
             value, parent=parent, path=path, origin=source_origin,
             source_path=source_path, path_kind=object.__getattribute__(parent, "_jinest_path_kind"),
-            local_vars=locals_map, context_origin_source=context_origin_source,
+            local_vars=locals_map, function_scope=_lookup_scope,
+            context_origin_source=context_origin_source,
         )
         if not isinstance(bound, _ContainerProxy):
             raise TypeError("node() requires a mapping or non-string sequence")
@@ -2351,6 +2913,7 @@ class Resolver:
             source_path=source_path, base_dir=base_dir or (source_path.parent if source_path else self.base_dir),
             import_roots=self.import_roots, function_max_depth=self.function_max_depth,
             emit_messages=False, treat_warnings_as_errors=False, debug=self.debug,
+            stdlib=self.config.stdlib, stdlib_exclude=self.config.stdlib_exclude,
             _global_owner=self._global_owner, _documents=self._documents,
             _document_identity=("tree", identity), _copy_input=False,
             _source_label=identity)
@@ -5206,6 +5769,8 @@ class Resolver:
                 emit_messages=False,
                 treat_warnings_as_errors=False,
                 debug=self.debug,
+                stdlib=self.config.stdlib,
+                stdlib_exclude=self.config.stdlib_exclude,
                 _import_chain=import_chain,
                 _global_owner=self._global_owner,
                 _documents=self._documents,
@@ -5604,6 +6169,46 @@ def _api_read_text(path: Any, *, anchor: Any = _MISSING, resolver: Resolver | No
     return _api_file_path(path, anchor=anchor, resolver=resolver).read_text(encoding=encoding)
 
 
+def _api_read_lines(
+    path: Any,
+    *,
+    anchor: Any = _MISSING,
+    resolver: Resolver | None = None,
+    encoding: str = "utf-8",
+    keepends: bool = False,
+) -> list[str]:
+    return _api_read_text(path, anchor=anchor, resolver=resolver, encoding=encoding).splitlines(
+        keepends=keepends
+    )
+
+
+def _api_read_bytes(
+    path: Any, *, anchor: Any = _MISSING, resolver: Resolver | None = None
+) -> bytes:
+    return _api_file_path(path, anchor=anchor, resolver=resolver).read_bytes()
+
+
+def _api_load_document(
+    path: Any,
+    format: str,
+    *,
+    anchor: Any = _MISSING,
+    resolver: Resolver | None = None,
+    encoding: str = "utf-8",
+) -> Any:
+    """Read one ordinary JSON/YAML document through the common file policy.
+
+    A bare Python helper call retains its useful standalone form.  Calls tied
+    to a Resolver/node/path use the same source-relative canonical path and
+    import-root checks as imports and Jinja file helpers.
+    """
+    if resolver is None and anchor is _MISSING:
+        text = Path(os.fspath(path)).read_text(encoding=encoding)
+    else:
+        text = _api_read_text(path, anchor=anchor, resolver=resolver, encoding=encoding)
+    return SerializationCodecs.parse(text, format)
+
+
 def _api_import(path: Any, format: str, *, resolver: Resolver | None = None, anchor: Any = _MISSING) -> Any:
     return _api_owner_from(anchor, resolver=resolver)._import_tree(path, format)
 
@@ -5679,9 +6284,9 @@ helpers = SimpleNamespace(
         get=lambda target, default=None, *, resolver=None, anchor=_MISSING: _api_owner_from(target, anchor, resolver=resolver).get(target, default, anchor=anchor),
         root_of=_api_root_of, source_file=_api_source_file, source_dir=_api_source_dir,
     ),
-    files=SimpleNamespace(file_path=_api_file_path, read_text=_api_read_text, read_lines=lambda path, **kwargs: _api_read_text(path, **kwargs).splitlines(), read_bytes=lambda path, **kwargs: _api_file_path(path, **kwargs).read_bytes(), file_exists=lambda path, **kwargs: _api_file_path(path, **kwargs).exists()),
+    files=SimpleNamespace(file_path=_api_file_path, read_text=_api_read_text, read_lines=_api_read_lines, read_bytes=_api_read_bytes, file_exists=lambda path, **kwargs: _api_file_path(path, **kwargs).exists()),
     runtime=SimpleNamespace(node=lambda value, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).node(value, **kwargs), resolve=lambda value, *, resolver=None, **kwargs: _api_owner_from(value, kwargs.get("context", _MISSING), resolver=resolver).resolve(value, **kwargs), eval=lambda expression, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).eval(expression, **kwargs), render=lambda template, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).render(template, **kwargs), script=lambda source, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).script(source, **kwargs), literal=_literal_tree),
-    documents=SimpleNamespace(load_json=lambda path: SerializationCodecs.parse(Path(path).read_text(encoding="utf-8"), "json"), load_yaml=lambda path: SerializationCodecs.parse(Path(path).read_text(encoding="utf-8"), "yaml"), import_json=lambda path, *, resolver=None, anchor=_MISSING: _api_import(path, "json", resolver=resolver, anchor=anchor), import_yaml=lambda path, *, resolver=None, anchor=_MISSING: _api_import(path, "yaml", resolver=resolver, anchor=anchor), import_tree=lambda value, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).import_tree(value, **kwargs), export_json=lambda value, path, **kwargs: _api_serialize(value, format="json", file=path, **kwargs), export_yaml=lambda value, path, **kwargs: _api_serialize(value, format="yaml", file=path, **kwargs)),
+    documents=SimpleNamespace(load_json=lambda path, **kwargs: _api_load_document(path, "json", **kwargs), load_yaml=lambda path, **kwargs: _api_load_document(path, "yaml", **kwargs), import_json=lambda path, *, resolver=None, anchor=_MISSING: _api_import(path, "json", resolver=resolver, anchor=anchor), import_yaml=lambda path, *, resolver=None, anchor=_MISSING: _api_import(path, "yaml", resolver=resolver, anchor=anchor), import_tree=lambda value, *, resolver=None, **kwargs: _runtime_owner(resolver, kwargs).import_tree(value, **kwargs), export_json=lambda value, path, **kwargs: _api_serialize(value, format="json", file=path, **kwargs), export_yaml=lambda value, path, **kwargs: _api_serialize(value, format="yaml", file=path, **kwargs)),
     serialization=SimpleNamespace(from_json=lambda text: SerializationCodecs.parse(text, "json"), from_yaml=lambda text: SerializationCodecs.parse(text, "yaml"), to_json=lambda value, **kwargs: _api_serialize(value, format="json", **kwargs), to_yaml=lambda value, **kwargs: _api_serialize(value, format="yaml", **kwargs), json_normalize=lambda value: _normalize_json_value(_api_materialize(value), active=set()), yaml_normalize=lambda value: _normalize_yaml_value(_api_materialize(value), active=set()), serialize=_api_serialize),
     collections=SimpleNamespace(combine=_combine, union=_ordered_union, intersect=lambda first, *rest: _ordered_intersect(first, *rest), difference=lambda first, *rest: _ordered_filter(first, _ordered_union(*rest), include=False), symmetric_difference=lambda a, b: _ordered_union(_ordered_filter(a, b, include=False), _ordered_filter(b, a, include=False))),
 )

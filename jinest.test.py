@@ -203,6 +203,11 @@ class JinestPythonApiTests(unittest.TestCase):
             text_path = folder / "note.txt"; text_path.write_text('one\ntwo\n', encoding="utf-8")
             self.assertEqual(jinest.helpers.documents.load_json(json_path), {"x": 1})
             self.assertEqual(jinest.helpers.documents.load_yaml(yaml_path), {"x": 2})
+            # Loading through a resolver is source-aware just like the Jinja
+            # adapter, while bare helper calls retain standalone file use.
+            self.assertEqual(jinest.helpers.documents.load_json(json_path, resolver=resolver), {"x": 1})
+            self.assertEqual(jinest.helpers.documents.load_yaml(yaml_path, resolver=resolver), {"x": 2})
+            self.assertEqual(jinest.helpers.files.read_lines(text_path, resolver=resolver, keepends=True), ["one\n", "two\n"])
             self.assertEqual(jinest.helpers.documents.import_json(json_path, resolver=resolver).x, 1)
             self.assertEqual(jinest.helpers.documents.import_yaml(yaml_path, resolver=resolver).x, 2)
             tree = jinest.helpers.documents.import_tree({"x$": "2"}, resolver=resolver, source="plugin://test/defaults")
@@ -231,6 +236,275 @@ class JinestPythonApiTests(unittest.TestCase):
         self.assertEqual(helpers.intersect([1, 2, 2], [2, 3]), [2])
         self.assertEqual(helpers.difference([1, 2, 1], [2]), [1])
         self.assertEqual(helpers.symmetric_difference([1, 2], [2, 3]), [1, 3])
+
+
+class JinestStdlibTests(unittest.TestCase):
+    def test_registry_selection_surfaces_precedence_and_dynamic_reservation(self) -> None:
+        resolver = jinest.Resolver({}, emit_messages=False)
+        self.assertEqual(
+            resolver.stdlib.enabled,
+            ("path", "files", "runtime", "documents", "serialization", "collections", "math", "strings"),
+        )
+        self.assertIsNot(resolver.stdlib.globals, resolver.environment.globals)
+        self.assertEqual(set(resolver.stdlib.globals), set(resolver.script_environment.globals) & set(resolver.stdlib.globals))
+        self.assertIn("map", resolver.stdlib.globals)
+        self.assertNotIn("map", resolver.stdlib.filters)
+        with self.assertRaises(TypeError):
+            resolver.stdlib.globals["new"] = object()
+        with self.assertRaisesRegex(ValueError, "Unknown Jinest stdlib namespace"):
+            jinest.Resolver({}, stdlib={"collectons"})
+        with self.assertRaisesRegex(TypeError, "namespace names must be strings"):
+            jinest.Resolver({}, stdlib={"path", 1})
+        with self.assertRaisesRegex(TypeError, "collection of namespace names"):
+            jinest.Resolver({}, stdlib_exclude="files")
+
+        self.assertEqual(
+            jinest.resolve(
+                {"resolve": "field", "result$": "resolve({'x': 1}).x"},
+                emit_messages=False,
+            ),
+            {"resolve": "field", "result": 1},
+        )
+        disabled = jinest.Resolver(
+            {"resolve": "field", "result$": "resolve"},
+            stdlib=False,
+            emit_messages=False,
+        )
+        self.assertEqual(disabled.resolve(), {"resolve": "field", "result": "field"})
+        selected = jinest.Resolver({}, stdlib={"collections"}, emit_messages=False)
+        self.assertEqual(selected.stdlib.enabled, ("collections",))
+        self.assertNotIn("read_text", selected.stdlib.globals)
+        imported = selected.import_tree(
+            {"read_text": "ordinary field", "seen$": "read_text"},
+            source="plugin://stdlib/selection",
+        )
+        self.assertEqual(selected.resolve(imported), {"read_text": "ordinary field", "seen": "ordinary field"})
+
+        overridden = jinest.Resolver(
+            {"global$": "get(2)", "filter$": "4 | sqrt"},
+            globals={"get": lambda value: value + 1},
+            filters={"sqrt": lambda value: value + 2},
+            emit_messages=False,
+        )
+        self.assertEqual(overridden.resolve(), {"global": 3, "filter": 6})
+        standard_map = jinest.Resolver(
+            {"text@": "{{ ['A', 'B'] | map('lower') | join(',') }}"},
+            emit_messages=False,
+        )
+        self.assertEqual(standard_map.resolve(), {"text": "a,b"})
+
+    def test_runtime_stdlib_inherits_context_lexical_function_and_compose_locals(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "base": 4,
+                "node_value$": "resolve(node({'x$': 'base * 2'})).x",
+                "literal_value$": "resolve(literal({'x$': 'literal'}))['x$']",
+                "script_value$": "script('% return base + 1')",
+                "override_value$": "eval('base', vars={'base': 10})",
+                "rebound_import$": "resolve(node(import_tree({'value$': 'base + delta'}, 'plugin://stdlib/rebind'), vars={'delta': 2})).value",
+                "loop@": "{% for item in [1, 2] %}{{ render('{{ item }}') }}{% endfor %}",
+                "twice(x)$": "eval('x + base')",
+                "function_value$": "twice(3)",
+                "items": [1, 2],
+                "composed[i=items]=": ["=$eval('i + base')"],
+            },
+            emit_messages=False,
+        )
+        rebound = jinest.Resolver(
+            {"factor": 3, "branch": {"value$": "factor"}, "result$": "resolve(path.branch, vars={'factor': 9}).value"},
+            emit_messages=False,
+        )
+        self.assertEqual(rebound.resolve(rebound.root.path.result), 9)
+        field_priority = jinest.Resolver(
+            {"x": 1, "nested$": "eval('x')"},
+            globals={"x": 2},
+            emit_messages=False,
+        )
+        self.assertEqual(field_priority.resolve(), {"x": 1, "nested": 1})
+        self.assertEqual(
+            resolver.resolve(),
+            {
+                "base": 4,
+                "node_value": 8,
+                "literal_value": "literal",
+                "script_value": 5,
+                "override_value": 10,
+                "rebound_import": 6,
+                "loop": "12",
+                "function_value": 7,
+                "items": [1, 2],
+                "composed": [5, 6],
+            },
+        )
+
+    def test_collections_math_and_callable_dispatch(self) -> None:
+        def double(value: int) -> int:
+            return value * 2
+
+        def positive(value: int) -> bool:
+            return value > 0
+
+        resolver = jinest.Resolver(
+            {
+                "flat$": "flatten([[1, [2]], [3]])",
+                "flat_one$": "flatten([[1, [2]], [3]], 1)",
+                "flat_zero$": "flatten([[1], [2]], 0)",
+                "zipped$": "zip([1, 2], ['a', 'b'])",
+                "product_value$": "product([1, 2], ['a', 'b'])",
+                "enumerated$": "enumerate(['x', 'y'], 1)",
+                "mapped$": "map(double, [1, 2])",
+                "mapped_function$": "map(inc, [1, 2])",
+                "filtered$": "filter(positive, [-1, 0, 2])",
+                "applied$": "2 | apply(double)",
+                "any_value$": "any([0, 2])",
+                "all_value$": "all([1, 2], positive)",
+                "union_value$": "union([{'x': 1}], [{'x': 1}, {'x': 2}])",
+                "clamped$": "10 | clamp(0, 5)",
+                "inc(x)$": "x + 1",
+            },
+            globals={"double": double, "positive": positive},
+            emit_messages=False,
+        )
+        result = resolver.resolve()
+        self.assertEqual(result["flat"], [1, 2, 3])
+        self.assertEqual(result["flat_one"], [1, [2], 3])
+        self.assertEqual(result["flat_zero"], [[1], [2]])
+        self.assertEqual(result["zipped"], [[1, "a"], [2, "b"]])
+        self.assertEqual(result["product_value"], [[1, "a"], [1, "b"], [2, "a"], [2, "b"]])
+        self.assertEqual(result["enumerated"], [[1, "x"], [2, "y"]])
+        self.assertEqual(result["mapped"], [2, 4])
+        self.assertEqual(result["mapped_function"], [2, 3])
+        self.assertEqual(result["filtered"], [2])
+        self.assertEqual(result["applied"], 4)
+        self.assertTrue(result["any_value"])
+        self.assertTrue(result["all_value"])
+        self.assertEqual(result["union_value"], [{"x": 1}, {"x": 2}])
+        self.assertEqual(result["clamped"], 5)
+        self.assertEqual(jinest.resolve({"value$": "zip()", "product$": "product()"}, emit_messages=False), {"value": [], "product": [[]]})
+        with self.assertRaisesRegex(jinest.JinestError, "equal length"):
+            jinest.resolve({"value$": "zip([1], [1, 2], strict=true)"}, emit_messages=False)
+        with self.assertRaisesRegex(jinest.JinestTemplateError, "levels"):
+            jinest.resolve({"value$": "flatten([1], -1)"}, emit_messages=False)
+        unsafe = lambda value: value
+        unsafe.unsafe_callable = True
+        with self.assertRaisesRegex(jinest.JinestTemplateError, "not safely callable"):
+            jinest.Resolver({"value$": "map(unsafe, [1])"}, globals={"unsafe": unsafe}, emit_messages=False).resolve()
+
+    def test_stdlib_collection_and_math_edge_contracts(self) -> None:
+        calls: list[int] = []
+
+        def add(left: int, right: int) -> int:
+            return left + right
+
+        def nonzero(value: int) -> bool:
+            calls.append(value)
+            return value != 0
+
+        resolver = jinest.Resolver(
+            {
+                "recursive_flat$": "flatten([1, (2, [3]), {'x': 4}])",
+                "tuple_flat$": "flatten((1, (2, 3)), 1)",
+                "mapped_many$": "map(add, [1, 2], [10])",
+                "intersected$": "intersect([1, 2, 2, {'x': 1}], [2, {'x': 1}])",
+                "differed$": "difference([1, 2, 1, 3], [2])",
+                "symmetric$": "symmetric_difference([1, 2], [2, 3])",
+                "ceil_value$": "ceil(1.2)",
+                "floor_value$": "floor(1.8)",
+                "sqrt_value$": "sqrt(9)",
+                "log_value$": "log(8, 2)",
+                "any_short$": "any([0, 2, 3], nonzero)",
+                "all_short$": "all([1, 0, 2], nonzero)",
+                "dotall$": "regex_search('a\nb', 'a.b', dotall=true)",
+            },
+            globals={"add": add, "nonzero": nonzero},
+            emit_messages=False,
+        )
+        result = resolver.resolve()
+        self.assertEqual(result["recursive_flat"], [1, 2, 3, {"x": 4}])
+        self.assertEqual(result["tuple_flat"], [1, 2, 3])
+        self.assertEqual(result["mapped_many"], [11])
+        self.assertEqual(result["intersected"], [2, {"x": 1}])
+        self.assertEqual(result["differed"], [1, 3])
+        self.assertEqual(result["symmetric"], [1, 3])
+        self.assertEqual(result["ceil_value"], 2)
+        self.assertEqual(result["floor_value"], 1)
+        self.assertEqual(result["sqrt_value"], 3)
+        self.assertEqual(result["log_value"], 3)
+        self.assertTrue(result["any_short"])
+        self.assertFalse(result["all_short"])
+        self.assertTrue(result["dotall"])
+        self.assertEqual(calls, [0, 2, 1, 0])
+
+    def test_strings_regex_global_filter_and_test_surfaces(self) -> None:
+        resolver = jinest.Resolver(
+            {
+                "split_value$": "'a,b,c' | split(',', 1)",
+                "match$": "regex_match('Abc', 'a', ignorecase=true)",
+                "fullmatch$": "'abc' is regex_fullmatch('[a-z]+')",
+                "search$": "'one\\ntwo' | regex_search('^two', multiline=true)",
+                "found$": "regex_findall('Ab aB', 'ab', ignorecase=true)",
+                "replaced$": "'a1b2' | regex_replace('[0-9]', '#')",
+                "split_regex$": "regex_split('a1b2', '[0-9]')",
+                "escaped$": "regex_escape('a.b')",
+            },
+            emit_messages=False,
+        )
+        self.assertEqual(
+            resolver.resolve(),
+            {
+                "split_value": ["a", "b,c"], "match": True, "fullmatch": True,
+                "search": True, "found": ["Ab", "aB"], "replaced": "a#b#",
+                "split_regex": ["a", "b", ""], "escaped": "a\\.b",
+            },
+        )
+        with self.assertRaisesRegex(jinest.JinestTemplateError, "Invalid regular expression"):
+            jinest.resolve({"bad$": "regex_search('x', '[')"}, emit_messages=False)
+
+    def test_files_documents_and_serialization_use_source_aware_python_primitives(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "main.yaml").write_text("# source anchor\n", encoding="utf-8")
+            (folder / "text.txt").write_text("first\nsecond\n", encoding="utf-8")
+            (folder / "plain.json").write_text('{"plain": 7}', encoding="utf-8")
+            (folder / "prototype.json").write_text('{"value": 9}', encoding="utf-8")
+            resolver = jinest.Resolver(
+                {
+                    "raw": b"\xff",
+                    "text@": "{{ read_text('text.txt') }}",
+                    "lines$": "read_lines('text.txt')",
+                    "bytes$": "read_bytes('text.txt')",
+                    "exists$": "file_exists('text.txt')",
+                    "loaded$": "load_json('plain.json').plain",
+                    "parsed$": "from_json('{\\\"n\\\": 2}').n + from_yaml('m: 3').m",
+                    "imported$": "import_json('prototype.json').value",
+                    "tree$": "import_tree({'x$': '2'}, 'plugin://stdlib/tree').x",
+                    "json_text$": "to_json({'raw': raw})",
+                    "yaml_text$": "to_yaml({'value': 2})",
+                    "path_text$": "to_json(path.loaded)",
+                },
+                source_path=folder / "main.yaml",
+                import_roots=[folder],
+                emit_messages=False,
+            )
+            result = resolver.resolve()
+            self.assertEqual(result["text"], "first\nsecond\n")
+            self.assertEqual(result["lines"], ["first", "second"])
+            self.assertEqual(result["bytes"], b"first\nsecond\n")
+            self.assertTrue(result["exists"])
+            self.assertEqual(result["loaded"], 7)
+            self.assertEqual(result["parsed"], 5)
+            self.assertEqual(result["imported"], 9)
+            self.assertEqual(result["tree"], 2)
+            self.assertEqual(json.loads(result["json_text"]), {"raw": "ÿ"})
+            self.assertIn("value: 2", result["yaml_text"])
+            self.assertEqual(result["path_text"], "7")
+            with self.assertRaisesRegex(jinest.JinestImportError, "outside permitted roots"):
+                jinest.Resolver(
+                    {"blocked$": "read_text('/etc/passwd')"},
+                    source_path=folder / "main.yaml",
+                    import_roots=[folder],
+                    emit_messages=False,
+                ).resolve()
 
 
 class JinestCoreTests(unittest.TestCase):
@@ -1121,10 +1395,10 @@ class JinestOverlayControlTests(unittest.TestCase):
                 "target": {
                     ".<<=": {"direct": 1, "nested": {"public": 2}},
                     ".<<1$": "root.base",
-                    ".<<2^": "% return {'script': 3}\n",
+                    ".<<2^": "% return {'script_value': 3}\n",
                     ".<<3[]": [{"many": 4}],
                     ".<<!4=": {"override": 5},
-                    "sum$": "direct + native + script + many + override",
+                    "sum$": "direct + native + script_value + many + override",
                     "nested_copy": "=$nested",
                 },
                 "override_target": {

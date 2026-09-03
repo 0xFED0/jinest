@@ -79,6 +79,9 @@ app:
   - [Node indexing](#node-indexing)
   - [Source helpers](#source-helpers)
 - [Imports](#imports)
+- [Jinja standard library](#jinja-standard-library)
+  - [Configuration](#configuration)
+  - [Namespaces](#namespaces)
 - [Python API](#python-api)
   - [Eager convenience](#eager-convenience)
   - [Lazy access](#lazy-access)
@@ -918,9 +921,13 @@ When the path is relative, `node[path]` reanchors it to that node.
 ```jinja
 root_of(node)
 source_file(node)
+source_dir()       {# current declaration origin #}
+source_dir(node)   {# another node or PathRef #}
 ```
 
-These correspond to `node.root` and `node.file`.
+`root_of(node)` and `source_file(node)` correspond to `node.root` and
+`node.file`. `source_dir()` returns the effective source/base directory of the
+current declaration; it is especially useful with source-relative file helpers.
 
 ## Imports
 
@@ -952,6 +959,126 @@ imports. There is currently no CLI `import_roots` option.
 
 An import already active in the current ancestry resolves to `null`. YAML
 imports require PyYAML; JSON imports do not.
+
+## Jinja standard library
+
+Jinest installs a small standard library into both its normal and script Jinja
+environments. The functions are globally visible in templates; *namespace* is
+an internal organisation and capability-selection mechanism, not a template
+object. Thus write `resolve(value)`, `flatten(values)`, or `read_text(path)`,
+not `runtime.resolve(...)`.
+
+### Configuration
+
+All namespaces are enabled by default. The active registry is observable but
+read-only through `resolver.stdlib.enabled`, `.globals`, `.filters`, and
+`.tests`.
+
+```python
+Resolver(data)                                      # all namespaces
+Resolver(data, stdlib=False)                        # no Jinest-added names
+Resolver(data, stdlib={"path", "runtime"})          # allowlist
+Resolver(data, stdlib=True, stdlib_exclude={"files"}) # subtract capability
+```
+
+Unknown namespace names are rejected eagerly. The selected capabilities are
+inherited by imported documents. Disabled names are not reserved for Jinest
+lookup: with `stdlib_exclude={"files"}`, a field named `read_text` is an
+ordinary field again. User `globals=` and `filters=` are installed after the
+stdlib and can deliberately override one of its names. `stdlib=False` only
+removes Jinest additions; it does not restrict standard Jinja or make
+application-provided callables safe. It is useful configuration hygiene, not
+OS-level sandboxing.
+
+### Namespaces
+
+Every item below is both a global and a filter unless stated otherwise. The
+existing detailed [Path functions](#path-functions) section documents the
+path namespace's path syntax and anchors.
+
+| Namespace | Exports | Notes |
+|---|---|---|
+| `path` | `normalize_path`, `absolute_path`, `relative_path`, `path_of`, `source_path_of`, `at`, `get`, `root_of`, `source_file`, `source_dir` | Source/destination-aware `PathRef` navigation. |
+| `files` | `file_path`, `read_text`, `read_lines`, `read_bytes`, `file_exists` | Read-only and subject to the same `import_roots` policy as imports. |
+| `runtime` | `node`, `resolve`, `eval`, `render`, `script`, `literal` | Lazy binding, targeted materialization, dynamic `$`/`@`/`^`, and source escaping. |
+| `documents` | `load_json`, `load_yaml`, `import_json`, `import_yaml`, `import_tree`; global `import` alias | Loading produces plain data; importing creates a lazy independent document. `import` also remains a compatibility filter alias. |
+| `serialization` | `from_json`, `from_yaml`, `to_json`, `to_yaml`, `json_normalize`, `yaml_normalize` | Uses the same normalization and Latin-1 byte contract as CLI/Python output. |
+| `collections` | `flatten`, `zip`, `enumerate`, `product`, `combine`, `apply`, `any`, `all`, `union`, `intersect`, `difference`, `symmetric_difference`; global-only `map`, `filter` | Ordered operations support unhashable values. |
+| `math` | `clamp`, `ceil`, `floor`, `sqrt`, `log` | `clamp` rejects a minimum above its maximum. |
+| `strings` | `split`, `regex_match`, `regex_fullmatch`, `regex_search`, `regex_findall`, `regex_replace`, `regex_split`, `regex_escape` | The first three regex predicates are also Jinja tests. |
+
+### Runtime and context
+
+Dynamic runtime helpers use the same evaluator/binding implementation as
+ordinary declarations and inherit the current destination, origin, function
+arguments, compose axes, lexical `{% set %}` values, and loop locals.
+
+```yaml
+base: 5
+value$: "resolve(node({'x$': 'base * 2'})).x" # 10
+next$: "eval('base + 1')"                    # 6
+hello@: '{{ render("Hello {{ name }}") }}'
+script_value$: "script('% return base + 2')"
+```
+
+`node()` stays lazy. `resolve()` explicitly materializes only its argument and
+never commits an `in_place=True` root. `literal(value)` recursively escapes a
+plain tree for a later Jinest parse.
+
+### Files, documents, and serialization
+
+File helpers default to the current declaration's source directory and use the
+same canonical-path and `import_roots` checks as `import_json`/`import_yaml`.
+A forbidden path raises an error even for `file_exists()`.
+
+```jinja
+{% set parsed = text | from_json %}             {# text -> plain data #}
+{% set loaded = load_json("data.json") %}       {# file -> plain data #}
+{% set imported = import_json("prototype.json") %} {# file -> lazy document #}
+{{ value | to_json }}
+```
+
+`import_tree(value, "plugin://name/defaults")` creates the same independent,
+lazy source-document model from an in-memory tree. `to_json`, `to_yaml`, and
+normalization helpers materialize a selected lazy node/`PathRef` when needed;
+ordinary mappings remain ordinary data and are never reparsed as declarations.
+
+### Collections, math, and strings
+
+`flatten(value, levels=None)` returns a list: `None` flattens recursively,
+`0` leaves top-level elements intact, and a positive number limits nesting.
+Strings, bytes, and mappings are atomic. `zip(..., strict=true)` requires equal
+lengths and always returns `list[list]`; `zip()` is `[]`. `product()` returns
+`[[]]` with no axes and follows Jinest compose ordering (first axis outermost).
+
+Callable helpers use Jinja's normal sandbox call path, so they work with
+Python globals, Jinest functions, and supported Jinja callables without
+bypassing callable safety:
+
+```jinja
+{% set doubled = map(double, values) %}
+{% set selected = filter(is_valid, values) %}
+{% set indexed = values | enumerate %}
+{% set matrix = product(xs, ys) %}
+{{ value | apply(transform, 10) }}
+```
+
+Jinest `map(fn, values)` is deliberately **global-only**. Standard Jinja
+`values | map(attribute="name")` and `values | map("lower")` remain unchanged.
+`any`/`all` optionally accept a predicate and short-circuit. The set-like
+helpers preserve order and equality-based semantics for lists/dicts.
+
+Regex predicates accept `ignorecase`, `multiline`, and `dotall` booleans and
+are available as globals, filters, and tests:
+
+```jinja
+{% if value is regex_fullmatch("[a-z]+") %}valid{% endif %}
+{{ "A1B2" | regex_replace("\\d", "#") }}
+```
+
+`split` follows Python string splitting. The math namespace intentionally stays
+small; applications should expose specialized numeric functions through
+`globals=` when needed.
 
 ## Python API
 
@@ -1118,6 +1245,8 @@ Convenience functions forward resolver options where applicable.
 | `emit_messages=True` | Print collected diagnostics |
 | `treat_warnings_as_errors=False` | Raise after resolution when warnings exist |
 | `debug=False` | Add `at`/`in` lines to stderr diagnostics |
+| `stdlib=True` | Enable all Jinest Jinja-stdlib namespaces; `False` disables only Jinest additions, and an iterable selects an allowlist |
+| `stdlib_exclude=()` | Remove named namespaces from the enabled set; unknown names are rejected eagerly |
 
 `Resolver.messages` remains available regardless of `emit_messages`.
 
@@ -1221,7 +1350,7 @@ Validate every documented result with:
 python examples/validate.py
 ```
 
-The suite contains 176 Python regression tests and 61 implementation-neutral
+The suite contains 182 Python regression tests and 62 implementation-neutral
 portable CLI fixtures.
 
 ## Security

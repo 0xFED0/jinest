@@ -12,12 +12,13 @@ python jinest.py examples/01_field_modes/example.yml \
   -o /tmp/jinest-result.yml
 ```
 
-`06_imports` and `08_python_api` use Python runners to demonstrate options
+`06_imports`, `08_python_api`, and `16_jinja_stdlib` use Python runners to demonstrate options
 that are not available through the CLI:
 
 ```bash
 python examples/06_imports/run.py
 python examples/08_python_api/run.py
+python examples/16_jinja_stdlib/run.py
 ```
 
 Validate the complete collection:
@@ -47,6 +48,8 @@ commented result files, and checks the exact JSON byte escapes in example 09.
 | `12_matrix_by_code` | Building a version/module matrix with script loops and structural functions |
 | `13_matrix_by_composition` | The same version/module matrix with Cartesian structural and text compose declarations |
 | `14_self_declarations` | Self `$`/`@`/`^` wrappers, nested evaluation pipelines, explicit array items, dynamic structural functions, self compose, and wrapper validation |
+| `15_overlay_controls` | Direct layers, hidden/public channel controls, tombstones, visibility masks, and overlay diagnostics |
+| `16_jinja_stdlib` | Configurable Jinja stdlib: dynamic runtime calls, parsing/loading/importing, functional collections, math, strings/regex, and disabled filesystem namespaces |
 
 Comments are intentionally retained in checked-in `result.yml` files. A fresh
 CLI output is therefore value-equivalent rather than byte-for-byte identical.

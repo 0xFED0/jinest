@@ -1,0 +1,11 @@
+# Jinja stdlib is available by default through global functions and filters.
+base: 4
+values: [1, 2]
+runtime$: "resolve(node({'x$': 'base * 2'})).x"
+loop@: >-
+  {% for item in values %}{{ render('{{ item }}') }}{% endfor %}
+flat$: flatten([[1, [2]], [3]], 1)
+zip_value$: zip(values, ['a', 'b'])
+product_value$: product(values, ['x', 'y'])
+regex$: "'jinest' is regex_fullmatch('[a-z]+')"
+json@: '{{ {"value": base} | to_json }}'

@@ -1,0 +1,26 @@
+base: 4
+values:
+- 1
+- 2
+runtime: 8
+loop: '12'
+flat:
+- 1
+- - 2
+- 3
+zip_value:
+- - 1
+  - a
+- - 2
+  - b
+product_value:
+- - 1
+  - x
+- - 1
+  - y
+- - 2
+  - x
+- - 2
+  - y
+regex: true
+json: "{\n  \"value\": 4\n}"

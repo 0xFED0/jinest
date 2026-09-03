@@ -1,0 +1,30 @@
+# Default stdlib output. Function declarations remain helper-only and are omitted.
+base: 5
+name: Ada
+values: [1, 2, 3]
+
+# Dynamic runtime calls inherited the source mapping and the nested template.
+runtime_node: 10
+runtime_eval: 6
+runtime_render: Hello Ada
+runtime_script: 7
+runtime_literal: literal data
+
+# Parsing, loading, importing, and virtual documents stay distinct.
+json_text: '{"from_text": 4}'
+from_text: 4
+from_file: 7
+from_import: 9
+virtual_tree: 3
+serialized: "{\n  \"name\": \"Ada\"\n}"
+
+doubled: [2, 4, 6]
+selected: [2, 3]
+indexed: [[0, 1], [1, 2], [2, 3]]
+matrix: [[a, 1], [a, 2], [b, 1], [b, 2]]
+flat: [1, 2, 3]
+limited: 10
+words: [a, 'b,c']
+slug: jinest
+slug_ok: true
+slug_parts: [jiNEST, jinest]
