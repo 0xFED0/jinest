@@ -39,6 +39,13 @@ def _find_jinest_module() -> Path:
     )
 
     module_path = next((p.resolve() for p in candidates if p.is_file()), None)
+    if module_path is not None and module_path.name == "__init__.py":
+        # A wheel exposes a package adapter at ``jinest/__init__.py`` and the
+        # actual single-file runtime beside it. This suite intentionally tests
+        # the runtime file; package importability is covered by package.test.py.
+        runtime_path = module_path.parent.parent / "jinest.py"
+        if runtime_path.is_file():
+            module_path = runtime_path
     if module_path is None:
         searched = "\n  ".join(str(p) for p in candidates)
         raise RuntimeError(f"Could not find Jinest module. Searched:\n  {searched}")
