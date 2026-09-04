@@ -44,7 +44,7 @@ app:
     path: global_root.app
 ```
 
-> **Status:** Jinest `0.19.2` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
+> **Status:** Jinest `0.19.3` is a single-file prototype with a standalone regression suite. The public API may still evolve before `1.0`.
 
 ## Contents
 
@@ -129,6 +129,22 @@ The wheel exposes the `jinest` CLI:
 
 ```bash
 jinest config.yaml
+```
+
+The standalone module exposes the Python namespaces directly:
+
+```python
+from jinest import serialization, documents
+
+value = serialization.json_normalize({"answer": 42})
+```
+
+The wheel additionally provides importable wrappers, so applications can use
+normal submodule imports without duplicating the runtime:
+
+```python
+from jinest.helpers.serialization import json_normalize
+from jinest.helpers.documents import load_yaml, export_yaml
 ```
 
 When copying `jinest.py` directly, Jinja2 version 3.1 through 3.x is required
@@ -234,7 +250,7 @@ and its result is always text:
 ```yaml
 release:
   product: Jinest
-  version: 0.19.2
+  version: 0.19.3
   label@: "{{ product }} v{{ version }}"
 ```
 
@@ -1334,7 +1350,8 @@ jinest config.yaml --unsafe
 ## Testing
 
 ```bash
-python jinest.test.py
+python jinest.test.py       # copied single-file runtime
+python package.test.py      # package/wheel import surface
 ```
 
 Portable CLI fixtures live in `tests/<test-name>/`. Each directory contains an

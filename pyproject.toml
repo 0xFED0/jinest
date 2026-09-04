@@ -20,6 +20,10 @@ jinest = "jinest:_main"
 
 [tool.setuptools]
 py-modules = ["jinest"]
+packages = ["jinest", "jinest.helpers"]
+
+[tool.setuptools.package-dir]
+"jinest.helpers" = "helpers"
 
 [tool.setuptools.dynamic]
 version = { attr = "jinest.__version__" }

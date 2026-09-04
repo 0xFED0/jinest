@@ -49,6 +49,9 @@ jobs:
       - name: Run Python regression tests
         run: python jinest.test.py
 
+      - name: Run package import regression tests
+        run: python package.test.py
+
       - name: Run Python regression tests with assertions disabled
         run: python -O jinest.test.py
 

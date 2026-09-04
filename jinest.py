@@ -104,7 +104,7 @@ __all__ = [
     "resolve_file",
 ]
 
-__version__ = "0.19.2"
+__version__ = "0.19.3"
 
 _INTERNAL_SCOPE = "__jinest_scope__"
 _INTERNAL_FUNCTION_LOCALS = "__jinest_function_locals__"
@@ -6616,6 +6616,15 @@ helpers = SimpleNamespace(
     serialization=SimpleNamespace(from_json=lambda text: SerializationCodecs.parse(text, "json"), from_yaml=lambda text: SerializationCodecs.parse(text, "yaml"), to_json=lambda value, **kwargs: _api_serialize(value, format="json", **kwargs), to_yaml=lambda value, **kwargs: _api_serialize(value, format="yaml", **kwargs), json_normalize=lambda value: _normalize_json_value(_api_materialize(value), active=set()), yaml_normalize=lambda value: _normalize_yaml_value(_api_materialize(value), active=set()), serialize=_api_serialize),
     collections=SimpleNamespace(combine=_combine, union=_ordered_union, intersect=lambda first, *rest: _ordered_intersect(first, *rest), difference=lambda first, *rest: _ordered_filter(first, _ordered_union(*rest), include=False), symmetric_difference=lambda a, b: _ordered_union(_ordered_filter(a, b, include=False), _ordered_filter(b, a, include=False))),
 )
+
+# Direct namespace imports are supported by the standalone module. Wheel-only
+# ``jinest.helpers.<namespace>`` modules re-export these same objects.
+path = helpers.path
+files = helpers.files
+runtime = helpers.runtime
+documents = helpers.documents
+serialization = helpers.serialization
+collections = helpers.collections
 
 
 # ----------------------------------------------------------------------

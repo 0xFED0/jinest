@@ -171,6 +171,11 @@ jobs:
           JINEST_MODULE: ${{ steps.installed.outputs.module }}
         run: .wheel-venv/bin/python -O jinest.test.py
 
+      - name: Run installed package import tests
+        run: |
+          cd /tmp
+          .wheel-venv/bin/python -c "import runpy; runpy.run_path('${{ github.workspace }}/package.test.py', run_name='__main__')"
+
       - name: Run portable CLI fixtures against installed command
         env:
           JINEST_CMD: ${{ github.workspace }}/.wheel-venv/bin/jinest
