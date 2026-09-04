@@ -174,7 +174,7 @@ jobs:
       - name: Run installed package import tests
         run: |
           cd /tmp
-          .wheel-venv/bin/python -c "import runpy; runpy.run_path('${{ github.workspace }}/package.test.py', run_name='__main__')"
+          "$GITHUB_WORKSPACE/.wheel-venv/bin/python" -c "import runpy; runpy.run_path('$GITHUB_WORKSPACE/package.test.py', run_name='__main__')"
 
       - name: Run portable CLI fixtures against installed command
         env:
